@@ -2,6 +2,6 @@
 __pycache__/
 *.pyc
 outputs/run_*.log
-./outputs
+outputs
 pyproject.toml
 uv.lock
