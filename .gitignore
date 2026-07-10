@@ -5,3 +5,4 @@ outputs/run_*.log
 outputs
 pyproject.toml
 uv.lock
+mesh

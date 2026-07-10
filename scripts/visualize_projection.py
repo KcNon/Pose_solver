@@ -1,17 +1,6 @@
-"""Validate ICP poses by projecting point clouds onto images.
+"""Validate ICP poses by projecting point clouds onto original frames.
 
-T is src->ref: apply_transform(src_pts, T) ~= ref_pts.
-
-Two consistent checks (same inv(T) / T for ALL parts, no special-casing):
-  BACKWARD (ref -> src image): ref_pts @ inv(T) projected with src cameras
-  FORWARD  (src -> ref image): src_pts @ T      projected with ref cameras
-
-If ICP is correct, FORWARD overlay should match the object on the ref image for
-every part. BACKWARD overlay should match the object on the src image.
-
-Output: outputs/proj_vis/<ref>_to_<src>/
-  view<v>.jpg          = backward | forward  side-by-side
-  montage.jpg
+Uses the same recon backend (vggt | da3) as seg_backproject_parts for cameras.
 """
 from __future__ import annotations
 
@@ -28,9 +17,15 @@ sys.path.insert(0, ROOT)
 
 from common.geom import project_points
 from common.icp import apply_transform
+from common.recon_loader import load_view_bundle, output_paths, resolve_backend
 
-DA3 = "/data_ft_9_10/wentai/projects/vggt-omega/试标数据-6.30/2/output_test/da3_output"
+VIEW_NAMES = ["2-1", "2-2", "2-3", "2-4", "2-5", "2-6"]
 COLORS = {"lid": (0, 0, 255), "body": (255, 0, 0), "inner_pot": (0, 255, 0)}
+
+
+def load_pipeline(path: str) -> dict:
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
 
 
 def read_ply(path):
@@ -49,7 +44,7 @@ def read_ply(path):
     return np.asarray(pts, dtype=np.float64)
 
 
-def draw(img, uv, z, color, depth_map=None, depth_tol=0.05, radius=1):
+def draw(img, uv, z, color, depth_map=None, depth_tol=0.05, radius=2):
     H, W = img.shape[:2]
     u = np.round(uv[:, 0]).astype(int)
     v = np.round(uv[:, 1]).astype(int)
@@ -69,23 +64,38 @@ def draw(img, uv, z, color, depth_map=None, depth_tol=0.05, radius=1):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ref", default="000019")
-    ap.add_argument("--src", default="000018")
+    ap.add_argument("--src", default="000029")
     ap.add_argument("--icp-json", default=None)
+    ap.add_argument("--pipeline", default=os.path.join(ROOT, "configs", "pipeline.json"))
+    ap.add_argument("--recon-backend", choices=["vggt", "da3"], default=None)
+    ap.add_argument("--depth-tol", type=float, default=0.05)
     args = ap.parse_args()
 
-    icp_json = args.icp_json or os.path.join(ROOT, "outputs/icp", f"pose_{args.src}_to_{args.ref}.json")
+    cfg = load_pipeline(args.pipeline)
+    backend = resolve_backend(cfg, args.recon_backend)
+    icp_json = args.icp_json or os.path.join(
+        ROOT, "outputs", "icp", backend, f"pose_{args.src}_to_{args.ref}.json")
     with open(icp_json, encoding="utf-8") as f:
         pose = json.load(f)
 
-    d_src = np.load(os.path.join(DA3, args.src, "exports/npz/results.npz"))
-    d_ref = np.load(os.path.join(DA3, args.ref, "exports/npz/results.npz"))
-    img_s, depth_s, K_s, E_s = d_src["image"], d_src["depth"], d_src["intrinsics"], d_src["extrinsics"]
-    img_r, depth_r, K_r, E_r = d_ref["image"], d_ref["depth"], d_ref["intrinsics"], d_ref["extrinsics"]
+    reg_method = pose.get("reg_method", "icp")
+    vis_backend = backend if reg_method == "icp" else f"{backend}_{reg_method}"
+
+    src_bundle = load_view_bundle(cfg, args.src, VIEW_NAMES, backend=backend)
+    ref_bundle = load_view_bundle(cfg, args.ref, VIEW_NAMES, backend=backend)
+    img_s, depth_s, K_s, E_s = (
+        src_bundle["images"], src_bundle["depth"],
+        src_bundle["intrinsics"], src_bundle["extrinsics"],
+    )
+    img_r, depth_r, K_r, E_r = (
+        ref_bundle["images"], ref_bundle["depth"],
+        ref_bundle["intrinsics"], ref_bundle["extrinsics"],
+    )
 
     ref_clouds, src_clouds, T_map, inv_T = {}, {}, {}, {}
     for pname, pinfo in pose["parts"].items():
-        rp = os.path.join(ROOT, "outputs/parts_ply", args.ref, f"{pname}.ply")
-        sp = os.path.join(ROOT, "outputs/parts_ply", args.src, f"{pname}.ply")
+        rp = os.path.join(output_paths(ROOT, backend, args.ref)["parts_ply"], f"{pname}.ply")
+        sp = os.path.join(output_paths(ROOT, backend, args.src)["parts_ply"], f"{pname}.ply")
         if os.path.exists(rp):
             ref_clouds[pname] = read_ply(rp)
         if os.path.exists(sp):
@@ -94,7 +104,7 @@ def main():
         T_map[pname] = T
         inv_T[pname] = np.linalg.inv(T)
 
-    out_dir = os.path.join(ROOT, "outputs/proj_vis", f"{args.ref}_to_{args.src}")
+    out_dir = os.path.join(ROOT, "outputs", "proj_vis", vis_backend, f"{args.ref}_to_{args.src}")
     os.makedirs(out_dir, exist_ok=True)
     panels = []
 
@@ -107,18 +117,19 @@ def main():
             if pname in ref_clouds:
                 pts_b = apply_transform(ref_clouds[pname], inv_T[pname])
                 uv, z = project_points(pts_b, K_s[v], E_s[v])
-                backward = draw(backward, uv, z, color, depth_map=depth_s[v])
+                backward = draw(backward, uv, z, color, depth_map=depth_s[v], depth_tol=args.depth_tol)
             if pname in src_clouds:
                 pts_f = apply_transform(src_clouds[pname], T_map[pname])
                 uv, z = project_points(pts_f, K_r[v], E_r[v])
-                forward = draw(forward, uv, z, color, depth_map=depth_r[v])
+                forward = draw(forward, uv, z, color, depth_map=depth_r[v], depth_tol=args.depth_tol)
 
-        cv2.putText(backward, f"backward: ref@inv(T) on {args.src}", (8, 18),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1, cv2.LINE_AA)
-        cv2.putText(forward, f"forward: src@T on {args.ref}", (8, 18),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(backward, f"[{vis_backend}] backward ref@inv(T) on {args.src} ({VIEW_NAMES[v]})",
+                    (8, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(forward, f"[{vis_backend}] forward src@T on {args.ref} ({VIEW_NAMES[v]})",
+                    (8, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
         pair = np.hstack([backward, np.full((backward.shape[0], 4, 3), 255, np.uint8), forward])
-        cv2.imwrite(os.path.join(out_dir, f"view{v}.jpg"), pair, [cv2.IMWRITE_JPEG_QUALITY, 92])
+        cv2.imwrite(os.path.join(out_dir, f"view{v}_{VIEW_NAMES[v]}.jpg"), pair,
+                    [cv2.IMWRITE_JPEG_QUALITY, 92])
         panels.append(pair)
 
     montage = np.vstack([cv2.resize(p, (p.shape[1] // 2, p.shape[0] // 2)) for p in panels])

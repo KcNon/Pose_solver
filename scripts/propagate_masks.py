@@ -8,7 +8,7 @@ Idea:
 
 Runs entirely on saved masks + results.npz; does NOT invoke SAM3.
 
-Input:  outputs/masks_da3/<ts>/<view>_<part>.png   (from seg_backproject_parts.py)
+Input:  outputs/masks/<backend>/<ts>/<view>_<part>.png
 Output: overwrites those masks with propagated versions (backup: *_raw.png),
         rebuilds outputs/parts_ply/<ts>/<part>.ply,
         writes propagated overlays *_overlay_prop.jpg
@@ -28,11 +28,16 @@ sys.path.insert(0, ROOT)
 
 from common.geom import backproject_view, project_points, rasterize_points
 from common.icp import write_ply
+from common.recon_loader import load_recon, load_recon_colors, output_paths, resolve_backend
 
-DA3 = "/data_ft_9_10/wentai/projects/vggt-omega/试标数据-6.30/2/output_test/da3_output"
-OUT_MASK = os.path.join(ROOT, "outputs/masks_da3")
 OUT_PLY = os.path.join(ROOT, "outputs/parts_ply")
+VIEW_NAMES = ["2-1", "2-2", "2-3", "2-4", "2-5", "2-6"]
 COLORS = {"lid": (0, 0, 255), "body": (255, 0, 0), "inner_pot": (0, 255, 0)}
+
+
+def load_pipeline(path: str) -> dict:
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
 
 
 def largest_cc(mask):
@@ -52,6 +57,8 @@ def load_parts(ts):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--timestamps", nargs="+", required=True)
+    ap.add_argument("--pipeline", default=os.path.join(ROOT, "configs", "pipeline.json"))
+    ap.add_argument("--recon-backend", choices=["vggt", "da3"], default=None)
     ap.add_argument("--min-px", type=int, default=200, help="views with fewer px are treated as empty/to-fill")
     ap.add_argument("--depth-tol", type=float, default=0.03, help="occlusion depth tolerance (m)")
     ap.add_argument("--dilate", type=int, default=1)
@@ -59,14 +66,24 @@ def main():
     ap.add_argument("--max-pts", type=int, default=80000)
     args = ap.parse_args()
 
+    cfg = load_pipeline(args.pipeline)
+    backend = resolve_backend(cfg, args.recon_backend)
+    frames_dir = cfg["frames_dir"]
+    print(f"recon backend: {backend}")
+
     for ts in args.timestamps:
         parts = load_parts(ts)
-        d = np.load(os.path.join(DA3, ts, "exports/npz/results.npz"))
-        img, depth, K, E, conf = d["image"], d["depth"], d["intrinsics"], d["extrinsics"], d["conf"]
-        V, H, W = depth.shape
+        recon = load_recon(cfg, ts, backend=backend)
+        depth = recon["depth"]
+        conf = recon["conf"]
+        K = recon["intrinsics"]
+        E = recon["extrinsics"]
+        H, W = recon["depth_hw"]
+        V = recon["n_views"]
         conf_thr = float(np.median(conf))
-        odir = os.path.join(OUT_MASK, ts)
-        ply_dir = os.path.join(OUT_PLY, ts)
+        img = load_recon_colors(recon, frames_dir, ts, VIEW_NAMES)
+        odir = output_paths(ROOT, backend, ts)["masks"]
+        ply_dir = output_paths(ROOT, backend, ts)["parts_ply"]
         os.makedirs(ply_dir, exist_ok=True)
 
         for pname in parts:

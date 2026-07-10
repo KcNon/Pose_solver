@@ -1,4 +1,4 @@
-"""Geometry helpers: backproject DA3 depth maps into world-frame point clouds."""
+"""Geometry helpers: backproject depth maps into world-frame point clouds."""
 import numpy as np
 
 
