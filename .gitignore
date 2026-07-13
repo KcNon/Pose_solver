@@ -6,3 +6,4 @@ outputs
 pyproject.toml
 uv.lock
 mesh
+experiments
