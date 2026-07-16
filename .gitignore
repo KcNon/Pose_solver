@@ -3,7 +3,6 @@ __pycache__/
 *.pyc
 outputs/run_*.log
 outputs
-pyproject.toml
 uv.lock
 mesh
 experiments

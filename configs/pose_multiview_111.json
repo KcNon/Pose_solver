@@ -8,6 +8,8 @@
   "vggt_omega_dir": "/data_ft_9_10/wentai/projects/depth-anything-3/试标数据-6.30/2-normalized/vggt-omega",
   "mesh_dir": "/data_ft_9_10/wentai/projects/pose_solver/mesh",
   "output_root": "/data_ft_9_10/wentai/projects/pose_solver/experiments/three_part_multiview_111f/outputs",
+  "point_cloud_variant": "da3_self_cond",
+  "point_cloud_root": "/data_ft_9_10/wentai/projects/pose_solver/experiments/three_part_multiview_111f/outputs/parts_ply/da3_self_cond",
   "views": ["2-1", "2-2", "2-3", "2-4", "2-5", "2-6"],
   "parts": ["body", "inner_pot", "lid"],
   "part_ids": {"lid": 1, "body": 2, "inner_pot": 3},

@@ -13,6 +13,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 from common.backproject_utils import fuse_part_cloud, load_palette_masks, load_recon_colors
+from common.depth_gauge import apply_depth_gauge, load_depth_gauge
 from common.icp import write_ply
 from common.normalized_recon import (
     all_timestamps,
@@ -27,7 +28,8 @@ from common.normalized_recon import (
 
 def parts_ply_root(cfg: dict, backend: str, tag: str | None) -> str:
     name = backend if not tag else f"{backend}_{tag}"
-    return os.path.join(output_root(cfg), "parts_ply", name)
+    artifact_root = cfg.get("point_cloud_output_root", output_root(cfg))
+    return os.path.join(artifact_root, "parts_ply", name)
 
 
 def backproject_timestamp(
@@ -41,9 +43,12 @@ def backproject_timestamp(
     stride: int,
     max_pts: int,
     tag: str | None,
+    depth_gauge: dict | None = None,
 ) -> dict:
     recon = load_recon(cfg, timestamp, backend=backend)
     depth = recon["depth"]
+    if depth_gauge is not None:
+        depth = apply_depth_gauge(depth, depth_gauge, timestamp)
     conf = recon["conf"]
     K = recon["intrinsics"]
     E = recon["extrinsics"]
@@ -92,6 +97,9 @@ def main():
     ap.add_argument("--max-pts", type=int, default=80000)
     ap.add_argument("--tag", default=None,
                     help="output subdir parts_ply/{backend}_{tag}/ (e.g. adaptive)")
+    ap.add_argument("--depth-gauge", default=None,
+                    help="depth_gauge.json from calibrate_depth_gauge.py; removes "
+                         "per-frame global depth drift before backprojection")
     args = ap.parse_args()
 
     cfg = load_pipeline(args.pipeline)
@@ -107,13 +115,18 @@ def main():
     else:
         timestamps = all_timestamps(cfg)
 
-    root = parts_ply_root(cfg, backend, args.tag)
+    depth_gauge_path = args.depth_gauge or cfg.get("depth_gauge_path")
+    depth_gauge = load_depth_gauge(depth_gauge_path) if depth_gauge_path else None
+    tag = args.tag if args.tag is not None else cfg.get("point_cloud_tag")
+
+    root = parts_ply_root(cfg, backend, tag)
     os.makedirs(root, exist_ok=True)
     full_summary = {
         "backend": backend,
-        "tag": args.tag,
+        "tag": tag,
         "conf_mode": args.conf_mode,
         "conf_quantile": args.conf_quantile,
+        "depth_gauge": depth_gauge_path,
         "timestamps": {},
     }
 
@@ -125,7 +138,8 @@ def main():
             conf_quantile=args.conf_quantile,
             stride=args.stride,
             max_pts=args.max_pts,
-            tag=args.tag,
+            tag=tag,
+            depth_gauge=depth_gauge,
         )
 
     summary_path = os.path.join(root, "backproject_summary.json")

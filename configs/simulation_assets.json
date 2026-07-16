@@ -1,0 +1,64 @@
+{
+  "asset_name": "rice_cooker_three_part",
+  "trajectory": "experiments/three_part_multiview_111f/outputs_v4_lid_se3/pose/trajectory.json",
+  "meshes": {
+    "body": "mesh/body.glb",
+    "inner_pot": "mesh/inner_pot.glb",
+    "lid": "mesh/lid.glb"
+  },
+  "output_dir": "experiments/rice_cooker_simulation_assets",
+  "reference_part": "body",
+  "display_parts": [
+    "body",
+    "inner_pot",
+    "lid"
+  ],
+  "mass_kg": {
+    "body": 3.0,
+    "inner_pot": 0.5,
+    "lid": 0.8
+  },
+  "assembly_targets": {
+    "inner_pot": {
+      "frame_range": [41, 110],
+      "required_state": "static",
+      "min_observing_views": 1,
+      "max_translation_residual_m": 0.01,
+      "max_rotation_residual_deg": 5.0
+    },
+    "lid": {
+      "frame_range": [109, 110],
+      "required_state": "static",
+      "min_observing_views": 1,
+      "max_translation_residual_m": 0.01,
+      "max_rotation_residual_deg": 5.0
+    }
+  },
+  "simulation": {
+    "container_part": "body",
+    "inserted_part": "inner_pot",
+    "up_axis_body": [0.0, 1.0, 0.0],
+    "observed_replay_frame_range": [0, 41],
+    "physics_hz": 240,
+    "settle_seconds": 3.0,
+    "drop_height_m": 0.03,
+    "static_friction": 0.4,
+    "dynamic_friction": 0.3,
+    "restitution": 0.05,
+    "success_translation_m": 0.015,
+    "success_rotation_deg": 10.0,
+    "success_linear_speed_mps": 0.02,
+    "success_angular_speed_radps": 0.1,
+    "trials": [
+      {"name": "aligned", "xy_offset_m": [0.0, 0.0], "yaw_deg": 0.0, "tilt_deg": [0.0, 0.0]},
+      {"name": "x_plus_2mm", "xy_offset_m": [0.002, 0.0], "yaw_deg": 0.0, "tilt_deg": [0.0, 0.0]},
+      {"name": "x_minus_2mm", "xy_offset_m": [-0.002, 0.0], "yaw_deg": 0.0, "tilt_deg": [0.0, 0.0]},
+      {"name": "y_plus_2mm", "xy_offset_m": [0.0, 0.002], "yaw_deg": 0.0, "tilt_deg": [0.0, 0.0]},
+      {"name": "y_minus_2mm", "xy_offset_m": [0.0, -0.002], "yaw_deg": 0.0, "tilt_deg": [0.0, 0.0]},
+      {"name": "yaw_plus_5deg", "xy_offset_m": [0.0, 0.0], "yaw_deg": 5.0, "tilt_deg": [0.0, 0.0]},
+      {"name": "yaw_minus_5deg", "xy_offset_m": [0.0, 0.0], "yaw_deg": -5.0, "tilt_deg": [0.0, 0.0]},
+      {"name": "tilt_x_plus_3deg", "xy_offset_m": [0.0, 0.0], "yaw_deg": 0.0, "tilt_deg": [3.0, 0.0]},
+      {"name": "tilt_y_plus_3deg", "xy_offset_m": [0.0, 0.0], "yaw_deg": 0.0, "tilt_deg": [0.0, 3.0]}
+    ]
+  }
+}

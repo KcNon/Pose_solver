@@ -1,0 +1,33 @@
+[project]
+name = "pose-solver"
+version = "0.1.0"
+description = "Articulated object part pose via DA3 depth + SAM3 masks + ICP"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26,<2",
+    "opencv-python-headless>=4.8",
+    "scipy>=1.11",
+    "pillow>=10.0",
+    "setuptools>=69,<70",
+    "einops>=0.7",
+    "pycocotools>=2.0",
+    "psutil>=5.9",
+    "decord>=0.6",
+    "kornia-rs>=0.1.14",
+    "small-gicp>=1.0.0",
+    "torch>=2.3",
+    "torchvision>=0.18",
+    "trimesh>=4.0",
+    "pyrender>=0.1.45",
+    "sam3",
+]
+
+[tool.uv.sources]
+sam3 = { path = "../sam3", editable = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["common"]

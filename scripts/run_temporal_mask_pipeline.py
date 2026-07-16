@@ -8,27 +8,19 @@ palette masks plus review videos into ``output_root``.
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from common.io_utils import load_json, write_json
+
+
 DEFAULT_VIEWS = [f"2-{index}" for index in range(1, 7)]
-
-
-def load_json(path: Path) -> dict[str, Any]:
-    with open(path, encoding="utf-8") as file:
-        return json.load(file)
-
-
-def write_json(path: Path, value: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as file:
-        json.dump(value, file, ensure_ascii=False, indent=2)
 
 
 def frame_ids(frames_dir: Path, view: str) -> list[str]:

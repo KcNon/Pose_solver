@@ -120,7 +120,6 @@ def main():
             # stats text
             old_ply = parts_ply_root(cfg, backend, None)
             new_ply = parts_ply_root(cfg, backend, "adaptive")
-            import json
             for part in parts:
                 def count_ply(root, ts, part):
                     p = os.path.join(root, ts, f"{part}.ply")

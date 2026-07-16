@@ -9,8 +9,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import json
-import os
 import sys
 from pathlib import Path
 
@@ -24,46 +22,17 @@ from scipy.spatial.transform import Rotation, Slerp
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from common.io_utils import load_json, write_json
 from common.mesh_align import align_mesh_to_cloud, read_ply_xyz
 from common.normalized_recon import load_recon, scale_intrinsics
-
-
-def load_json(path: Path) -> dict:
-    with open(path, encoding="utf-8") as f:
-        return json.load(f)
-
-
-def save_json(path: Path, value: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(value, f, ensure_ascii=False, indent=2)
-
-
-def decompose_similarity(S: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
-    scale = float(np.cbrt(max(np.linalg.det(S[:3, :3]), 1e-12)))
-    return scale, S[:3, :3] / scale, S[:3, 3].copy()
-
-
-def similarity(scale: float, R: np.ndarray, t: np.ndarray) -> np.ndarray:
-    S = np.eye(4)
-    S[:3, :3] = scale * R
-    S[:3, 3] = t
-    return S
-
-
-def rigid_from_similarity(S: np.ndarray, origin_raw: np.ndarray) -> np.ndarray:
-    scale, R, t = decompose_similarity(S)
-    T = np.eye(4)
-    T[:3, :3] = R
-    T[:3, 3] = scale * (R @ origin_raw) + t
-    return T
-
-
-def similarity_from_rigid(T: np.ndarray, scale: float, origin_raw: np.ndarray) -> np.ndarray:
-    S = np.eye(4)
-    S[:3, :3] = scale * T[:3, :3]
-    S[:3, 3] = T[:3, 3] - scale * (T[:3, :3] @ origin_raw)
-    return S
+from common.pose_transforms import (
+    axis_rotation,
+    decompose_similarity,
+    rigid_from_similarity,
+    similarity,
+    similarity_from_rigid,
+    transform_points,
+)
 
 
 def voxel_unique(points: np.ndarray, voxel: float = 0.002) -> np.ndarray:
@@ -100,10 +69,6 @@ def subsample(points: np.ndarray, maximum: int, seed: int) -> np.ndarray:
         return np.ascontiguousarray(points, dtype=np.float64)
     index = np.random.default_rng(seed).choice(len(points), maximum, replace=False)
     return np.ascontiguousarray(points[index], dtype=np.float64)
-
-
-def transform_points(points: np.ndarray, T: np.ndarray) -> np.ndarray:
-    return points @ T[:3, :3].T + T[:3, 3]
 
 
 def transform_angle(T: np.ndarray) -> float:
@@ -176,14 +141,6 @@ def best_pair_registration(source: np.ndarray, target: np.ndarray,
     quality["rotation_deg"] = transform_angle(T)
     quality["candidate_median_nn_m"] = {name: score for score, name, _ in scored}
     return T, quality
-
-
-def axis_rotation(axis: np.ndarray, angle: float) -> np.ndarray:
-    axis = np.asarray(axis, dtype=float)
-    axis /= np.linalg.norm(axis)
-    T = np.eye(4)
-    T[:3, :3] = Rotation.from_rotvec(axis * angle).as_matrix()
-    return T
 
 
 def symmetry_align_pose(T: np.ndarray, reference: np.ndarray, axis_raw: np.ndarray) -> np.ndarray:
@@ -591,7 +548,8 @@ def main() -> None:
     config_path = Path(args.config).resolve()
     cfg = load_json(config_path)
     output = Path(cfg["output_root"])
-    cloud_root = output / "parts_ply" / cfg["recon_backend"]
+    cloud_root = Path(cfg.get(
+        "point_cloud_root", output / "parts_ply" / cfg["recon_backend"]))
     calibration_path = output / "pose" / "calibration.json"
     mesh_dir = Path(cfg["mesh_dir"])
     meshes = {part: trimesh.load(mesh_dir / f"{part}.glb", force="mesh") for part in cfg["parts"]}
@@ -640,10 +598,13 @@ def main() -> None:
                 anchor_info[part][str(fit["frame"])]["fixed_scale"] = scale
         calibration_json = {
             "config": str(config_path), "coordinate_convention": "world-to-camera extrinsics; column transforms",
+            "point_cloud_root": str(cloud_root),
+            "point_cloud_variant": cfg.get("point_cloud_variant", cfg["recon_backend"]),
+            "depth_gauge_path": cfg.get("depth_gauge_path"),
             "scales": scales, "raw_mesh_origins": {p: origins[p].tolist() for p in origins},
             "anchors": anchor_info,
         }
-        save_json(calibration_path, calibration_json)
+        write_json(calibration_path, calibration_json)
 
     # A validated trajectory may provide a stronger assembly calibration than a
     # fresh partial-cloud similarity fit.  The mechanism is optional and keeps
@@ -741,9 +702,20 @@ def main() -> None:
         world_poses[part] = part_poses
         all_registrations[part] = part_regs
 
+    # Detector output (scripts/detect_part_states.py) enriches the exported
+    # labels with occluded/assembled without touching how poses were solved.
+    detected_path = output / "diagnostics" / "part_states.json"
+    detected = load_json(detected_path)["parts"] if detected_path.exists() else {}
+
     mask_root = Path(cfg["masks_dir"])
     trajectory = {
         "config": str(config_path),
+        "provenance": {
+            "recon_backend": cfg["recon_backend"],
+            "point_cloud_root": str(cloud_root),
+            "point_cloud_variant": cfg.get("point_cloud_variant", cfg["recon_backend"]),
+            "depth_gauge_path": cfg.get("depth_gauge_path"),
+        },
         "conventions": {
             "T_world_from_part": "rigid pose of the canonical part frame; origin is raw mesh centroid",
             "T_body_from_part": "inv(T_world_from_body) @ T_world_from_part",
@@ -784,6 +756,9 @@ def main() -> None:
                               else "static_anchor")
                     state = "static"
             record = pose_record(T_WP, T_WB, S_WP, state, source, views)
+            detected_entry = detected.get(part, {}).get("states", {}).get(key)
+            if detected_entry:
+                record["detected_state"] = detected_entry["state"]
             if previous[part] is None:
                 step_m, step_deg = 0.0, 0.0
             else:
@@ -798,8 +773,8 @@ def main() -> None:
             previous[part] = T_WP
 
     pose_dir = output / "pose"
-    save_json(pose_dir / "trajectory.json", trajectory)
-    save_json(pose_dir / "pair_registrations.json", all_registrations)
+    write_json(pose_dir / "trajectory.json", trajectory)
+    write_json(pose_dir / "pair_registrations.json", all_registrations)
     with open(pose_dir / "trajectory.csv", "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["frame", "part", "state", "source", "observing_views",

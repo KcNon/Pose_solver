@@ -1,0 +1,38 @@
+{
+  "data_root": "/data_ft_9_10/wentai/projects/depth-anything-3/试标数据-6.30/2-normalized",
+  "frames_dir": "/data_ft_9_10/wentai/projects/depth-anything-3/试标数据-6.30/2-normalized/frames",
+  "masks_dir": "/data_ft_9_10/wentai/projects/depth-anything-3/试标数据-6.30/2-normalized/temporal_sam3_all6_000000/masks",
+  "recon_backend": "da3_self_cond",
+  "da3_self_cond_dir": "/data_ft_9_10/wentai/projects/depth-anything-3/试标数据-6.30/2-normalized/da3-self_cond",
+  "da3_vggt_cond_dir": "/data_ft_9_10/wentai/projects/depth-anything-3/试标数据-6.30/2-normalized/da3-vggt_cond",
+  "vggt_omega_dir": "/data_ft_9_10/wentai/projects/depth-anything-3/试标数据-6.30/2-normalized/vggt-omega",
+  "mesh_dir": "/data_ft_9_10/wentai/projects/pose_solver/mesh",
+  "output_root": "/data_ft_9_10/wentai/projects/pose_solver/experiments/three_part_multiview_111f/outputs_v4_lid_se3",
+  "base_trajectory": "/data_ft_9_10/wentai/projects/pose_solver/experiments/three_part_multiview_111f/outputs_v3_body_yaw/pose/trajectory.json",
+  "point_cloud_variant": "da3_self_cond_gauge",
+  "point_cloud_root": "/data_ft_9_10/wentai/projects/pose_solver/experiments/three_part_multiview_111f/outputs/parts_ply/da3_self_cond_gauge",
+  "depth_gauge_path": "/data_ft_9_10/wentai/projects/pose_solver/experiments/three_part_multiview_111f/outputs/diagnostics/depth_gauge.json",
+  "views": ["2-1", "2-2", "2-3", "2-4", "2-5", "2-6"],
+  "parts": ["body", "inner_pot", "lid"],
+  "part_ids": {"lid": 1, "body": 2, "inner_pot": 3},
+  "reference_part": "body",
+  "frames": {"start": 0, "end": 110},
+  "review_keyframes": [0, 12, 20, 40, 50, 68, 72, 76, 80, 84, 88, 92, 96, 100, 104, 108],
+  "lid_refinement": {
+    "keyframes": [50, 68, 72, 76, 80, 84, 88, 92, 96, 100, 104, 108],
+    "resolution": [320, 180],
+    "rotation_steps_deg": [14.0, 5.0, 1.5],
+    "translation_steps_m": [0.008, 0.003, 0.001],
+    "sensitivity_deg": 5.0,
+    "rotation_observability_min_score_drop": 0.005,
+    "min_mask_pixels": 120,
+    "silhouette_chamfer_weight": 0.008,
+    "rgb_edge_chamfer_weight": 0.0025
+  },
+  "render": {
+    "fps": 30.0,
+    "axis_length_m": 0.09,
+    "axis_radius_m": 0.004,
+    "primary_view": "2-3"
+  }
+}

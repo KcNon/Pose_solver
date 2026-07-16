@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from pathlib import Path
 
@@ -15,6 +14,7 @@ from PIL import Image
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from common.io_utils import load_json, write_json
 from common.mesh_render import SceneRenderer
 from common.normalized_recon import load_recon, scale_intrinsics
 
@@ -29,11 +29,6 @@ AXIS_COLORS_RGB = {
     "y": (40, 235, 70),
     "z": (50, 100, 255),
 }
-
-
-def load_json(path: Path) -> dict:
-    with open(path, encoding="utf-8") as f:
-        return json.load(f)
 
 
 def solid_mesh(mesh: trimesh.Trimesh, rgb: tuple[int, int, int]) -> trimesh.Trimesh:
@@ -126,11 +121,16 @@ def main() -> None:
     parser.add_argument("--view", default=None)
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)
+    parser.add_argument("--trajectory", default=None,
+                        help="optional trajectory.json instead of <output_root>/pose/trajectory.json")
+    parser.add_argument("--output-root", default=None,
+                        help="optional result root; useful for derived/refined trajectories")
     args = parser.parse_args()
 
     cfg = load_json(Path(args.config))
-    output = Path(cfg["output_root"])
-    trajectory = load_json(output / "pose" / "trajectory.json")
+    output = Path(args.output_root or cfg["output_root"])
+    trajectory_path = Path(args.trajectory) if args.trajectory else output / "pose" / "trajectory.json"
+    trajectory = load_json(trajectory_path)
     view = args.view or cfg["render"]["primary_view"]
     view_index = cfg["views"].index(view)
     width, height = args.width, args.height
@@ -152,6 +152,8 @@ def main() -> None:
     writers = {
         "overlay": cv2.VideoWriter(str(render_dir / "overlay.mp4"), fourcc, fps, (width, height)),
         "mesh_only": cv2.VideoWriter(str(render_dir / "mesh_only.mp4"), fourcc, fps, (width, height)),
+        "mesh_textured": cv2.VideoWriter(str(render_dir / "mesh_textured.mp4"), fourcc, fps,
+                                          (width, height)),
         "mesh_axes": cv2.VideoWriter(str(render_dir / "mesh_axes.mp4"), fourcc, fps, (width, height)),
     }
     if not all(writer.isOpened() for writer in writers.values()):
@@ -186,6 +188,12 @@ def main() -> None:
                 mesh_bgr = cv2.cvtColor(mesh_rgb, cv2.COLOR_RGB2BGR)
                 mesh_bgr[mesh_depth <= 0] = 0
 
+                textured_rgb, textured_depth = renderer.render(
+                    [(raw_meshes[part], transforms[part]) for part in cfg["parts"]], K, E)
+                textured_bgr = cv2.cvtColor(textured_rgb, cv2.COLOR_RGB2BGR)
+                textured_bgr[textured_depth <= 0] = 0
+                annotate_status(textured_bgr, frame, records)
+
                 axis_parts = list(mesh_parts)
                 for part in cfg["parts"]:
                     axis_parts.extend((axis, rigid[part]) for axis in axes)
@@ -218,6 +226,7 @@ def main() -> None:
 
                 writers["overlay"].write(overlay)
                 writers["mesh_only"].write(mesh_bgr)
+                writers["mesh_textured"].write(textured_bgr)
                 writers["mesh_axes"].write(axes_bgr)
                 if frame in sample_frames:
                     tile = np.hstack([
@@ -230,26 +239,25 @@ def main() -> None:
         for writer in writers.values():
             writer.release()
 
-    with open(render_dir / "metrics.json", "w", encoding="utf-8") as f:
-        metrics["summary"] = {}
-        for part in cfg["parts"]:
-            visible = [
-                value[part]["silhouette_iou"] for value in metrics["frames"].values()
-                if value[part]["mask_pixels"] > 0 and value[part]["rendered_pixels"] > 0
-            ]
-            moving = [
-                value[part]["silhouette_iou"] for value in metrics["frames"].values()
-                if value[part]["state"] == "moving"
-                and value[part]["mask_pixels"] > 0 and value[part]["rendered_pixels"] > 0
-            ]
-            metrics["summary"][part] = {
-                "visible_frames": len(visible),
-                "visible_mean_iou": float(np.mean(visible)) if visible else None,
-                "visible_median_iou": float(np.median(visible)) if visible else None,
-                "moving_visible_frames": len(moving),
-                "moving_visible_mean_iou": float(np.mean(moving)) if moving else None,
-            }
-        json.dump(metrics, f, indent=2)
+    metrics["summary"] = {}
+    for part in cfg["parts"]:
+        visible = [
+            value[part]["silhouette_iou"] for value in metrics["frames"].values()
+            if value[part]["mask_pixels"] > 0 and value[part]["rendered_pixels"] > 0
+        ]
+        moving = [
+            value[part]["silhouette_iou"] for value in metrics["frames"].values()
+            if value[part]["state"] == "moving"
+            and value[part]["mask_pixels"] > 0 and value[part]["rendered_pixels"] > 0
+        ]
+        metrics["summary"][part] = {
+            "visible_frames": len(visible),
+            "visible_mean_iou": float(np.mean(visible)) if visible else None,
+            "visible_median_iou": float(np.median(visible)) if visible else None,
+            "moving_visible_frames": len(moving),
+            "moving_visible_mean_iou": float(np.mean(moving)) if moving else None,
+        }
+    write_json(render_dir / "metrics.json", metrics)
     if samples:
         contact = np.vstack(samples)
         cv2.imwrite(str(render_dir / "contact_sheet.jpg"), contact,

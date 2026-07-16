@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import re
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import ImageDraw, ImageFont
 
 LABEL_ALIASES = {
     "pot": "inner_pot",

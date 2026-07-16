@@ -4,7 +4,6 @@ For each view (2-1..2-6) produce one grid image over all timestamps.
 """
 import argparse
 import os
-from glob import glob
 
 import cv2
 import numpy as np

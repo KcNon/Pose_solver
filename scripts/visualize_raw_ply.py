@@ -23,7 +23,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 from common.geom import project_points
-from common.mask_io import PART_COLORS, VIEW_NAMES, list_timestamps
+from common.mask_io import PART_COLORS, VIEW_NAMES
 from common.normalized_recon import (
     all_timestamps,
     load_pipeline,

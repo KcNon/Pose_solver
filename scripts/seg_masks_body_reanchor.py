@@ -9,7 +9,6 @@ occlusions.  Output uses the canonical palette id ``body=2``.
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
 from pathlib import Path
@@ -26,12 +25,8 @@ from PIL import Image
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from common.io_utils import load_json, write_json
 from common.mask_io import DEFAULT_PARTS, DEFAULT_PROMPTS, masks_to_label_map, save_palette_png
-
-
-def load_json(path: str | Path) -> dict[str, Any]:
-    with open(path, encoding="utf-8") as file:
-        return json.load(file)
 
 
 def list_frames(view_dir: Path) -> list[tuple[str, Path]]:
@@ -183,8 +178,7 @@ def main() -> None:
         "frames_written": len(frames),
         "details": details,
     }
-    with open(output_dir / f"body_masks_{args.view}.json", "w", encoding="utf-8") as file:
-        json.dump(summary, file, ensure_ascii=False, indent=2)
+    write_json(output_dir / f"body_masks_{args.view}.json", summary)
     print(f"done -> {output_dir}", flush=True)
 
 

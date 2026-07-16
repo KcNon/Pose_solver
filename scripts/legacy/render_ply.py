@@ -1,6 +1,5 @@
 """Render a colored point cloud (ply) to 2D images from a few viewpoints."""
 import argparse
-import os
 
 import matplotlib
 matplotlib.use("Agg")
