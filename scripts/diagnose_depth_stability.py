@@ -124,7 +124,10 @@ def main() -> None:
             depth_stack = np.empty((len(frames),) + depth.shape, np.float32)
             valid_stack = np.zeros((len(frames),) + depth.shape, bool)
         depth_stack[index] = depth
-        masks = load_palette_masks(cfg["masks_dir"], timestamp, [part], recon["depth_hw"])[part]
+        masks = load_palette_masks(
+            cfg["masks_dir"], timestamp, [part], recon["depth_hw"],
+            views=cfg.get("views"),
+        )[part]
         for v in range(depth.shape[0]):
             valid_stack[index, v] = masks[v] & np.isfinite(depth[v]) & (depth[v] > 1e-3)
         if index % 20 == 0:

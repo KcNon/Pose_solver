@@ -31,9 +31,7 @@ trajectory.json
 ```text
 common/       可复用的数据加载、几何、位姿、渲染和仿真资产逻辑
 configs/      数据集与实验配置；绝对路径和人工先验只允许放在这里
-scripts/      可直接运行的流程阶段
-scripts/legacy/
-              历史单帧/旧布局流程，仅用于结果复现
+scripts/      可直接运行的正式流程阶段
 tests/        不依赖 GPU 的核心约定和资产测试
 docs/         架构、仿真和专项说明
 mesh/         输入 mesh（被 .gitignore 忽略）
@@ -48,9 +46,8 @@ experiments/  生成结果（被 .gitignore 忽略）
 - 深度 gauge：`scripts/calibrate_depth_gauge.py`
 - 点云反投影：`scripts/backproject_normalized.py`
 - 状态诊断：`scripts/detect_part_states.py`
-- 主位姿求解：`scripts/solve_multiview_pose.py`
-- body yaw 修正：`scripts/refine_body_multiview_yaw.py`
-- lid SE(3) 修正：`scripts/refine_lid_multiview_se3.py`
+- 初始位姿求解：`scripts/solve_multiview_pose.py`
+- V6 全局精修与验收：`scripts/refine_multiview_pose.py`
 - 视频渲染：`scripts/render_multiview_pose.py`
 - 六视角评审：`scripts/export_multiview_pose_review.py`
 - URDF 导出：`scripts/export_simulation_assets.py`
@@ -59,6 +56,9 @@ experiments/  生成结果（被 .gitignore 忽略）
 当前 rice-cooker 数据使用 `configs/pose_multiview_111*.json`；这些文件包含当前数据的
 路径和先验，不是通用算法的一部分。批量处理新对象时应生成新配置，而不是修改
 `common/` 中的算法。
+
+V6 内部的 body、inner_pot、lid 和验收阶段仍可单独恢复执行，但批处理只应调用
+`refine_multiview_pose.py`。它会检查各阶段产物并默认断点续跑；使用 `--force` 才会重算。
 
 ## 验证
 

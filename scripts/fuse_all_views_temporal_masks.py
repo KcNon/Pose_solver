@@ -17,7 +17,6 @@ sys.path.insert(0, str(ROOT))
 from common.mask_io import (
     DEFAULT_PARTS,
     PART_COLORS,
-    VIEW_NAMES,
     masks_to_label_map,
     save_palette_png,
 )
@@ -128,7 +127,7 @@ def main() -> None:
     parser.add_argument("--body-dir", required=True)
     parser.add_argument("--frames-dir", required=True)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--views", nargs="+", choices=VIEW_NAMES, default=VIEW_NAMES)
+    parser.add_argument("--views", nargs="+", required=True)
     parser.add_argument("--fps", type=float, default=10.0)
     parser.add_argument("--skip-review", action="store_true")
     args = parser.parse_args()

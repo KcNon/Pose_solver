@@ -8,6 +8,8 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
+# Backward-compatible default for the original six-camera dataset. New datasets
+# should declare their ordered camera names in config["views"].
 VIEW_NAMES = ["2-1", "2-2", "2-3", "2-4", "2-5", "2-6"]
 
 PART_COLORS: dict[str, list[int]] = {
@@ -22,6 +24,17 @@ DEFAULT_PROMPTS = {
     "body": ["rice cooker body", "cooker body without lid"],
     "inner_pot": ["inner pot", "metal bowl", "black pot"],
 }
+
+
+def view_names(config: dict[str, Any] | None = None) -> list[str]:
+    """Return the configured camera order, falling back to the legacy rig."""
+    configured = None if config is None else config.get("views")
+    views = [str(view) for view in configured] if configured else list(VIEW_NAMES)
+    if not views:
+        raise ValueError("at least one view is required")
+    if len(set(views)) != len(views):
+        raise ValueError(f"duplicate view names are not allowed: {views}")
+    return views
 
 
 def parts_meta(parts: list[str] | None = None) -> dict[str, dict[str, Any]]:
@@ -46,9 +59,14 @@ def frame_path(frames_dir: str, layout: str, timestamp: str, view: str) -> str:
     return os.path.join(frames_dir, timestamp, f"{view}.png")
 
 
-def list_timestamps(frames_dir: str, layout: str) -> list[str]:
+def list_timestamps(
+    frames_dir: str,
+    layout: str,
+    views: list[str] | None = None,
+) -> list[str]:
     if layout == "normalized":
-        view_dir = os.path.join(frames_dir, VIEW_NAMES[0])
+        ordered_views = views or VIEW_NAMES
+        view_dir = os.path.join(frames_dir, ordered_views[0])
         if not os.path.isdir(view_dir):
             raise FileNotFoundError(view_dir)
         ts = sorted(

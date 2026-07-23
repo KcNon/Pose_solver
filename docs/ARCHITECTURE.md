@@ -37,13 +37,11 @@ NumPy / OpenCV / SciPy / trimesh / pyrender / small_gicp
 | `backproject_utils.py` / `geom.py` | mask + depth 反投影 |
 | `depth_gauge.py` | 静态参考部件的逐帧/跨视角深度校正 |
 | `icp.py` / `mesh_align.py` | 刚体点云配准与 mesh similarity 标定 |
+| `gicp.py` | 多尺度 GICP、下采样和配准质量 |
+| `pose_refinement.py` | silhouette、点云评分、装配/速度约束 |
+| `trajectory_io.py` | trajectory CSV 统一写出 |
 | `mesh_render.py` | DA3 相机约定下的离屏 mesh 渲染 |
 | `simulation_assets.py` | canonical mesh、装配位姿、URDF 和 QA |
-| `recon_loader.py` | 旧目录布局兼容层 |
-
-`recon_loader.py` 暂时保留，因为 `align_meshes.py`、`render_meshes.py` 和部分
-`scripts/legacy/` 仍引用它。新代码必须使用 `normalized_recon.py`，待历史结果不再
-需要复现时再整体删除兼容层。
 
 ## 4. 正式流程阶段
 
@@ -55,8 +53,7 @@ NumPy / OpenCV / SciPy / trimesh / pyrender / small_gicp
 | 点云 | `backproject_normalized.py` | `parts_ply/<variant>/<frame>/<part>.ply` |
 | 状态诊断 | `detect_part_states.py` | `part_states.json` |
 | 主求解 | `solve_multiview_pose.py` | `trajectory.json/csv`、配准诊断 |
-| body refinement | `refine_body_multiview_yaw.py` | 派生 trajectory、A/B 指标 |
-| lid refinement | `refine_lid_multiview_se3.py` | 派生 trajectory、可观测性指标 |
+| 全局精修 | `refine_multiview_pose.py` | body/inner/lid 派生轨迹与联合验收 |
 | 渲染 | `render_multiview_pose.py` | overlay、纯 mesh、纹理、坐标轴视频 |
 | 六视角评审 | `export_multiview_pose_review.py` | silhouette 指标、关键帧评审图 |
 | 仿真资产 | `export_simulation_assets.py` | canonical OBJ、URDF、manifest |
@@ -102,39 +99,21 @@ solver、renderer 与 URDF 导出不得各自重新实现。
 
 在自动 FSM 完全验证前，状态诊断只作为附加证据，不暗中改变 pose。
 
-## 6. 正式代码、兼容代码与实验代码
+## 6. 正式代码与内部阶段
 
 ### 正式代码
 
 本文件第 4 节列出的入口和它们直接依赖的 `common/` 模块。
 
-### 兼容代码
-
-- `common/recon_loader.py`
-- `scripts/align_meshes.py`
-- `scripts/render_meshes.py`
-- `scripts/legacy/`
-
-它们服务旧的 `configs/pipeline.json` 和早期结果复现。不要在新批处理流程中继续扩展。
-
-### 数据准备/研究工具
-
-`run_da3_joint.py`、`compare_backproject_view.py`、`compare_depth_gauge.py`、
-`plot_diagnostics.py` 等用于重建或诊断，保留独立 CLI，但不进入线上最短路径。
+`refine_body_global_yaw.py`、`refine_inner_assembly_prior.py`、
+`refine_lid_multiview_se3.py` 和 `select_pose_multimetric_final.py` 是可恢复的内部阶段。
+它们共享 `common/` 算法，但互不导入；正式批处理入口是 `refine_multiview_pose.py`。
 
 ## 7. 本轮清理
 
-本轮删除或收敛了以下内容：
-
-- 删除无任何调用方的旧 `common/gauge.py`；正式实现是 `depth_gauge.py`；
-- 删除已转向 Isaac Sim 后遗留的 `check_isaac_gym_runtime.py`；
-- 删除引用不存在脚本的 `run_full_pipeline.sh`；
-- 删除 `pyproject.toml` 中指向不存在模块的 console entry point；
-- 抽取重复的 JSON 和 rigid/similarity 变换实现；
-- 删除 Isaac demo 中未使用的 contact query、旧相机和临时调试分支。
-
-没有删除仍有调用方的旧 loader/renderer。删除代码的标准是“无调用方且无文档承诺”
-或“入口已确认损坏”，而不是仅凭文件较旧。
+本轮将 pose 精修收敛为一个正式入口，并删除旧 mesh pipeline、legacy 单帧流程、
+FoundationPose/oracle/filter 等一次性评估脚本。GICP、轨迹写出、silhouette/点云评分、
+装配约束和速度门已从 CLI 中抽到 `common/`，项目内不再存在 `scripts → scripts` 导入。
 
 ## 8. 批量复用方式
 
@@ -166,6 +145,5 @@ isaac.complete.json
 
 1. 增加配置 schema 和输入 preflight，尽早报告缺帧、缺 mask、路径和单位错误；
 2. 将 solver 中的 tracking strategy 拆成独立模块并建立小型合成数据测试；
-3. 用一个轻量 pipeline runner 串联正式阶段，基于输出哈希恢复，而不是 shell 脚本；
-4. 当历史流程归档后，删除 `recon_loader.py` 和对应旧脚本；
-5. 将 Isaac 场景 authoring 与物理 trial 进一步拆开，便于批量无渲染验证。
+3. 为 pipeline runner 增加输入哈希，避免仅凭输出存在性判断是否恢复；
+4. 将 Isaac 场景 authoring 与物理 trial 进一步拆开，便于批量无渲染验证。

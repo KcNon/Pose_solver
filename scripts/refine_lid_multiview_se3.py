@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import argparse
 import copy
-import csv
 import sys
 from pathlib import Path
 
@@ -31,7 +30,9 @@ sys.path.insert(0, str(ROOT))
 from common.io_utils import load_json, write_json
 from common.mesh_render import SceneRenderer
 from common.normalized_recon import load_recon, scale_intrinsics
+from common.pose_refinement import limit_pose_velocity
 from common.pose_transforms import similarity_from_rigid
+from common.trajectory_io import write_trajectory_csv
 
 
 def mask_edge(mask: np.ndarray) -> np.ndarray:
@@ -47,26 +48,11 @@ def capped_mean(values: np.ndarray, cap: float = 20.0) -> float:
     return float(np.mean(np.minimum(values, cap))) if len(values) else cap
 
 
-def write_csv(trajectory: dict, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["frame", "part", "state", "source", "observing_views",
-                         "tx", "ty", "tz", "qx", "qy", "qz", "qw",
-                         "translation_step_m", "rotation_step_deg"])
-        for key, frame in trajectory["frames"].items():
-            for part in trajectory["parts"]:
-                record = frame["parts"][part]
-                writer.writerow([int(key), part, record["state"], record["source"],
-                                 record["observing_views"], *record["translation_body_m"],
-                                 *record["quaternion_body_xyzw"], record["translation_step_m"],
-                                 record["rotation_step_deg"]])
-
-
 class FrameObjective:
     def __init__(self, cfg: dict, frame: int, mesh: trimesh.Trimesh, scale: float,
                  origin: np.ndarray, renderer: SceneRenderer, width: int, height: int,
-                 min_pixels: int, chamfer_weight: float, feature_weight: float):
+                 min_pixels: int, chamfer_weight: float, feature_weight: float,
+                 part: str = "lid"):
         self.cfg = cfg
         self.frame = frame
         self.mesh = mesh
@@ -76,13 +62,14 @@ class FrameObjective:
         self.width, self.height = width, height
         self.chamfer_weight = chamfer_weight
         self.feature_weight = feature_weight
+        self.part = part
         self.cache: dict[tuple[float, ...], dict] = {}
         timestamp = f"{frame:06d}"
         recon = load_recon(cfg, timestamp, backend=cfg["recon_backend"])
         self.views = []
         for index, view in enumerate(cfg["views"]):
             labels = np.asarray(Image.open(Path(cfg["masks_dir"]) / timestamp / f"{view}.png"))
-            target = cv2.resize((labels == int(cfg["part_ids"]["lid"])).astype(np.uint8),
+            target = cv2.resize((labels == int(cfg["part_ids"][part])).astype(np.uint8),
                                 (width, height), interpolation=cv2.INTER_NEAREST).astype(bool)
             if int(target.sum()) < min_pixels:
                 continue
@@ -348,6 +335,11 @@ def main() -> None:
     }
     motion_poses = interpolate_corrections(
         base_poses, measured, all_base, motion_start, motion_end)
+    motion_poses, velocity_report = limit_pose_velocity(
+        motion_poses,
+        float(options.get("max_translation_step_m", 0.04)),
+        float(options.get("max_rotation_step_deg", 3.0)),
+    )
     refined = copy.deepcopy(source)
     refined["config"] = str(config_path)
     refined.setdefault("provenance", {})["derived_from_trajectory"] = str(source_path)
@@ -411,6 +403,8 @@ def main() -> None:
         "translation_steps_m": options["translation_steps_m"],
         "rotation_observability_min_score_drop": options.get(
             "rotation_observability_min_score_drop", 0.0),
+        "tilt_unlocked": True,
+        "motion_velocity_gate": velocity_report,
         "summary": {
             "mean_score_gain": float(np.mean(gains)),
             "median_score_gain": float(np.median(gains)),
@@ -420,7 +414,7 @@ def main() -> None:
     }
     write_json(output / "diagnostics" / "lid_se3_refinement.json", report)
     write_json(output / "pose" / "trajectory.json", refined)
-    write_csv(refined, output / "pose" / "trajectory.csv")
+    write_trajectory_csv(refined, output / "pose" / "trajectory.csv")
     print(f"\nwrote {output / 'pose' / 'trajectory.json'}")
 
 

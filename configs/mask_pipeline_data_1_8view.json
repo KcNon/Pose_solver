@@ -1,0 +1,24 @@
+{
+  "frames_dir": "/data_ft_9_10/wentai/projects/pose_solver/experiments/data_1/normalized/frames",
+  "work_root": "/data_ft_9_10/wentai/projects/pose_solver/experiments/data_1/mask_work",
+  "output_root": "/data_ft_9_10/wentai/projects/pose_solver/experiments/data_1/normalized/temporal_sam3_8view_seed_000125",
+  "views": [
+    "GX012728",
+    "GX012828",
+    "GX013102",
+    "GX013140",
+    "GX013468",
+    "GX014074",
+    "GX015353",
+    "GX017743"
+  ],
+  "qwen_python": "/data_ft_9_10/wentai/projects/qwen3-vl/.venv/bin/python",
+  "sam_python": "/data_ft_9_10/wentai/projects/sam3/.venv/bin/python",
+  "qwen_model": "/data_ft_9_10/wentai/projects/qwen3-vl/models/Qwen3-VL-8B-Instruct",
+  "sam_ckpt": "/data_ft_9_10/wentai/projects/sam3/sam3.1/sam3.1_multiplex.pt",
+  "prompts": {
+    "lid": ["rice cooker lid", "metal lid"],
+    "body": ["rice cooker body", "cooker body without lid", "rice cooker"],
+    "inner_pot": ["inner pot", "metal bowl", "black pot"]
+  }
+}

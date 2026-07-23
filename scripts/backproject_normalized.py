@@ -24,6 +24,7 @@ from common.normalized_recon import (
     resolve_backend,
     sample_timestamps,
 )
+from common.mask_io import view_names
 
 
 def parts_ply_root(cfg: dict, backend: str, tag: str | None) -> str:
@@ -52,9 +53,17 @@ def backproject_timestamp(
     conf = recon["conf"]
     K = recon["intrinsics"]
     E = recon["extrinsics"]
+    views = view_names(cfg)
+    if recon["n_views"] != len(views):
+        raise ValueError(
+            f"reconstruction has {recon['n_views']} views but config declares "
+            f"{len(views)}: {views}"
+        )
     global_thr = float(np.median(conf))
     img = load_recon_colors(recon, cfg, timestamp)
-    view_masks = load_palette_masks(masks_dir(cfg), timestamp, parts, recon["depth_hw"])
+    view_masks = load_palette_masks(
+        masks_dir(cfg), timestamp, parts, recon["depth_hw"], views=views
+    )
 
     out_dir = os.path.join(parts_ply_root(cfg, backend, tag), timestamp)
     os.makedirs(out_dir, exist_ok=True)
@@ -69,6 +78,7 @@ def backproject_timestamp(
             stride=stride,
             max_pts=max_pts,
             seed=pi + 1,
+            views=views,
         )
         ply_path = os.path.join(out_dir, f"{part}.ply")
         if len(pts) == 0:

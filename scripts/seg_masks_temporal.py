@@ -42,10 +42,10 @@ sys.path.insert(0, ROOT)
 from common.mask_io import (
     DEFAULT_PARTS,
     DEFAULT_PROMPTS,
-    VIEW_NAMES,
     load_bbox_json,
     masks_to_label_map,
     save_palette_png,
+    view_names,
 )
 
 
@@ -191,7 +191,7 @@ def main() -> None:
                     help="timestamp whose Qwen boxes initialize this temporal segment")
     ap.add_argument("--range-start", help="first timestamp to write (inclusive); tracking remains bidirectional")
     ap.add_argument("--range-end", help="last timestamp to write (inclusive); tracking remains bidirectional")
-    ap.add_argument("--views", nargs="+", choices=VIEW_NAMES, default=VIEW_NAMES)
+    ap.add_argument("--views", nargs="+", default=None)
     ap.add_argument(
         "--parts", nargs="+", choices=DEFAULT_PARTS,
         help="parts to track (default: pipeline temporal_parts, or lid inner_pot)",
@@ -223,7 +223,7 @@ def main() -> None:
     )
     model = predictor.model
 
-    views = args.views
+    views = args.views or view_names(cfg)
     all_view_frames = {view: list_view_frames(os.path.join(frames_dir, view)) for view in views}
     reference_timestamps = [ts for ts, _ in all_view_frames[views[0]]]
     if args.init_timestamp not in reference_timestamps:

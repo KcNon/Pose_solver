@@ -8,6 +8,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from common.io_utils import load_json, write_json
+from common.mask_io import list_timestamps, view_names
 from common.pose_transforms import (
     axis_rotation,
     axis_rotation_degrees,
@@ -27,6 +28,25 @@ class JsonIoTests(unittest.TestCase):
             write_json(path, value)
             self.assertEqual(load_json(path), value)
             self.assertTrue(path.read_text(encoding="utf-8").endswith("\n"))
+
+    def test_configured_eight_view_layout(self) -> None:
+        views = [f"camera_{index}" for index in range(8)]
+        with tempfile.TemporaryDirectory() as directory:
+            frames = Path(directory)
+            for view in views:
+                view_dir = frames / view
+                view_dir.mkdir()
+                (view_dir / "000000.jpg").touch()
+                (view_dir / "000001.jpg").touch()
+            self.assertEqual(view_names({"views": views}), views)
+            self.assertEqual(
+                list_timestamps(str(frames), "normalized", views),
+                ["000000", "000001"],
+            )
+
+    def test_duplicate_view_names_are_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            view_names({"views": ["camera_a", "camera_a"]})
 
 
 class PoseTransformTests(unittest.TestCase):

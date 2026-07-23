@@ -25,6 +25,8 @@
     "translation_steps_m": [0.008, 0.003, 0.001],
     "sensitivity_deg": 5.0,
     "rotation_observability_min_score_drop": 0.005,
+    "max_rotation_step_deg": 3.0,
+    "max_translation_step_m": 0.04,
     "min_mask_pixels": 120,
     "silhouette_chamfer_weight": 0.008,
     "rgb_edge_chamfer_weight": 0.0025

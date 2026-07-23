@@ -7,7 +7,7 @@ import cv2
 import numpy as np
 
 from common.geom import backproject_view
-from common.mask_io import PART_COLORS, VIEW_NAMES, part_id_map
+from common.mask_io import PART_COLORS, VIEW_NAMES, part_id_map, view_names
 
 
 def load_palette_masks(
@@ -15,12 +15,13 @@ def load_palette_masks(
     timestamp: str,
     parts: list[str],
     depth_hw: tuple[int, int],
+    views: list[str] | None = None,
 ) -> dict[str, list[np.ndarray]]:
     """Load per-view boolean masks resized to depth resolution."""
     h, w = depth_hw
     ids = part_id_map(parts)
     out: dict[str, list[np.ndarray]] = {p: [] for p in parts}
-    for vname in VIEW_NAMES:
+    for vname in (views or VIEW_NAMES):
         path = os.path.join(masks_root, timestamp, f"{vname}.png")
         if not os.path.exists(path):
             raise FileNotFoundError(path)
@@ -70,12 +71,19 @@ def fuse_part_cloud(
     stride: int = 2,
     max_pts: int = 80000,
     seed: int = 0,
+    views: list[str] | None = None,
 ) -> tuple[np.ndarray, np.ndarray | None, dict]:
     """Fuse one part across all views. Returns pts, cols, per-view stats."""
     if global_conf_thr is None:
         global_conf_thr = float(np.median(conf))
     all_pts, all_cols = [], []
     stats: dict[str, int] = {}
+    ordered_views = views or VIEW_NAMES
+    if len(ordered_views) != depth.shape[0]:
+        raise ValueError(
+            f"configured {len(ordered_views)} views but reconstruction has "
+            f"{depth.shape[0]}"
+        )
     for v in range(depth.shape[0]):
         m = part_masks[v].astype(bool)
         m &= np.isfinite(depth[v]) & (depth[v] > 1e-3)
@@ -84,7 +92,7 @@ def fuse_part_cloud(
         sub = np.zeros_like(m)
         sub[::stride, ::stride] = True
         m &= sub
-        stats[VIEW_NAMES[v]] = int(m.sum())
+        stats[ordered_views[v]] = int(m.sum())
         if m.sum() == 0:
             continue
         pts, cols = backproject_view(depth[v], K[v], E[v], mask=m, color=img[v])
@@ -122,7 +130,7 @@ def load_recon_colors(recon: dict, cfg: dict, timestamp: str) -> np.ndarray:
     from common.mask_io import frame_path
 
     colors = []
-    for vname in VIEW_NAMES:
+    for vname in view_names(cfg):
         path = frame_path(cfg["frames_dir"], cfg.get("frames_layout", "normalized"), timestamp, vname)
         bgr = cv2.imread(path)
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)

@@ -26,12 +26,12 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 from common.mask_io import (
-    VIEW_NAMES,
     frame_path,
     list_timestamps,
     load_bbox_json,
     save_bbox_json,
     parts_meta,
+    view_names,
 )
 from common.qwen_bbox import BATCH_PROMPT, parse_boxes, visualize
 
@@ -81,6 +81,7 @@ def process_timestamp(
     parts_list = cfg.get("parts")
     masks_dir = cfg.get("masks_dir")
     out_root = args.out_root
+    views = view_names(cfg)
 
     if layout == "normalized":
         if not masks_dir:
@@ -95,7 +96,7 @@ def process_timestamp(
         os.makedirs(vis_dir, exist_ok=True)
     summary = {"timestamp": timestamp, "views": {}}
 
-    for vname in VIEW_NAMES:
+    for vname in views:
         image_path = frame_path(frames_dir, layout, timestamp, vname)
         if not os.path.exists(image_path):
             raise FileNotFoundError(image_path)
@@ -164,7 +165,7 @@ def main():
     masks_dir = cfg.get("masks_dir")
 
     if args.all:
-        timestamps = list_timestamps(frames_dir, layout)
+        timestamps = list_timestamps(frames_dir, layout, view_names(cfg))
         print(f"Processing {len(timestamps)} timestamps ({layout} layout)")
     else:
         timestamps = [args.timestamp]
@@ -202,7 +203,8 @@ def main():
     for i, ts in enumerate(timestamps):
         if layout == "normalized" and bbox_store is not None and args.all:
             views = bbox_store.get("frames", {}).get(ts, {})
-            if len(views) >= len(VIEW_NAMES):
+            expected_views = view_names(cfg)
+            if all(view in views for view in expected_views):
                 print(f"\n######## [{i + 1}/{len(timestamps)}] {ts} (skip, bbox complete) ########")
                 continue
         print(f"\n######## [{i + 1}/{len(timestamps)}] {ts} ########")

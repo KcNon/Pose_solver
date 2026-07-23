@@ -18,9 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from common.io_utils import load_json, write_json
-
-
-DEFAULT_VIEWS = [f"2-{index}" for index in range(1, 7)]
+from common.mask_io import view_names
 
 
 def frame_ids(frames_dir: Path, view: str) -> list[str]:
@@ -54,7 +52,7 @@ def main() -> None:
         "--config", default=str(ROOT / "configs" / "mask_pipeline_normalized.json")
     )
     parser.add_argument("--seed-timestamp", default="000000")
-    parser.add_argument("--views", nargs="+", default=DEFAULT_VIEWS)
+    parser.add_argument("--views", nargs="+", default=None)
     parser.add_argument("--qwen-gpu", type=int, default=5)
     parser.add_argument("--video-gpu", type=int, default=6)
     parser.add_argument("--body-gpus", nargs="+", type=int, default=[4, 5, 6, 7])
@@ -64,20 +62,26 @@ def main() -> None:
     parser.add_argument("--skip-body", action="store_true")
     parser.add_argument("--skip-fusion", action="store_true")
     parser.add_argument("--skip-review", action="store_true")
+    parser.add_argument(
+        "--qwen-only",
+        action="store_true",
+        help="stop after writing the seed-frame Qwen boxes for manual QA",
+    )
     args = parser.parse_args()
 
     config_path = Path(args.config).resolve()
     config = load_json(config_path)
+    views = args.views or view_names(config)
     frames_dir = Path(config["frames_dir"])
     output_root = Path(config["output_root"])
     work_root = Path(config["work_root"])
     temporal_dir = work_root / "temporal" / "masks"
     body_dir = work_root / "body" / "masks"
     runtime_dir = work_root / "runtime_configs"
-    frames = frame_ids(frames_dir, args.views[0])
+    frames = frame_ids(frames_dir, views[0])
     if not frames:
-        raise RuntimeError(f"no frames found under {frames_dir / args.views[0]}")
-    for view in args.views[1:]:
+        raise RuntimeError(f"no frames found under {frames_dir / views[0]}")
+    for view in views[1:]:
         if frame_ids(frames_dir, view) != frames:
             raise RuntimeError(f"timestamp sequence differs for {view}")
     if args.seed_timestamp not in frames:
@@ -91,6 +95,7 @@ def main() -> None:
         "parts": ["lid", "body", "inner_pot"],
         "temporal_parts": ["lid", "inner_pot"],
         "prompts": config.get("prompts", {}),
+        "views": views,
     }
     temporal_config = {**base, "masks_dir": str(temporal_dir)}
     body_config = {
@@ -120,38 +125,42 @@ def main() -> None:
         raise FileNotFoundError(f"Qwen bbox is required: {bbox_path}")
     else:
         print(f"Qwen: reuse {bbox_path}", flush=True)
+    if args.qwen_only:
+        print(f"\nQwen-only complete -> {bbox_path}", flush=True)
+        return
 
     if not args.skip_temporal and (
-        args.force or not branch_complete(temporal_dir, frames, args.views)
+        args.force or not branch_complete(temporal_dir, frames, views)
     ):
         run(
             [
                 sam_python, "-u", "scripts/seg_masks_temporal.py",
                 "--pipeline", str(temporal_config_path),
                 "--all", "--init-timestamp", args.seed_timestamp,
-                "--views", *args.views,
+                "--views", *views,
                 "--parts", "lid", "inner_pot",
                 "--gpu", str(args.video_gpu),
             ],
             gpu=args.video_gpu,
         )
-    elif not branch_complete(temporal_dir, frames, args.views):
+    elif not branch_complete(temporal_dir, frames, views):
         raise RuntimeError("temporal branch is incomplete but --skip-temporal was requested")
     else:
         print("temporal SAM3: reuse complete branch", flush=True)
 
-    if not args.skip_body and (args.force or not branch_complete(body_dir, frames, args.views)):
+    if not args.skip_body and (args.force or not branch_complete(body_dir, frames, views)):
         run(
             [
                 sys.executable, "-u", "scripts/run_body_multigpu.py",
                 "--pipeline", str(body_config_path),
-                "--views", *args.views,
+                "--views", *views,
                 "--gpus", *(str(gpu) for gpu in args.body_gpus),
                 "--python", sam_python,
                 "--log-dir", str(work_root / "body" / "logs"),
+                "--init-timestamp", args.seed_timestamp,
             ]
         )
-    elif not branch_complete(body_dir, frames, args.views):
+    elif not branch_complete(body_dir, frames, views):
         raise RuntimeError("body branch is incomplete but --skip-body was requested")
     else:
         print("body SAM3: reuse complete branch", flush=True)
@@ -163,7 +172,7 @@ def main() -> None:
             "--body-dir", str(body_dir),
             "--frames-dir", str(frames_dir),
             "--output-dir", str(output_root),
-            "--views", *args.views,
+            "--views", *views,
         ]
         if args.skip_review:
             command.append("--skip-review")
@@ -175,7 +184,7 @@ def main() -> None:
             "output_root": str(output_root),
             "masks_dir": str(output_root / "masks"),
             "bbox_json": str(output_root / "masks" / "bbox.json"),
-            "views": args.views,
+            "views": views,
             "mask_method": "qwen_first_frame_bbox_plus_sam3_temporal_hybrid",
         }
         write_json(output_root / "pipeline.json", final_config)

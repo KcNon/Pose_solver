@@ -8,7 +8,7 @@ from typing import Any, Literal
 import cv2
 import numpy as np
 
-from common.mask_io import VIEW_NAMES, frame_path, list_timestamps
+from common.mask_io import frame_path, list_timestamps, view_names
 
 ReconBackend = Literal["da3_self_cond", "da3_vggt_cond", "vggt_omega"]
 SUPPORTED_BACKENDS = ("da3_self_cond", "da3_vggt_cond", "vggt_omega")
@@ -64,7 +64,11 @@ def masks_dir(cfg: dict) -> str:
 
 
 def all_timestamps(cfg: dict) -> list[str]:
-    return list_timestamps(cfg["frames_dir"], cfg.get("frames_layout", "normalized"))
+    return list_timestamps(
+        cfg["frames_dir"],
+        cfg.get("frames_layout", "normalized"),
+        view_names(cfg),
+    )
 
 
 def sample_timestamps() -> list[str]:
@@ -124,7 +128,7 @@ def resize_depth_to(depth: np.ndarray, hw: tuple[int, int]) -> np.ndarray:
 
 def load_fullres_frames(cfg: dict, timestamp: str) -> np.ndarray:
     frames = []
-    for vname in VIEW_NAMES:
+    for vname in view_names(cfg):
         path = frame_path(cfg["frames_dir"], cfg.get("frames_layout", "normalized"), timestamp, vname)
         bgr = cv2.imread(path)
         if bgr is None:

@@ -78,7 +78,11 @@ def main() -> None:
         collision_path = output_root / "meshes/collision" / f"{part}.obj"
         export_collision_obj(canonical_mesh, collision_path)
 
-        components = canonical_mesh.split(only_watertight=False)
+        # ``split`` materializes a new mesh for every connected component and
+        # becomes prohibitively expensive for dense reconstruction meshes.
+        # ``body_count`` computes the same QA quantity from sparse vertex
+        # adjacency without duplicating any geometry.
+        connected_components = int(canonical_mesh.body_count)
         part_info[part] = {
             "source_mesh": str(source_path.relative_to(project_root)),
             "source_sha256": sha256_file(source_path),
@@ -91,7 +95,7 @@ def main() -> None:
             "canonical_extents_m": np.asarray(canonical_mesh.extents, dtype=float).tolist(),
             "vertices": int(len(canonical_mesh.vertices)),
             "faces": int(len(canonical_mesh.faces)),
-            "connected_components": int(len(components)),
+            "connected_components": connected_components,
             "watertight": bool(canonical_mesh.is_watertight),
             "mass_kg": float(config.get("mass_kg", {}).get(part, 1.0)),
             "mass_source": "configured_assumption",

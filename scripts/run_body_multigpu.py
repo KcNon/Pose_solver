@@ -16,6 +16,7 @@ def main() -> None:
     parser.add_argument("--gpus", nargs="+", type=int, required=True)
     parser.add_argument("--python", default="/data_ft_9_10/wentai/projects/sam3/.venv/bin/python")
     parser.add_argument("--log-dir", default="outputs/normalized_body_all6_000000/logs")
+    parser.add_argument("--init-timestamp", default="000000")
     args = parser.parse_args()
 
     log_dir = Path(args.log_dir)
@@ -34,7 +35,7 @@ def main() -> None:
                 args.python, "-u", "scripts/seg_masks_body_reanchor.py",
                 "--pipeline", args.pipeline,
                 "--view", view,
-                "--init-timestamp", "000000",
+                "--init-timestamp", args.init_timestamp,
                 "--gpu", str(gpu),
             ]
             env = os.environ.copy()

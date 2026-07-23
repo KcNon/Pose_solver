@@ -49,7 +49,10 @@ def compute_depth_gauge(
             depth_stack = np.empty((len(timestamps),) + depth.shape, np.float32)
             valid_stack = np.zeros((len(timestamps),) + depth.shape, bool)
         depth_stack[index] = depth
-        masks = load_palette_masks(cfg["masks_dir"], timestamp, [part], recon["depth_hw"])[part]
+        masks = load_palette_masks(
+            cfg["masks_dir"], timestamp, [part], recon["depth_hw"],
+            views=cfg.get("views"),
+        )[part]
         for v in range(depth.shape[0]):
             mask = cv2.erode(masks[v].astype(np.uint8), kernel, iterations=erode).astype(bool)
             valid_stack[index, v] = mask & np.isfinite(depth[v]) & (depth[v] > 1e-3)
@@ -135,7 +138,10 @@ def compute_view_bias(
         depth = recon["depth"]
         if gauge is not None:
             depth = apply_depth_gauge(depth, gauge, timestamp)
-        masks = load_palette_masks(cfg["masks_dir"], timestamp, [part], recon["depth_hw"])[part]
+        masks = load_palette_masks(
+            cfg["masks_dir"], timestamp, [part], recon["depth_hw"],
+            views=cfg.get("views"),
+        )[part]
         clouds, rays = [], []
         for v in range(depth.shape[0]):
             mask = masks[v] & np.isfinite(depth[v]) & (depth[v] > 1e-3)
