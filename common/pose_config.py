@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from common.symmetry import symmetry_spec_from_state
+
 
 TRACKING_METHODS = {
     "cloud_registration",
@@ -58,6 +60,10 @@ def validate_pose_config(config: dict, *, check_paths: bool = False) -> dict:
         )
     for part in parts:
         state = config["states"][part]
+        try:
+            symmetry_spec_from_state(state)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"{part}: invalid symmetry: {error}") from error
         method = state.get("method", "cloud_registration")
         if method not in TRACKING_METHODS:
             raise ValueError(f"{part}: unsupported method {method!r}")

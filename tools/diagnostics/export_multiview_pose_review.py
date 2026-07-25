@@ -23,6 +23,7 @@ from common.pose_visualization import (
     silhouette_review_metrics,
     solid_mesh,
 )
+from common.symmetry import symmetry_spec_from_state
 
 
 def main() -> None:
@@ -228,12 +229,9 @@ def main() -> None:
         "coordinate_conventions": trajectory["conventions"],
         "reference_part": trajectory["reference_part"],
         "symmetry": {
-            part: {
-                "axis_raw": cfg.get("states", {})
-                .get(part, {})
-                .get("symmetry_axis_raw"),
-                "continuous_or_discrete": None,
-            }
+            part: symmetry_spec_from_state(
+                cfg["states"][part]
+            ).as_dict()
             for part in trajectory["parts"]
         },
         "semantic_axes": {

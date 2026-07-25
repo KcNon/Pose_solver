@@ -12,7 +12,8 @@ from scipy.spatial.transform import Rotation, Slerp
 from common.cloud_io import read_ply_xyz
 from common.gicp import multiscale_gicp, subsample, transform_angle, voxel_unique
 from common.normalized_recon import load_recon, recon_npz_path, scale_intrinsics
-from common.pose_transforms import axis_rotation, transform_points
+from common.pose_transforms import transform_points
+from common.symmetry import SymmetrySpec, resolve_symmetric_pose
 
 
 def load_part_cloud(
@@ -49,16 +50,22 @@ def align_symmetric_pose(
     axis_raw: np.ndarray,
     step_degrees: float = 5.0,
 ) -> np.ndarray:
-    """Choose the equivalent axial rotation closest to a reference pose."""
-    best = None
-    for angle in np.deg2rad(np.arange(0.0, 360.0, step_degrees)):
-        candidate = pose @ axis_rotation(axis_raw, float(angle))
-        error = Rotation.from_matrix(
-            reference[:3, :3].T @ candidate[:3, :3]
-        ).magnitude()
-        if best is None or error < best[0]:
-            best = (float(error), candidate)
-    return best[1]
+    """Compatibility wrapper for continuous axial symmetry.
+
+    New code should construct a :class:`common.symmetry.SymmetrySpec` and call
+    :func:`common.symmetry.resolve_symmetric_pose` directly.
+    """
+    symmetry = SymmetrySpec(
+        axis_raw=tuple(np.asarray(axis_raw, dtype=np.float64)),
+        equivalence="continuous_axial",
+        candidate_step_deg=float(step_degrees),
+    )
+    return resolve_symmetric_pose(
+        pose,
+        reference,
+        symmetry,
+        include_observation_ambiguities=False,
+    ).pose
 
 
 def interpolate_transform(delta: np.ndarray, fraction: float) -> np.ndarray:
@@ -138,7 +145,7 @@ def track_cloud_registration(
     end_pose: np.ndarray,
     cloud_root: Path,
     registration_config: dict,
-    symmetry_axis_raw: np.ndarray | None,
+    symmetry: SymmetrySpec | None,
 ) -> tuple[dict[int, np.ndarray], dict]:
     clouds = {
         frame: load_part_cloud(cloud_root, frame, part)
@@ -182,13 +189,15 @@ def track_cloud_registration(
             quality["rejected"] = False
             previous_pair = pair
         current = np.linalg.inv(pair) @ poses[previous_frame]
-        if (
-            symmetry_axis_raw is not None
-            and registration_config.get("symmetry_lock", True)
+        if symmetry is not None and registration_config.get(
+            "symmetry_lock", True
         ):
-            current = align_symmetric_pose(
-                current, poses[previous_frame], symmetry_axis_raw
-            )
+            current = resolve_symmetric_pose(
+                current,
+                poses[previous_frame],
+                symmetry,
+                include_observation_ambiguities=False,
+            ).pose
         poses[frame] = current
         registrations[f"{frame:06d}_to_{previous_frame:06d}"] = {
             "source": frame,
@@ -224,10 +233,13 @@ def track_cloud_registration(
             )
             poses[frame] = pose
     predicted_end = poses[end]
-    if symmetry_axis_raw is not None:
-        end_pose = align_symmetric_pose(
-            end_pose, predicted_end, symmetry_axis_raw
-        )
+    if symmetry is not None:
+        end_pose = resolve_symmetric_pose(
+            end_pose,
+            predicted_end,
+            symmetry,
+            include_observation_ambiguities=False,
+        ).pose
     delta = end_pose @ np.linalg.inv(predicted_end)
     for frame in range(start, end + 1):
         fraction = (frame - start) / max(end - start, 1)

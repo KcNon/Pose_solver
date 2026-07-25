@@ -19,11 +19,17 @@ run_isaac_insertion.py             Isaac Sim python.sh
 run_isaac_video.py                 Isaac Sim python.sh
               │
      complete multi-view MP4
+              │
+              ▼
+run_isaac_physics_video.py         Isaac Sim python.sh
+              │
+ force-driven MP4 + contact report
 ```
 
 `scripts/` 只保留轻量 CLI；资产算法和导出实现位于
 `common/simulation_assets.py`、`common/simulation_export.py`，Isaac 实现位于
-`common/isaac_runtime.py`，完整视频实现位于 `common/isaac_video.py`。
+`common/isaac_runtime.py`，完整 pose 回放位于 `common/isaac_video.py`，完整
+物理驱动视频位于 `common/isaac_physics_video.py`。
 
 ## 1. 配置
 
@@ -135,6 +141,21 @@ ISAAC_SIM_DIR=/data_ft_9_10/wentai/projects/isaacsim/_build/linux-x86_64/release
 该入口会渲染完整时间线和三个固定视角。轨迹开始前保持空场景；部件只在其状态变为
 可观测后出现。视频是 pose 的 Isaac 回放，动态插入是否成功仍以 insertion report
 为准。
+
+如需原 `05_physics_driven_trajectory.mp4` 类型的完整视频，运行：
+
+```bash
+"$ISAAC_SIM_DIR/python.sh" scripts/run_isaac_physics_video.py \
+  --asset-root experiments/data_1/simulation_assets \
+  --runtime-root experiments/data_1/isaac_runtime_proxy_v2 \
+  --output-dir experiments/data_1/isaac_video_physics_complete \
+  --fps 5 --start-frame 0 --end-frame 245
+```
+
+其中带纹理 mesh 是实际 PhysX 刚体，青色和品红色半透明 mesh 是 pose solver
+目标。部件在首次可观测时初始化一次；之后只施加有上限的力和力矩，不再逐帧覆盖
+刚体 pose。碰撞始终参与实际轨迹，逐帧误差、接触数和穿透量写入
+`complete_physics_video_report.json`。
 
 ## 5. 验证
 

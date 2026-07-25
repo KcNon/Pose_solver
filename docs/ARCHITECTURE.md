@@ -43,12 +43,14 @@ NumPy / OpenCV / SciPy / trimesh / pyrender / small_gicp
 | `pose_refinement.py` | silhouette、点云评分、装配/速度约束 |
 | `pose_config.py` / `pose_validation.py` | pose 配置 preflight 与轨迹约束验证 |
 | `appearance_pose.py` | 纹理/轮廓候选、对称轴翻面假设、时序路径选择 |
+| `symmetry.py` | 连续轴对称、有限阶对称、观测翻转歧义及统一姿态消歧 |
 | `calibration_cache.py` | mesh、锚点点云、mask/RGB/相机输入指纹 |
 | `trajectory_io.py` | 派生字段归一化及 trajectory JSON/CSV 统一写出 |
 | `mesh_render.py` | DA3 相机约定下的离屏 mesh 渲染 |
 | `simulation_assets.py` / `simulation_export.py` | canonical mesh、装配位姿、URDF 和 QA |
 | `isaac_runtime.py` | USD 导入、碰撞设置、轨迹回放和落座试验 |
 | `isaac_video.py` | 复用 USD cache 的完整时间线多视角视频 |
+| `isaac_physics_video.py` | 有限力控制、接触统计和完整 PhysX 轨迹视频 |
 
 ## 4. 正式流程阶段
 
@@ -61,6 +63,7 @@ NumPy / OpenCV / SciPy / trimesh / pyrender / small_gicp
 | 仿真资产 | `export_simulation_assets.py` | canonical OBJ、URDF、manifest |
 | Isaac 验证 | `run_isaac_insertion.py` | USD、插入报告、最终截图 |
 | Isaac 视频 | `run_isaac_video.py` | 完整时间线三视角 MP4 |
+| Isaac 物理视频 | `run_isaac_physics_video.py` | 实际刚体与目标 ghost 的完整 PhysX MP4 |
 
 诊断脚本不应改写源 trajectory。refinement 也写入新的 output root，保证每次结果都能
 回溯到输入轨迹。
@@ -141,10 +144,16 @@ isaac.complete.json
 - reference part；
 - mesh 路径；
 - static/dynamic/assembly 先验；
-- symmetry/semantic axis；
-- appearance candidate mode（`axial`、`axis_flip`、`axial_and_flip`）及证据帧；
+- `symmetry.equivalence`（`none`、`continuous_axial`、`cyclic`）及
+  `axis_raw`/`discrete_order`；
+- `symmetry.observation_ambiguities`（例如 `axis_flip`）及 appearance 证据帧；
 - 通用单帧平移、SO(3) 旋转和对称轴方向变化门限；
 - 质量、摩擦、碰撞角色和成功阈值。
+
+后续 tracking/refinement 代码统一调用
+`symmetry_spec_from_state(state)` 和
+`resolve_symmetric_pose(measured_pose, reference_pose, symmetry)`；不要再各自
+枚举绕轴角度。连续轴对称使用解析解，`axis_flip` 只在显式启用观测歧义候选时参与选择。
 
 锚点先由点云得到尺度、平移和几何旋转候选，再由多视角 silhouette 与纹理边缘解除
 对称歧义；多个锚点通过有界运动先验联合选路。该流程不检查物体名称。输入指纹不一致

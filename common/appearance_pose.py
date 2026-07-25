@@ -12,34 +12,13 @@ from common.mask_io import frame_path
 from common.normalized_recon import load_recon, scale_intrinsics
 from common.pose_refinement import silhouette_metrics
 from common.pose_transforms import rigid_from_similarity, similarity_from_rigid
-
-
-def _unit(vector: np.ndarray) -> np.ndarray:
-    vector = np.asarray(vector, dtype=np.float64).reshape(3)
-    norm = float(np.linalg.norm(vector))
-    if norm < 1e-12:
-        raise ValueError("axis must be non-zero")
-    return vector / norm
-
-
-def _axis_angle(axis: np.ndarray, angle_rad: float) -> np.ndarray:
-    axis = _unit(axis)
-    x, y, z = axis
-    skew = np.array([[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]], dtype=np.float64)
-    rotation = (
-        np.eye(3, dtype=np.float64)
-        + math.sin(angle_rad) * skew
-        + (1.0 - math.cos(angle_rad)) * (skew @ skew)
-    )
-    transform = np.eye(4, dtype=np.float64)
-    transform[:3, :3] = rotation
-    return transform
-
-
-def perpendicular_axis(axis: np.ndarray) -> np.ndarray:
-    axis = _unit(axis)
-    basis = np.eye(3, dtype=np.float64)[int(np.argmin(np.abs(axis)))]
-    return _unit(np.cross(axis, basis))
+from common.symmetry import (
+    SymmetrySpec,
+    axis_direction_error_deg,
+    symmetry_candidates,
+    symmetry_rotation_distance_deg,
+    symmetry_spec_from_state,
+)
 
 
 def candidate_local_rotations(
@@ -47,47 +26,27 @@ def candidate_local_rotations(
     mode: str,
     angle_step_deg: float = 30.0,
 ) -> list[dict[str, Any]]:
-    """Create generic orientation hypotheses in the canonical object frame.
-
-    ``axial`` resolves rotation around a declared symmetry axis. ``axis_flip``
-    resolves the two possible directions of that axis. ``axial_and_flip``
-    evaluates both ambiguity families together.
-    """
-
-    axis = _unit(axis)
+    """Compatibility wrapper for the former appearance candidate API."""
     mode = str(mode).lower()
     if mode not in {"none", "axial", "axis_flip", "axial_and_flip"}:
         raise ValueError(f"Unsupported appearance candidate mode: {mode}")
     if angle_step_deg <= 0.0 or angle_step_deg > 360.0:
         raise ValueError("angle_step_deg must be in (0, 360]")
-
-    angles = [0.0]
-    if mode in {"axial", "axial_and_flip"}:
-        count = max(1, int(round(360.0 / angle_step_deg)))
-        angles = [index * 360.0 / count for index in range(count)]
-
-    flips = [("same", np.eye(4, dtype=np.float64))]
-    if mode in {"axis_flip", "axial_and_flip"}:
-        flips.append(("flipped", _axis_angle(perpendicular_axis(axis), math.pi)))
-
-    candidates: list[dict[str, Any]] = []
-    seen: set[tuple[float, ...]] = set()
-    for flip_label, flip in flips:
-        for angle_deg in angles:
-            local = flip @ _axis_angle(axis, math.radians(angle_deg))
-            key = tuple(np.round(local[:3, :3], decimals=8).ravel())
-            if key in seen:
-                continue
-            seen.add(key)
-            candidates.append(
-                {
-                    "label": f"{flip_label}:axis_{angle_deg:.3f}",
-                    "axis_flipped": flip_label == "flipped",
-                    "axis_angle_deg": float(angle_deg),
-                    "local_transform": local,
-                }
-            )
-    return candidates
+    symmetry = SymmetrySpec(
+        axis_raw=tuple(np.asarray(axis, dtype=np.float64)),
+        equivalence=(
+            "continuous_axial"
+            if mode in {"axial", "axial_and_flip"}
+            else "none"
+        ),
+        observation_ambiguities=(
+            ("axis_flip",)
+            if mode in {"axis_flip", "axial_and_flip"}
+            else ()
+        ),
+        candidate_step_deg=float(angle_step_deg),
+    )
+    return symmetry_candidates(symmetry)
 
 
 def rotation_distance_deg(transform_a: np.ndarray, transform_b: np.ndarray) -> float:
@@ -114,13 +73,22 @@ def select_candidate_chain(
     max_rotation_deg_per_frame: float,
     static_ranges: list[list[int]] | list[tuple[int, int]] | None = None,
     transition_axis: np.ndarray | None = None,
+    transition_symmetry: SymmetrySpec | None = None,
 ) -> tuple[list[int], dict[str, Any]]:
     """Select orientation hypotheses with a generic bounded-motion prior."""
 
     if len(anchor_frames) != len(candidate_rows) or not anchor_frames:
         raise ValueError("anchor_frames and candidate_rows must be non-empty and have equal length")
     static_ranges = static_ranges or []
-    transition_axis = None if transition_axis is None else _unit(transition_axis)
+    transition_axis = (
+        None
+        if transition_axis is None
+        else np.asarray(transition_axis, dtype=np.float64)
+    )
+    if transition_axis is not None and transition_symmetry is not None:
+        raise ValueError(
+            "transition_axis and transition_symmetry are mutually exclusive"
+        )
     if max_rotation_deg_per_frame <= 0:
         raise ValueError("max_rotation_deg_per_frame must be positive")
 
@@ -145,15 +113,20 @@ def select_candidate_chain(
         for current_index, current in enumerate(current_rows):
             penalties: list[float] = []
             for previous_index, previous in enumerate(previous_rows):
-                if transition_axis is None:
+                if transition_symmetry is not None:
+                    angle_deg = symmetry_rotation_distance_deg(
+                        previous["pose"],
+                        current["pose"],
+                        transition_symmetry,
+                    )
+                elif transition_axis is None:
                     angle_deg = rotation_distance_deg(previous["pose"], current["pose"])
                 else:
-                    previous_axis = previous["pose"][:3, :3] @ transition_axis
-                    current_axis = current["pose"][:3, :3] @ transition_axis
-                    cosine = float(
-                        np.clip(np.dot(previous_axis, current_axis), -1.0, 1.0)
+                    angle_deg = axis_direction_error_deg(
+                        previous["pose"],
+                        current["pose"],
+                        transition_axis,
                     )
-                    angle_deg = math.degrees(math.acos(cosine))
                 normalized_rate = angle_deg / frame_gap / max_rotation_deg_per_frame
                 penalty = float(transition_weight) * normalized_rate * normalized_rate
                 penalties.append(penalty)
@@ -177,9 +150,13 @@ def select_candidate_chain(
         "dynamic_programming_scores": [row.tolist() for row in scores],
         "transition_penalties": transitions,
         "transition_metric": (
-            "full_rotation"
-            if transition_axis is None
-            else "declared_axis_direction"
+            "geometric_symmetry_quotient"
+            if transition_symmetry is not None
+            else (
+                "full_rotation"
+                if transition_axis is None
+                else "declared_axis_direction"
+            )
         ),
     }
     return selected, diagnostics
@@ -269,10 +246,12 @@ def refine_anchor_orientations(
 
     from common.mesh_render import SceneRenderer
 
-    axis = np.asarray(appearance_cfg["symmetry_axis_raw"], dtype=np.float64)
-    mode = str(appearance_cfg.get("candidate_mode", "axial"))
-    step_deg = float(appearance_cfg.get("angle_step_deg", 30.0))
-    candidates = candidate_local_rotations(axis, mode, step_deg)
+    symmetry = symmetry_spec_from_state(state_cfg)
+    if symmetry.axis is None:
+        raise ValueError(
+            f"{part}: appearance refinement requires a symmetry axis"
+        )
+    candidates = symmetry_candidates(symmetry)
     width, height = [int(value) for value in appearance_cfg.get("resolution", [240, 135])]
     erosion_pixels = int(appearance_cfg.get("texture_erosion_pixels", 3))
     min_mask_pixels = int(appearance_cfg.get("min_mask_pixels", 80))
@@ -442,7 +421,7 @@ def refine_anchor_orientations(
             appearance_cfg.get("max_rotation_deg_per_frame", 10.0)
         ),
         static_ranges=_range_pairs(state_cfg.get("static_ranges", [])),
-        transition_axis=axis if mode == "axis_flip" else None,
+        transition_symmetry=symmetry,
     )
     updated: dict[int, np.ndarray] = {}
     for anchor_index, anchor_frame in enumerate(anchor_frames):
@@ -457,8 +436,7 @@ def refine_anchor_orientations(
     return updated, {
         "enabled": True,
         "part": part,
-        "candidate_mode": mode,
-        "symmetry_axis_raw": _unit(axis).tolist(),
+        "symmetry": symmetry.as_dict(),
         "resolution": [width, height],
         "anchors": per_anchor_report,
         "chain": chain_report,

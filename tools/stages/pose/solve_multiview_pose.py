@@ -22,7 +22,6 @@ from common.io_utils import load_json, write_json
 from common.mesh_align import align_mesh_to_cloud
 from common.pose_config import validate_pose_config
 from common.pose_tracking import (
-    align_symmetric_pose,
     fuse_part_clouds,
     track_cloud_registration,
     track_mask_bbox_translation,
@@ -33,6 +32,7 @@ from common.pose_transforms import (
     rigid_from_similarity,
     similarity,
 )
+from common.symmetry import resolve_symmetric_pose, symmetry_spec_from_state
 from common.pose_validation import validate_world_poses
 from common.trajectory_io import (
     refresh_trajectory_derived_fields,
@@ -232,10 +232,9 @@ def _solve_part(
     method = state.get("method", "cloud_registration")
     poses = {}
     registrations = {}
-    axis = (
-        np.asarray(state["symmetry_axis_raw"], dtype=float)
-        if "symmetry_axis_raw" in state
-        else None
+    symmetry = symmetry_spec_from_state(state)
+    geometric_symmetry = (
+        symmetry if symmetry.equivalence != "none" else None
     )
     if method == "trajectory_prior":
         if prior is None:
@@ -266,10 +265,15 @@ def _solve_part(
         )
         start_pose = rigid_from_similarity(anchors[start_anchor], origin)
         end_pose = rigid_from_similarity(anchors[end_anchor], origin)
-        if axis is not None and method in {
+        if geometric_symmetry is not None and method in {
             "model_tracking", "mask_bbox_tracking"
         }:
-            end_pose = align_symmetric_pose(end_pose, start_pose, axis)
+            end_pose = resolve_symmetric_pose(
+                end_pose,
+                start_pose,
+                geometric_symmetry,
+                include_observation_ambiguities=False,
+            ).pose
         if method == "model_tracking":
             segment, segment_report = track_model_translation(
                 part,
@@ -307,7 +311,7 @@ def _solve_part(
                 end_pose,
                 cloud_root,
                 config["registration"],
-                axis,
+                geometric_symmetry,
             )
         else:
             raise ValueError(f"{part}: unknown tracking method {method!r}")
@@ -337,11 +341,16 @@ def _solve_part(
     )
     if missing:
         raise RuntimeError(f"{part}: uncovered frames {missing}")
-    if axis is not None and config["registration"].get("symmetry_lock", True):
+    if geometric_symmetry is not None and config["registration"].get(
+        "symmetry_lock", True
+    ):
         for frame in range(start_frame + 1, end_frame + 1):
-            poses[frame] = align_symmetric_pose(
-                poses[frame], poses[frame - 1], axis
-            )
+            poses[frame] = resolve_symmetric_pose(
+                poses[frame],
+                poses[frame - 1],
+                geometric_symmetry,
+                include_observation_ambiguities=False,
+            ).pose
     return poses, registrations
 
 

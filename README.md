@@ -51,6 +51,7 @@ experiments/  生成结果（被 .gitignore 忽略）
 - URDF 导出：`scripts/export_simulation_assets.py`
 - Isaac Sim 验证：`scripts/run_isaac_insertion.py`
 - Isaac 完整视频：`scripts/run_isaac_video.py`
+- Isaac 完整物理驱动视频：`scripts/run_isaac_physics_video.py`
 
 状态诊断、depth 稳定性审计和多视角评审位于 `tools/diagnostics/`；high-FPS
 重采样与局部轨迹替换位于 `tools/highfps/`；runner 调用的模型/solver 内部阶段

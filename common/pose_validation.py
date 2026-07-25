@@ -7,6 +7,10 @@ import numpy as np
 import trimesh
 
 from common.gicp import transform_angle
+from common.symmetry import (
+    axis_direction_error_deg,
+    symmetry_spec_from_state,
+)
 
 
 def validate_world_poses(
@@ -21,12 +25,11 @@ def validate_world_poses(
         translations = []
         rotations = []
         axes = []
+        symmetry = symmetry_spec_from_state(config["states"][part])
         axis = validation.get(
-            "axis_raw", config["states"][part].get("symmetry_axis_raw")
+            "axis_raw", symmetry.axis_raw
         )
         axis = None if axis is None else np.asarray(axis, dtype=np.float64)
-        if axis is not None:
-            axis /= np.linalg.norm(axis)
         for previous_frame, frame in zip(frames[:-1], frames[1:]):
             previous = world_poses[part][previous_frame]
             current = world_poses[part][frame]
@@ -36,13 +39,11 @@ def validate_world_poses(
             )
             rotations.append((frame, transform_angle(delta)))
             if axis is not None:
-                previous_axis = previous[:3, :3] @ axis
-                current_axis = current[:3, :3] @ axis
-                cosine = float(
-                    np.clip(np.dot(previous_axis, current_axis), -1.0, 1.0)
-                )
                 axes.append(
-                    (frame, float(np.degrees(np.arccos(cosine))))
+                    (
+                        frame,
+                        axis_direction_error_deg(previous, current, axis),
+                    )
                 )
         limits = {
             "translation_step_m": validation.get("max_translation_step_m"),
@@ -74,6 +75,7 @@ def validate_world_poses(
             return {"frame": frame, unit: value}
 
         report[part] = {
+            "symmetry": symmetry.as_dict(),
             "limits": limits,
             "max_translation_step": maximum(translations, "value_m"),
             "max_rotation_step": maximum(rotations, "value_deg"),

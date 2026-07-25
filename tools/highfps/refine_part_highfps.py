@@ -16,9 +16,10 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from common.io_utils import load_json, write_json
-from common.pose_tracking import align_symmetric_pose, track_mask_bbox_translation
+from common.pose_tracking import track_mask_bbox_translation
 from common.pose_transforms import similarity_from_rigid
 from common.pose_validation import validate_trajectory
+from common.symmetry import resolve_symmetric_pose, symmetry_spec_from_state
 
 
 def observing_views(config: dict, part: str, frame: int) -> int:
@@ -108,11 +109,14 @@ def main() -> None:
         ],
         dtype=np.float64,
     )
-    axis = config.get("states", {}).get(part, {}).get("symmetry_axis_raw")
-    if axis is not None:
-        end_pose = align_symmetric_pose(
-            end_pose, start_pose, np.asarray(axis, dtype=np.float64)
-        )
+    symmetry = symmetry_spec_from_state(config["states"][part])
+    if symmetry.equivalence != "none":
+        end_pose = resolve_symmetric_pose(
+            end_pose,
+            start_pose,
+            symmetry,
+            include_observation_ambiguities=False,
+        ).pose
 
     poses, tracking_report = track_mask_bbox_translation(
         part,

@@ -33,7 +33,10 @@
   },
   "states": {
     "inner_pot": {
-      "symmetry_axis_raw": [0.0, 1.0, 0.0],
+      "symmetry": {
+        "equivalence": "continuous_axial",
+        "axis_raw": [0.0, 1.0, 0.0]
+      },
       "validation": {
         "max_translation_step_m": 0.08,
         "max_rotation_step_deg": 10.0,
