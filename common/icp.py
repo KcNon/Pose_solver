@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from common.cloud_io import nearest_neighbor_rmse as nn_rmse, write_ply
+
 try:
     import kornia_rs as kr
 except ImportError as e:
@@ -185,28 +187,6 @@ def _result_to_T(result) -> np.ndarray:
     return T
 
 
-def nn_rmse(
-    source: np.ndarray,
-    target: np.ndarray,
-    T: np.ndarray,
-    max_pts: int = 4000,
-    seed: int = 0,
-) -> float:
-    """Subsampled nearest-neighbor RMSE for cross-backend comparison."""
-    src = _as_cloud(source)
-    tgt = _as_cloud(target)
-    if len(src) < 3 or len(tgt) < 3:
-        return float("inf")
-    rng = np.random.default_rng(seed)
-    if len(src) > max_pts:
-        src = src[rng.choice(len(src), max_pts, replace=False)]
-    if len(tgt) > max_pts:
-        tgt = tgt[rng.choice(len(tgt), max_pts, replace=False)]
-    aligned = apply_transform(src, T)
-    d2 = np.sum((aligned[:, None, :] - tgt[None, :, :]) ** 2, axis=2)
-    return float(np.sqrt(np.min(d2, axis=1).mean()))
-
-
 def _auto_gicp_resolution(pts: np.ndarray) -> tuple[float, float]:
     extent = np.max(pts, axis=0) - np.min(pts, axis=0)
     ds = max(float(np.max(extent)) / 80.0, 0.002)
@@ -350,21 +330,3 @@ def downsample(pts: np.ndarray, cols: np.ndarray | None, max_pts: int, seed: int
     idx = rng.choice(len(pts), max_pts, replace=False)
     c = cols[idx] if cols is not None else None
     return pts[idx], c
-
-
-def write_ply(path: str, pts: np.ndarray, cols: np.ndarray | None = None):
-    pts = np.asarray(pts, dtype=np.float32)
-    with open(path, "w", encoding="ascii") as f:
-        f.write("ply\nformat ascii 1.0\n")
-        f.write(f"element vertex {len(pts)}\n")
-        f.write("property float x\nproperty float y\nproperty float z\n")
-        if cols is not None:
-            f.write("property uchar red\nproperty uchar green\nproperty uchar blue\n")
-        f.write("end_header\n")
-        if cols is None:
-            for p in pts:
-                f.write(f"{p[0]:.6f} {p[1]:.6f} {p[2]:.6f}\n")
-        else:
-            cols = np.asarray(cols, dtype=np.uint8)
-            for p, c in zip(pts, cols):
-                f.write(f"{p[0]:.6f} {p[1]:.6f} {p[2]:.6f} {c[0]} {c[1]} {c[2]}\n")

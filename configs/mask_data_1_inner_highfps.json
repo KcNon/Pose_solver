@@ -1,0 +1,61 @@
+{
+  "frames_dir": "/data_ft_9_10/wentai/projects/pose_solver/experiments/data_1/highfps_inner_170_195/frames",
+  "work_root": "/data_ft_9_10/wentai/projects/pose_solver/experiments/data_1/highfps_inner_170_195/mask_work",
+  "output_root": "/data_ft_9_10/wentai/projects/pose_solver/experiments/data_1/highfps_inner_170_195/temporal_sam3",
+  "views": [
+    "GX012728",
+    "GX012828",
+    "GX013102",
+    "GX013140",
+    "GX013468",
+    "GX014074",
+    "GX015353",
+    "GX017743"
+  ],
+  "parts": {
+    "inner_pot": {
+      "id": 3,
+      "color": [0, 122, 255],
+      "start_frame": 0,
+      "prompts": [
+        "inner pot",
+        "metal bowl",
+        "black removable cooking pot"
+      ],
+      "tracking": {
+        "mode": "video",
+        "seed_frame": 0
+      }
+    }
+  },
+  "occlusion_order": ["inner_pot"],
+  "bbox_overrides": {
+    "000000": {
+      "GX013468": {"inner_pot": [307, 553, 637, 997]},
+      "GX014074": {"inner_pot": [167, 483, 500, 967]},
+      "GX015353": {"inner_pot": [300, 102, 537, 385]},
+      "GX017743": {"inner_pot": [432, 74, 666, 392]}
+    },
+    "000024": {
+      "GX012728": {"inner_pot": [120, 386, 440, 852]},
+      "GX012828": {"inner_pot": [159, 209, 422, 602]},
+      "GX013102": {"inner_pot": [480, 560, 780, 998]},
+      "GX013140": {"inner_pot": [573, 193, 815, 570]},
+      "GX013468": {"inner_pot": [307, 553, 638, 997]},
+      "GX014074": {"inner_pot": [163, 483, 500, 968]},
+      "GX015353": {"inner_pot": [300, 102, 537, 385]},
+      "GX017743": {"inner_pot": [432, 75, 667, 388]}
+    }
+  },
+  "qwen_python": "/data_ft_9_10/wentai/projects/qwen3-vl/.venv/bin/python",
+  "sam_python": "/data_ft_9_10/wentai/projects/sam3/.venv/bin/python",
+  "qwen_model": "/data_ft_9_10/wentai/projects/qwen3-vl/models/Qwen3-VL-8B-Instruct",
+  "sam_ckpt": "/data_ft_9_10/wentai/projects/sam3/sam3.1/sam3.1_multiplex.pt",
+  "multiview_completion": {
+    "enabled": false
+  },
+  "runtime": {
+    "qwen_gpu": 1,
+    "sam_gpu": 1
+  }
+}

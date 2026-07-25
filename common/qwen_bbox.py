@@ -4,8 +4,6 @@ from __future__ import annotations
 import json
 import re
 
-from PIL import ImageDraw, ImageFont
-
 LABEL_ALIASES = {
     "pot": "inner_pot",
     "inner pot": "inner_pot",
@@ -38,6 +36,38 @@ COLORS = [
     "#FF3B30", "#34C759", "#007AFF", "#FF9500", "#AF52DE", "#FF2D55",
     "#5AC8FA", "#FFCC00", "#00C7BE", "#A2845E", "#8E8E93", "#30B0C7",
 ]
+
+
+def build_batch_prompt(parts) -> str:
+    """Build a strict detection prompt from arbitrary configured parts.
+
+    ``parts`` may contain PartSpec-like objects or dictionaries with
+    ``name``/``prompts`` fields.
+    """
+    rows = []
+    labels = []
+    for part in parts:
+        if isinstance(part, dict):
+            name = str(part["name"])
+            prompts = part.get("prompts", [name.replace("_", " ")])
+        else:
+            name = str(part.name)
+            prompts = list(part.prompts)
+        labels.append(name)
+        description = ", ".join(str(value) for value in prompts)
+        rows.append(f"- {name}: {description}")
+    allowed_labels = ", ".join(labels)
+    example_label = labels[0]
+    return (
+        "Detect each configured object part IF it is visible in this image.\n"
+        + "\n".join(rows)
+        + "\nOmit parts that are not visible. Do not detect hands, people, the "
+          "table, backdrop, or containers that are not listed above. "
+          'Return ONLY a JSON array such as '
+          f'[{{"bbox_2d":[x1,y1,x2,y2],"label":"{example_label}"}}]. '
+          f"Allowed labels: {allowed_labels}. Coordinates are normalized 0-1000. "
+          "Use the exact configured labels and output no other text."
+    )
 
 
 def normalize_label(label: str) -> str:
@@ -80,6 +110,8 @@ def to_pixels(box, width, height):
 
 
 def visualize(image, boxes, out_path):
+    from PIL import ImageDraw, ImageFont
+
     img = image.convert("RGB").copy()
     W, H = img.size
     draw = ImageDraw.Draw(img)

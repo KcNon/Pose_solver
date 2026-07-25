@@ -1,0 +1,83 @@
+{
+  "output_root": "/data_ft_9_10/wentai/projects/pose_solver/experiments/reconviagen_objects",
+  "rgba_root": "/data_ft_9_10/wentai/projects/pose_solver/experiments/reconviagen_objects/rgba",
+  "mesh_root": "/data_ft_9_10/wentai/projects/pose_solver/experiments/reconviagen_objects/reconviagen_meshes",
+  "sample_fps": 2.0,
+  "qwen_python": "/data_ft_9_10/wentai/projects/qwen3-vl/.venv/bin/python",
+  "sam_python": "/data_ft_9_10/wentai/projects/sam3/.venv/bin/python",
+  "recon_python": "/data_ft_9_10/wentai/projects/ReconViaGen/.venv/bin/python",
+  "qwen_model": "/data_ft_9_10/wentai/projects/qwen3-vl/models/Qwen3-VL-8B-Instruct",
+  "sam_ckpt": "/data_ft_9_10/wentai/projects/sam3/sam3.1/sam3.1_multiplex.pt",
+  "videos": {
+    "body": "/data_ft_9_10/wentai/projects/data/obiect/body.mp4",
+    "inner_pot": "/data_ft_9_10/wentai/projects/data/obiect/inner_pot.mp4",
+    "lid": "/data_ft_9_10/wentai/projects/data/obiect/lid.mp4"
+  },
+  "parts": {
+    "body": {
+      "id": 2,
+      "color": [52, 199, 89],
+      "prompts": [
+        "rice cooker body",
+        "cooker body without lid",
+        "rice cooker"
+      ],
+      "mask_timestamps": [
+        "000000", "000008", "000016", "000024", "000031", "000039",
+        "000047", "000055", "000063", "000071", "000079", "000087",
+        "000094", "000102", "000110", "000118"
+      ],
+      "rgba_timestamps": [
+        "000000", "000008", "000016", "000024", "000031", "000039",
+        "000047", "000055", "000063", "000071", "000079", "000087",
+        "000102", "000110", "000118"
+      ]
+    },
+    "inner_pot": {
+      "id": 3,
+      "color": [0, 122, 255],
+      "prompts": [
+        "inner pot",
+        "metal bowl",
+        "black pot"
+      ],
+      "mask_timestamps": [
+        "000000", "000007", "000015", "000022", "000030", "000037",
+        "000044", "000052", "000059", "000067", "000074", "000081",
+        "000089", "000096", "000104", "000111"
+      ],
+      "rgba_timestamps": [
+        "000000", "000007", "000015", "000022", "000030", "000037",
+        "000044", "000052", "000059", "000067", "000074", "000081",
+        "000089", "000096", "000104", "000111"
+      ]
+    },
+    "lid": {
+      "id": 1,
+      "color": [255, 59, 48],
+      "prompts": [
+        "rice cooker lid",
+        "metal lid"
+      ],
+      "mask_timestamps": [
+        "000000", "000005", "000010", "000015", "000021", "000026",
+        "000031", "000036", "000041", "000046", "000051", "000056",
+        "000062", "000067", "000072", "000077"
+      ],
+      "rgba_timestamps": [
+        "000000", "000005", "000010", "000015", "000021", "000026",
+        "000031", "000036", "000041", "000046", "000051", "000056",
+        "000062", "000067", "000072", "000077"
+      ],
+      "postprocess": "convex_hull"
+    }
+  },
+  "reconstruction": {
+    "strategy": "adaptive_guidance_weight",
+    "pipeline_type": "1024_cascade",
+    "ss_source": "mesh",
+    "seed": 0,
+    "decimation_target": 500000,
+    "texture_size": 2048
+  }
+}

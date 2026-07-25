@@ -1,12 +1,12 @@
 {
   "asset_name": "rice_cooker_three_part",
-  "trajectory": "experiments/three_part_multiview_111f/outputs_v4_lid_se3/pose/trajectory.json",
+  "trajectory": "experiments/data_1/pose_outputs/solver_repaired_highfps_inner/pose/trajectory.json",
   "meshes": {
-    "body": "mesh/body.glb",
-    "inner_pot": "mesh/inner_pot.glb",
-    "lid": "mesh/lid.glb"
+    "body": "experiments/reconviagen_objects/reconviagen_meshes/body.glb",
+    "inner_pot": "experiments/reconviagen_objects/reconviagen_meshes/inner_pot.glb",
+    "lid": "experiments/reconviagen_objects/reconviagen_meshes/lid.glb"
   },
-  "output_dir": "experiments/rice_cooker_simulation_assets",
+  "output_dir": "experiments/data_1/simulation_assets",
   "reference_part": "body",
   "display_parts": [
     "body",
@@ -18,16 +18,63 @@
     "inner_pot": 0.5,
     "lid": 0.8
   },
+  "collision_proxies": {
+    "body": {
+      "type": "cylindrical_container",
+      "axis": "y",
+      "inner_radius_m": 0.128,
+      "outer_radius_m": 0.155,
+      "floor_top_m": -0.006,
+      "rim_top_m": 0.11654,
+      "floor_thickness_m": 0.008,
+      "sections": 64
+    },
+    "inner_pot": {
+      "type": "compound",
+      "components": [
+        {
+          "type": "revolved_solid",
+          "axis": "y",
+          "profile_axis_radius_m": [
+            [-0.069, 0.090],
+            [-0.050, 0.103],
+            [0.020, 0.114],
+            [0.0536, 0.116]
+          ],
+          "sections": 64
+        },
+        {
+          "type": "cylinder",
+          "axis": "y",
+          "radius_m": 0.142,
+          "axis_min_m": 0.0536,
+          "axis_max_m": 0.080,
+          "sections": 64
+        }
+      ]
+    },
+    "lid": {
+      "type": "revolved_solid",
+      "axis": "y",
+      "profile_axis_radius_m": [
+        [-0.025, 0.128],
+        [-0.010, 0.129],
+        [0.010, 0.070],
+        [0.035, 0.025]
+      ],
+      "sections": 64
+    }
+  },
   "assembly_targets": {
     "inner_pot": {
-      "frame_range": [41, 110],
+      "frame_range": [192, 245],
       "required_state": "static",
       "min_observing_views": 1,
       "max_translation_residual_m": 0.01,
       "max_rotation_residual_deg": 5.0
     },
     "lid": {
-      "frame_range": [109, 110],
+      "frame_range": [218, 245],
       "required_state": "static",
       "min_observing_views": 1,
       "max_translation_residual_m": 0.01,
@@ -38,7 +85,8 @@
     "container_part": "body",
     "inserted_part": "inner_pot",
     "up_axis_body": [0.0, 1.0, 0.0],
-    "observed_replay_frame_range": [0, 41],
+    "align_insert_up_axis": true,
+    "observed_replay_frame_range": [175, 192],
     "physics_hz": 240,
     "settle_seconds": 3.0,
     "drop_height_m": 0.03,

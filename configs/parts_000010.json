@@ -1,8 +1,0 @@
-{
-  "timestamp": "000010",
-  "parts": ["lid", "body"],
-  "prompts": {
-    "lid": ["lid"],
-    "body": ["rice cooker body", "cooker body without lid", "rice cooker"]
-  }
-}

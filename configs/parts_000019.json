@@ -1,9 +1,0 @@
-{
-  "timestamp": "000019",
-  "parts": ["lid", "body", "inner_pot"],
-  "prompts": {
-    "lid": ["lid"],
-    "body": ["rice cooker body", "cooker body without lid"],
-    "inner_pot": ["inner pot", "metal bowl", "black pot"]
-  }
-}

@@ -2,7 +2,7 @@
 
 The recon depth of each frame carries a per-view global shift of up to ~9 mm
 while the pixel-level residual is sub-millimetre (measured by
-``scripts/diagnose_depth_stability.py``).  Anchoring every frame's depth to
+``tools/diagnostics/diagnose_depth_stability.py``). Anchoring every frame's depth to
 the temporal median depth of the static reference part removes that shift
 before backprojection, so the per-part clouds inherit the residual noise
 floor instead of the frame-to-frame drift.

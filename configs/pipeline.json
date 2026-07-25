@@ -1,8 +1,0 @@
-{
-  "recon_backend": "da3",
-  "frames_dir": "/data_ft_9_10/wentai/projects/depth-anything-3/试标数据-6.30/2/output_test/frames",
-  "vggt_dir": "/data_ft_9_10/wentai/projects/depth-anything-3/试标数据-6.30/2/outputs/vggt_output",
-  "da3_dir": "/data_ft_9_10/wentai/projects/depth-anything-3/试标数据-6.30/2/output_test/da3_output",
-  "qwen_model": "/data_ft_9_10/wentai/projects/qwen3-vl/models/Qwen3-VL-8B-Instruct",
-  "sam_ckpt": "/data_ft_9_10/wentai/projects/sam3/sam3.1/sam3.1_multiplex.pt"
-}

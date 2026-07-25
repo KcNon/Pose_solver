@@ -16,24 +16,7 @@ import numpy as np
 import trimesh
 from trimesh import registration as reg
 
-from common.icp import nn_rmse
-
-
-def read_ply_xyz(path: str) -> np.ndarray:
-    """Read xyz from an ascii PLY (matches scripts/visualize_projection.read_ply)."""
-    pts = []
-    with open(path, encoding="ascii") as f:
-        hdr = False
-        for line in f:
-            if line.strip() == "end_header":
-                hdr = True
-                continue
-            if not hdr:
-                continue
-            p = line.split()
-            if len(p) >= 3:
-                pts.append([float(p[0]), float(p[1]), float(p[2])])
-    return np.asarray(pts, dtype=np.float64)
+from common.cloud_io import nearest_neighbor_rmse, read_ply_xyz
 
 
 def _rms_radius(pts: np.ndarray, center: np.ndarray) -> float:
@@ -124,7 +107,7 @@ def align_mesh_to_cloud(
 
     # World-frame fit error: for each observed point, nearest transformed mesh pt.
     mesh_world = mesh_pts @ M.T + t
-    fit_rmse = nn_rmse(obs, mesh_world, np.eye(4))
+    fit_rmse = nearest_neighbor_rmse(obs, mesh_world, np.eye(4))
 
     return {
         "T_mesh_to_world": T_mesh_to_world,

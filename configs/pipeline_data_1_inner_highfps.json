@@ -1,0 +1,65 @@
+{
+  "frames_layout": "normalized",
+  "data_root": "/data_ft_9_10/wentai/projects/pose_solver/experiments/data_1/highfps_inner_170_195",
+  "output_root": "/data_ft_9_10/wentai/projects/pose_solver/experiments/data_1/highfps_inner_170_195/pose_outputs",
+  "point_cloud_output_root": "/data_ft_9_10/wentai/projects/pose_solver/experiments/data_1/highfps_inner_170_195/pose_outputs",
+  "frames_dir": "/data_ft_9_10/wentai/projects/pose_solver/experiments/data_1/highfps_inner_170_195/frames",
+  "masks_dir": "/data_ft_9_10/wentai/projects/pose_solver/experiments/data_1/highfps_inner_170_195/temporal_sam3/masks",
+  "recon_backend": "da3_self_cond",
+  "da3_self_cond_dir": "/data_ft_9_10/wentai/projects/pose_solver/experiments/data_1/highfps_inner_170_195/da3-self-fixed",
+  "depth_gauge_path": "/data_ft_9_10/wentai/projects/pose_solver/experiments/data_1/highfps_inner_170_195/depth_gauge_29_97fps.json",
+  "point_cloud_tag": "gauge_repaired",
+  "mesh_dir": "/data_ft_9_10/wentai/projects/pose_solver/experiments/reconviagen_objects/reconviagen_meshes",
+  "views": [
+    "GX012728",
+    "GX012828",
+    "GX013102",
+    "GX013140",
+    "GX013468",
+    "GX014074",
+    "GX015353",
+    "GX017743"
+  ],
+  "parts": ["inner_pot"],
+  "part_start_frames": {
+    "inner_pot": 0
+  },
+  "part_ids": {
+    "inner_pot": 3
+  },
+  "frames": {
+    "start": 0,
+    "end": 155
+  },
+  "states": {
+    "inner_pot": {
+      "symmetry_axis_raw": [0.0, 1.0, 0.0],
+      "validation": {
+        "max_translation_step_m": 0.08,
+        "max_rotation_step_deg": 10.0,
+        "max_axis_step_deg": 10.0,
+        "fail_on_violation": true
+      },
+      "mask_bbox_tracking": {
+        "ranges": {
+          "24-132": {
+            "start_bias_frames": [24, 25, 26, 27, 28, 29],
+            "end_bias_frames": [132, 138, 144, 150, 155],
+            "max_translation_step_m": 0.08,
+            "prediction_velocity_cap_m": 0.05,
+            "motion_prior_weight": 0.35,
+            "motion_prior_sigma_m": 0.04,
+            "linear_prior_weight": 0.01,
+            "linear_prior_sigma_m": 0.15
+          }
+        }
+      }
+    }
+  },
+  "render": {
+    "fps": 29.97002997002997,
+    "axis_length_m": 0.09,
+    "axis_radius_m": 0.004,
+    "primary_view": "GX013102"
+  }
+}

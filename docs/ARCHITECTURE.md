@@ -32,35 +32,46 @@ NumPy / OpenCV / SciPy / trimesh / pyrender / small_gicp
 | `io_utils.py` | UTF-8 JSON 读写 |
 | `pose_transforms.py` | rigid/similarity 转换、轴旋转、点变换 |
 | `mask_io.py` | normalized mask、视角和时间戳约定 |
+| `masking/` | 任意部件配置、独立二值 track、遮挡合成、质量报告与多视角几何先验 |
 | `qwen_bbox.py` | Qwen bbox prompt、解析和可视化 |
 | `normalized_recon.py` | 当前 normalized DA3/VGGT 数据布局加载 |
 | `backproject_utils.py` / `geom.py` | mask + depth 反投影 |
 | `depth_gauge.py` | 静态参考部件的逐帧/跨视角深度校正 |
-| `icp.py` / `mesh_align.py` | 刚体点云配准与 mesh similarity 标定 |
-| `gicp.py` | 多尺度 GICP、下采样和配准质量 |
+| `cloud_io.py` | 无 ICP 后端依赖的 PLY 读写与最近邻诊断 |
+| `icp.py` / `mesh_align.py` | 基础 ICP 兼容接口与 mesh similarity 标定 |
+| `gicp.py` / `pose_tracking.py` | 正式多尺度 GICP、对称性连续化和三种跟踪策略 |
 | `pose_refinement.py` | silhouette、点云评分、装配/速度约束 |
-| `trajectory_io.py` | trajectory CSV 统一写出 |
+| `pose_config.py` / `pose_validation.py` | pose 配置 preflight 与轨迹约束验证 |
+| `appearance_pose.py` | 纹理/轮廓候选、对称轴翻面假设、时序路径选择 |
+| `calibration_cache.py` | mesh、锚点点云、mask/RGB/相机输入指纹 |
+| `trajectory_io.py` | 派生字段归一化及 trajectory JSON/CSV 统一写出 |
 | `mesh_render.py` | DA3 相机约定下的离屏 mesh 渲染 |
-| `simulation_assets.py` | canonical mesh、装配位姿、URDF 和 QA |
+| `simulation_assets.py` / `simulation_export.py` | canonical mesh、装配位姿、URDF 和 QA |
+| `isaac_runtime.py` | USD 导入、碰撞设置、轨迹回放和落座试验 |
+| `isaac_video.py` | 复用 USD cache 的完整时间线多视角视频 |
 
 ## 4. 正式流程阶段
 
 | 阶段 | 入口 | 主要输出 |
 |---|---|---|
-| mask | `run_temporal_mask_pipeline.py` | palette PNG、mask QA |
-| depth 诊断 | `diagnose_depth_stability.py` | depth 时序报告 |
-| depth gauge | `calibrate_depth_gauge.py` | `depth_gauge.json` |
-| 点云 | `backproject_normalized.py` | `parts_ply/<variant>/<frame>/<part>.ply` |
-| 状态诊断 | `detect_part_states.py` | `part_states.json` |
-| 主求解 | `solve_multiview_pose.py` | `trajectory.json/csv`、配准诊断 |
-| 全局精修 | `refine_multiview_pose.py` | body/inner/lid 派生轨迹与联合验收 |
+| mask | `run_mask_pipeline.py` | 独立部件 track、palette PNG、mask QA |
+| depth + 点云 | `run_depth_pipeline.py` | `depth_gauge.json`、分部件 PLY |
+| pose 调度 | `run_pose_pipeline.py` | 状态、求解、评审和渲染的断点执行 |
 | 渲染 | `render_multiview_pose.py` | overlay、纯 mesh、纹理、坐标轴视频 |
-| 六视角评审 | `export_multiview_pose_review.py` | silhouette 指标、关键帧评审图 |
 | 仿真资产 | `export_simulation_assets.py` | canonical OBJ、URDF、manifest |
 | Isaac 验证 | `run_isaac_insertion.py` | USD、插入报告、最终截图 |
+| Isaac 视频 | `run_isaac_video.py` | 完整时间线三视角 MP4 |
 
 诊断脚本不应改写源 trajectory。refinement 也写入新的 output root，保证每次结果都能
 回溯到输入轨迹。
+
+可选工具不放在正式入口目录：
+
+| 类型 | 位置 | 用途 |
+|---|---|---|
+| depth/状态/多视角评审 | `tools/diagnostics/` | QA 与人工验收 |
+| high-FPS | `tools/highfps/` | gauge 重采样与局部轨迹替换 |
+| runner 内部阶段 | `tools/stages/` | Qwen、SAM 和 pose solver 的跨环境/断点入口 |
 
 ## 5. 核心数据约定
 
@@ -99,21 +110,16 @@ solver、renderer 与 URDF 导出不得各自重新实现。
 
 在自动 FSM 完全验证前，状态诊断只作为附加证据，不暗中改变 pose。
 
-## 6. 正式代码与内部阶段
+## 6. 正式代码
 
-### 正式代码
-
-本文件第 4 节列出的入口和它们直接依赖的 `common/` 模块。
-
-`refine_body_global_yaw.py`、`refine_inner_assembly_prior.py`、
-`refine_lid_multiview_se3.py` 和 `select_pose_multimetric_final.py` 是可恢复的内部阶段。
-它们共享 `common/` 算法，但互不导入；正式批处理入口是 `refine_multiview_pose.py`。
+本文件第 4 节列出的入口和它们直接依赖的 `common/` 模块。`data/1` 的正式批处理
+入口是 `run_pose_pipeline.py`；各阶段通过 `--stages` 独立恢复。
 
 ## 7. 本轮清理
 
-本轮将 pose 精修收敛为一个正式入口，并删除旧 mesh pipeline、legacy 单帧流程、
-FoundationPose/oracle/filter 等一次性评估脚本。GICP、轨迹写出、silhouette/点云评分、
-装配约束和速度门已从 CLI 中抽到 `common/`，项目内不再存在 `scripts → scripts` 导入。
+本轮把 `data/1` 的正式流程收敛到 `run_pose_pipeline.py`，并将点云 I/O、三种 tracking
+strategy、轨迹派生字段和验证逻辑抽到 `common/`。旧六视角 V6、FoundationPose
+候选实验和旧 mask 兼容入口已移除，避免它们继续成为并行但不一致的 pipeline。
 
 ## 8. 批量复用方式
 
@@ -136,14 +142,19 @@ isaac.complete.json
 - mesh 路径；
 - static/dynamic/assembly 先验；
 - symmetry/semantic axis；
+- appearance candidate mode（`axial`、`axis_flip`、`axial_and_flip`）及证据帧；
+- 通用单帧平移、SO(3) 旋转和对称轴方向变化门限；
 - 质量、摩擦、碰撞角色和成功阈值。
+
+锚点先由点云得到尺度、平移和几何旋转候选，再由多视角 silhouette 与纹理边缘解除
+对称歧义；多个锚点通过有界运动先验联合选路。该流程不检查物体名称。输入指纹不一致
+时，`--reuse-calibration` 会拒绝旧缓存，必须重标定或显式强制复用。
 
 如果新对象需要修改 `solve_multiview_pose.py` 中的分支才能运行，应先判断该差异能否
 抽象成新的 tracking strategy 或约束配置，避免形成按对象复制的 solver。
 
 ## 9. 后续架构改进顺序
 
-1. 增加配置 schema 和输入 preflight，尽早报告缺帧、缺 mask、路径和单位错误；
-2. 将 solver 中的 tracking strategy 拆成独立模块并建立小型合成数据测试；
-3. 为 pipeline runner 增加输入哈希，避免仅凭输出存在性判断是否恢复；
-4. 将 Isaac 场景 authoring 与物理 trial 进一步拆开，便于批量无渲染验证。
+1. 为 pipeline runner 增加输入哈希，避免仅凭输出存在性判断是否恢复；
+2. 增加跨视角 silhouette、depth 和时序 pose 的联合回归测试；
+3. 将 Isaac 场景 authoring 与物理 trial 进一步拆开，便于批量无渲染验证。
