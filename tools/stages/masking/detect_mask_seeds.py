@@ -7,6 +7,8 @@ SAM tracks and final palette masks are separate stages.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 from pathlib import Path
 import sys
 
@@ -54,6 +56,32 @@ def _detect(model, processor, image_path: Path, prompt: str, max_new_tokens: int
     return raw, parse_boxes(raw)
 
 
+def _request_fingerprint(
+    *,
+    image_path: Path,
+    prompt: str,
+    model_path: str,
+    max_new_tokens: int,
+    max_pixels: int,
+) -> str:
+    stat = image_path.stat()
+    payload = {
+        "image": str(image_path.resolve()),
+        "image_size": stat.st_size,
+        "image_mtime_ns": stat.st_mtime_ns,
+        "prompt": prompt,
+        "model_path": str(model_path),
+        "max_new_tokens": int(max_new_tokens),
+        "max_pixels": int(max_pixels),
+    }
+    return hashlib.sha256(json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", "--pipeline", dest="config", required=True)
@@ -69,10 +97,6 @@ def main() -> None:
     parser.add_argument("--vis", action="store_true")
     parser.add_argument("--force", "--fresh", action="store_true")
     args = parser.parse_args()
-
-    import torch
-    from PIL import Image
-    from transformers import AutoModelForImageTextToText, AutoProcessor
 
     config = load_mask_pipeline_config(args.config)
     views = args.views or list(config.views)
@@ -107,19 +131,8 @@ def main() -> None:
     }
 
     model_path = config.raw["qwen_model"]
-    attention = _attention()
-    print(f"loading Qwen from {model_path} ({attention})", flush=True)
-    model = AutoModelForImageTextToText.from_pretrained(
-        model_path,
-        dtype=torch.bfloat16,
-        attn_implementation=attention,
-        device_map="auto",
-    )
-    processor = AutoProcessor.from_pretrained(model_path)
-    processor.image_processor.size = {
-        "longest_edge": args.max_pixels,
-        "shortest_edge": 256 * 32 * 32,
-    }
+    model = None
+    processor = None
 
     for timestamp in timestamps:
         active = [
@@ -132,6 +145,16 @@ def main() -> None:
         prompt = args.prompt or build_batch_prompt(active)
         allowed = {part.name for part in active}
         for view in views:
+            image_path = frame_path(config.frames_dir, view, timestamp)
+            if not image_path.exists():
+                raise FileNotFoundError(image_path)
+            request_fingerprint = _request_fingerprint(
+                image_path=image_path,
+                prompt=prompt,
+                model_path=model_path,
+                max_new_tokens=args.max_new_tokens,
+                max_pixels=args.max_pixels,
+            )
             existing = bbox_data.get("frames", {}).get(timestamp, {}).get(view)
             requested_before = set(existing.get("requested_parts", ())) if existing else set()
             if existing is not None and not requested_before:
@@ -140,13 +163,36 @@ def main() -> None:
             if (
                 existing is not None
                 and allowed.issubset(requested_before)
+                and existing.get("request_fingerprint") == request_fingerprint
                 and not args.force
             ):
                 print(f"{timestamp}/{view}: reuse bbox", flush=True)
                 continue
-            image_path = frame_path(config.frames_dir, view, timestamp)
-            if not image_path.exists():
-                raise FileNotFoundError(image_path)
+            if model is None or processor is None:
+                import torch
+                from transformers import (
+                    AutoModelForImageTextToText,
+                    AutoProcessor,
+                )
+
+                attention = _attention()
+                print(
+                    f"loading Qwen from {model_path} ({attention})",
+                    flush=True,
+                )
+                model = AutoModelForImageTextToText.from_pretrained(
+                    model_path,
+                    dtype=torch.bfloat16,
+                    attn_implementation=attention,
+                    device_map="auto",
+                )
+                processor = AutoProcessor.from_pretrained(model_path)
+                processor.image_processor.size = {
+                    "longest_edge": args.max_pixels,
+                    "shortest_edge": 256 * 32 * 32,
+                }
+            from PIL import Image
+
             image = Image.open(image_path).convert("RGB")
             raw, boxes = _detect(
                 model, processor, image_path, prompt, args.max_new_tokens
@@ -158,6 +204,7 @@ def main() -> None:
                 "parts": boxes,
                 "raw_output": raw,
                 "requested_parts": sorted(allowed),
+                "request_fingerprint": request_fingerprint,
             }
             if args.vis:
                 output = config.bbox_path.parent / "preview" / timestamp / f"{view}.png"

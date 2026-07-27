@@ -82,6 +82,11 @@
     "inner_pot",
     "body"
   ],
+  "mask_postprocess": {
+    "enabled": true,
+    "close_kernel": 5,
+    "fill_holes": true
+  },
   "bbox_overrides": {
     "000065": {
       "GX012828": {
@@ -101,6 +106,19 @@
       "GX012828": {
         "inner_pot": [159, 211, 423, 598]
       }
+    }
+  },
+  "automation": {
+    "discovery": {
+      "stride": 10,
+      "minimum_views": 2,
+      "consecutive_scans": 1
+    },
+    "repair": {
+      "enabled": true,
+      "apply": true,
+      "padding_frames": 2,
+      "maximum_jobs_per_part": 1
     }
   },
   "qwen_python": "/data_ft_9_10/wentai/projects/qwen3-vl/.venv/bin/python",

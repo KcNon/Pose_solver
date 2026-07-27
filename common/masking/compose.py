@@ -14,7 +14,12 @@ from .io import (
     track_path,
     write_json,
 )
-from .quality import summarize_area_series
+from .quality import (
+    clean_mask,
+    mask_iou,
+    mask_metrics,
+    summarize_track_series,
+)
 from .schema import MaskPipelineConfig
 
 
@@ -57,10 +62,19 @@ def compose_track_tree(
     tracks_root = tracks_root or config.tracks_root
     output_root = output_root or config.masks_root
     selected_views = views or list(config.views)
-    areas = {
-        view: {part.name: [] for part in config.parts}
+    features = {
+        view: {
+            part.name: {
+                "areas": [],
+                "centroids": [],
+                "temporal_ious": [],
+                "previous": None,
+            }
+            for part in config.parts
+        }
         for view in selected_views
     }
+    image_diagonals: dict[str, float] = {}
     for timestamp in timestamps:
         frame_number = int(timestamp)
         for view in selected_views:
@@ -71,6 +85,7 @@ def compose_track_tree(
                 shape = load_label_mask(
                     shape_source_root / timestamp / f"{view}.png"
                 ).shape
+            image_diagonals[view] = float(np.hypot(*shape))
             masks = {}
             for part in config.parts:
                 path = track_path(tracks_root, part.name, timestamp, view)
@@ -78,17 +93,50 @@ def compose_track_tree(
                     raise FileNotFoundError(
                         f"active part track is missing: {path}"
                     )
-                masks[part.name] = load_binary_mask(path, shape)
+                mask = load_binary_mask(path, shape)
+                global_cleanup = config.raw.get("mask_postprocess", {})
+                configured_parts = config.raw.get("parts", {})
+                part_values = (
+                    configured_parts.get(part.name, {})
+                    if isinstance(configured_parts, dict)
+                    else {}
+                )
+                part_cleanup = (
+                    part_values.get("mask_postprocess", {})
+                    if isinstance(part_values, dict)
+                    else {}
+                )
+                cleanup = {**global_cleanup, **part_cleanup}
+                if cleanup.get("enabled", False) and mask.any():
+                    mask = clean_mask(
+                        mask,
+                        close_kernel=int(
+                            cleanup.get("close_kernel", 5)
+                        ),
+                        fill_holes=bool(
+                            cleanup.get("fill_holes", True)
+                        ),
+                    )
+                masks[part.name] = mask
+                metric = mask_metrics(mask)
+                series = features[view][part.name]
+                series["areas"].append(int(metric["pixels"]))
+                series["centroids"].append(metric["centroid_xy"])
+                series["temporal_ious"].append(
+                    mask_iou(series["previous"], mask)
+                )
+                series["previous"] = mask
             label, resolved = compose_frame(masks, config, frame_number, shape)
             save_label_mask(output_root / timestamp / f"{view}.png", label, config.parts)
-            for part in config.parts:
-                areas[view][part.name].append(int(resolved[part.name].sum()))
     quality = {
         view: {
-            part.name: summarize_area_series(
+            part.name: summarize_track_series(
                 timestamps,
-                areas[view][part.name],
+                features[view][part.name]["areas"],
+                features[view][part.name]["centroids"],
+                features[view][part.name]["temporal_ious"],
                 start_frame=part.start_frame,
+                image_diagonal=image_diagonals[view],
             )
             for part in config.parts
         }

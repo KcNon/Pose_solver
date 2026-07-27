@@ -32,6 +32,7 @@ class PartSpec:
     color: tuple[int, int, int]
     start_frame: int
     prompts: tuple[str, ...]
+    start_frame_auto: bool = False
 
 
 @dataclass(frozen=True)
@@ -125,7 +126,18 @@ def _parts(raw: dict[str, Any]) -> tuple[PartSpec, ...]:
         used_ids.add(part_id)
         fallback_color = LEGACY_COLORS.get(name, AUTO_COLORS[index % len(AUTO_COLORS)])
         part_color = _color(values.get("color", colors.get(name)), fallback_color)
-        start_frame = int(values.get("start_frame", starts.get(name, 0)))
+        configured_start = values.get("start_frame", starts.get(name, 0))
+        start_frame_auto = (
+            isinstance(configured_start, str)
+            and configured_start.strip().lower() == "auto"
+        )
+        if start_frame_auto:
+            # An unresolved automatic start must stay active during the sparse
+            # Qwen discovery pass.  The runner writes an integer start to its
+            # resolved config before SAM or composition is allowed to run.
+            start_frame = 0
+        else:
+            start_frame = int(configured_start)
         if start_frame < 0:
             raise ValueError(f"part {name!r} start_frame must be non-negative")
         configured_prompts = values.get("prompts", prompts.get(name))
@@ -136,7 +148,14 @@ def _parts(raw: dict[str, Any]) -> tuple[PartSpec, ...]:
         prompt_tuple = tuple(str(prompt).strip() for prompt in configured_prompts if str(prompt).strip())
         if not prompt_tuple:
             raise ValueError(f"part {name!r} must have at least one prompt")
-        result.append(PartSpec(name, part_id, part_color, start_frame, prompt_tuple))
+        result.append(PartSpec(
+            name,
+            part_id,
+            part_color,
+            start_frame,
+            prompt_tuple,
+            start_frame_auto,
+        ))
     if not result:
         raise ValueError("at least one part is required")
     return tuple(result)

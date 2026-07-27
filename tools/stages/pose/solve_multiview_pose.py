@@ -53,6 +53,7 @@ def _fit_anchor(
     anchor: int,
     part: str,
     seed: int,
+    fixed_scale: float | None = None,
 ) -> dict:
     frames = _calibration_frames(state, anchor)
     cloud = fuse_part_clouds(cloud_root, frames, part, 40000, seed)
@@ -64,6 +65,7 @@ def _fit_anchor(
         coarse_iters=30,
         fine_iters=100,
         seed=seed,
+        fixed_scale=fixed_scale,
     )
     return {
         "frame": anchor,
@@ -108,6 +110,11 @@ def _fit_calibration(
     scales = {}
     for index, part in enumerate(config["parts"]):
         state = config["states"][part]
+        configured_scale = (
+            None
+            if state.get("scale_prior") is None
+            else float(state["scale_prior"])
+        )
         if part == config["reference_part"]:
             calibration = state["calibration_frames"]
             frames = [int(calibration[len(calibration) // 2])]
@@ -130,6 +137,7 @@ def _fit_calibration(
                 anchor,
                 part,
                 seed=31 + 10 * index + anchor,
+                fixed_scale=configured_scale,
             )
             fits.append(fit)
             anchor_info[part][str(anchor)] = {
@@ -142,7 +150,9 @@ def _fit_calibration(
                 flush=True,
             )
         scale = float(
-            state.get("scale_prior", np.median([fit["scale"] for fit in fits]))
+            configured_scale
+            if configured_scale is not None
+            else np.median([fit["scale"] for fit in fits])
         )
         scales[part] = scale
         for fit in fits:

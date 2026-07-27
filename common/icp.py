@@ -170,7 +170,7 @@ def build_icp_init(
         if T_global is None:
             raise ValueError("rigid mode requires T_global")
         T = T_global
-        info["components"] = ["global_from_lid"]
+        info["components"] = ["global_rigid"]
         return T, info
 
     raise ValueError(f"unknown init mode: {mode}")

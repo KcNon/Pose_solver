@@ -3,7 +3,7 @@
 ## 1. 数据流
 
 ```text
-人工配置：part 列表、part 出现帧、种子帧、相机视角
+配置：part 列表、出现帧/种子帧（可为 auto）、相机视角
                          │
 同步多视角 RGB ── Qwen3-VL bbox（只跑种子帧）
                          │
@@ -126,6 +126,15 @@ output_root/
 
 合成阶段会拒绝缺失的“已出现部件”track，避免缺文件被静默解释为空 mask。
 `quality_report.json` 会报告空帧区间、面积异常和建议重新播种帧。
+
+`start_frame`、`seed_frame` 或 `seed_frames` 可写为 `"auto"`。runner 会先按
+`automation.discovery.stride` 稀疏调用 Qwen，以多视角投票确定首次出现区间，
+随后逐帧细化转折点，并按可见视角数和 bbox 面积为每个相机选择种子。结果写入
+`work_root/manifests/resolved_mask_config.json`，人工整数值始终作为 override。
+
+开启 `automation.repair` 后，独立 part track 会额外检查质心跳变和时序 IoU。
+异常段触发局部 Qwen→SAM 双向重播种；修复后异常数增加时自动恢复备份。Qwen、
+SAM job 和 pose 阶段的复用都带输入指纹，配置或上游产物改变后不会静默沿用旧结果。
 
 ## 4. 多视角能否弥补看不到视角的 mask
 

@@ -226,8 +226,16 @@ def validate_assembly_entries(
 def validate_trajectory(
     config: dict,
     trajectory: dict,
+    *,
+    enforce_assembly: bool = True,
 ) -> tuple[dict, list[str]]:
-    """Validate a serialized trajectory after solving or post-processing."""
+    """Validate a serialized trajectory after solving or post-processing.
+
+    ``enforce_assembly=False`` is intended for intermediate appearance-only
+    refinement.  Assembly diagnostics are still computed and reported, but a
+    downstream geometric-constraint stage is allowed to repair them before
+    they become terminal failures.
+    """
     world_poses = {
         part: {
             int(key): np.asarray(
@@ -243,10 +251,16 @@ def validate_trajectory(
     assembly, assembly_failures = validate_assembly_entries(
         config, trajectory
     )
-    failures = motion_failures + assembly_failures
+    failures = motion_failures + (
+        assembly_failures if enforce_assembly else []
+    )
     return {
         "motion": motion,
         "assembly": assembly,
+        "assembly_enforced": bool(enforce_assembly),
+        "assembly_advisory_failures": (
+            [] if enforce_assembly else assembly_failures
+        ),
         "passed": not failures,
         "failures": failures,
     }, failures

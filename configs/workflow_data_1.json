@@ -1,0 +1,10 @@
+{
+  "runtime_root": "/data_ft_9_10/wentai/projects/pose_solver/experiments/data_1/workflow",
+  "configs": {
+    "preprocess": "data_1_preprocess_8view.json",
+    "reconviagen": "reconviagen_objects.json",
+    "mask": "mask_pipeline_data_1_reusable.json",
+    "depth": "pipeline_data_1_8view.json",
+    "pose": "pose_data_1_8view.json"
+  }
+}

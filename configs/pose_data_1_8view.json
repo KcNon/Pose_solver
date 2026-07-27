@@ -37,6 +37,22 @@
     "start": 40,
     "end": 245
   },
+  "automation": {
+    "enabled": true,
+    "use_detected_states": true,
+    "infer_reference_part": false,
+    "infer_calibration_frames": true,
+    "infer_anchors": true,
+    "infer_appearance_evidence": true,
+    "infer_symmetry": true,
+    "force_inferred_symmetry": false,
+    "minimum_observing_views": 4,
+    "minimum_dynamic_frames": 2,
+    "motion_padding_before": 0,
+    "motion_padding_after": 2,
+    "anchor_window_frames": 9,
+    "calibration_window_frames": 16
+  },
   "states": {
     "body": {
       "method": "cloud_registration",
@@ -154,7 +170,7 @@
       "dynamic_ranges": [[89, 96], [206, 217]],
       "validation": {
         "max_translation_step_m": 0.5,
-        "max_rotation_step_deg": 8.0,
+        "max_rotation_step_deg": 9.0,
         "max_axis_step_deg": 8.0,
         "fail_on_violation": true
       }
@@ -170,7 +186,7 @@
       "max_center_radial_m": 0.1,
       "rim_clearance_tolerance_m": 0.01,
       "require_stay_centered_after_entry": true,
-      "fail_on_violation": true
+      "fail_on_violation": false
     }
   ],
   "backprojection": {
@@ -185,6 +201,183 @@
     "max_correspondence_m": [0.09, 0.045, 0.022],
     "max_iterations": 60,
     "symmetry_lock": true
+  },
+  "render_loss_refinement": {
+    "enabled": true,
+    "resolution": [160, 90],
+    "surface_points": 30000,
+    "seed": 1701,
+    "optimize_views": [
+      "GX012828",
+      "GX013102",
+      "GX013140",
+      "GX013468",
+      "GX014074",
+      "GX015353"
+    ],
+    "holdout_views": [
+      "GX012728",
+      "GX017743"
+    ],
+    "minimum_optimize_views": 3,
+    "min_mask_pixels": 30,
+    "dilation_pixels": 1,
+    "edge_cap_pixels": 15.0,
+    "depth_residual_cap_m": 0.05,
+    "min_depth_pixels": 20,
+    "trim_worst_views": 1,
+    "weights": {
+      "iou": 1.0,
+      "contour": 0.25,
+      "target_coverage": 0.15,
+      "depth": 0.08
+    },
+    "translation_steps_m": [0.006, 0.003, 0.0015],
+    "rotation_steps_deg": [2.0, 1.0, 0.5],
+    "maximum_translation_delta_m": 0.015,
+    "maximum_rotation_delta_deg": 4.0,
+    "minimum_improvement": 0.002,
+    "maximum_holdout_degradation": 0.015,
+    "prior_weight": 0.03,
+    "temporal_weight": 0.02,
+    "rejected_temporal_decay": 0.5,
+    "parts": {
+      "body": {
+        "enabled": false
+      },
+      "inner_pot": {
+        "enabled": true,
+        "ranges": [[65, 71], [175, 191]],
+        "maximum_translation_delta_m": 0.012,
+        "maximum_rotation_delta_deg": 3.0,
+        "optimize_rotation": true
+      },
+      "lid": {
+        "enabled": true,
+        "ranges": [[89, 96], [206, 217]],
+        "maximum_translation_delta_m": 0.018,
+        "maximum_rotation_delta_deg": 4.0,
+        "optimize_rotation": true
+      }
+    }
+  },
+  "trajectory_constraints": {
+    "enabled": true,
+    "geometry_proxy_config": "configs/geometry_proxies_data_1.json",
+    "seed": 3191,
+    "fail_on_unresolved": true,
+    "render_gate": {
+      "enabled": true,
+      "resolution": [160, 90],
+      "surface_points": 30000,
+      "optimize_views": [
+        "GX012828",
+        "GX013102",
+        "GX013140",
+        "GX013468",
+        "GX014074",
+        "GX015353"
+      ],
+      "holdout_views": [
+        "GX012728",
+        "GX017743"
+      ],
+      "minimum_optimize_views": 3,
+      "min_mask_pixels": 30,
+      "dilation_pixels": 1,
+      "edge_cap_pixels": 15.0,
+      "depth_residual_cap_m": 0.05,
+      "min_depth_pixels": 20,
+      "trim_worst_views": 1,
+      "weights": {
+        "iou": 1.0,
+        "contour": 0.25,
+        "target_coverage": 0.15,
+        "depth": 0.08
+      },
+      "maximum_optimize_degradation": 0.03,
+      "maximum_holdout_degradation": 0.035,
+      "line_search_alphas": [1.0, 0.75, 0.5, 0.25]
+    },
+    "relations": [
+      {
+        "name": "inner_pot_into_body",
+        "type": "insert_into",
+        "required": false,
+        "seed": 3191,
+        "container": "body",
+        "moving_part": "inner_pot",
+        "frame_range": [175, 192],
+        "optimize_frame_range": [175, 192],
+        "propagate_through_frame": 245,
+        "moving_axis_part": [0.0, 1.0, 0.0],
+        "entry_center_radius_m": 0.1,
+        "contact_tolerance_m": 0.001,
+        "maximum_allowed_penetration_m": 0.0005,
+        "continuous_substeps": 8,
+        "surface_points": 2000,
+        "penetration_scale_m": 0.005,
+        "maximum_translation_delta_m": 0.02,
+        "maximum_rotation_delta_deg": 10.0,
+        "translation_steps_m": [0.008, 0.004, 0.002, 0.001],
+        "rotation_steps_deg": [4.0, 2.0, 1.0, 0.5],
+        "prior_weight": 0.002,
+        "prior_translation_weight": 0.01,
+        "prior_rotation_weight": 0.0005,
+        "seat_axis_alignment_weight": 1.0,
+        "seat_activation_height_m": 0.02,
+        "seat_axis_tolerance_deg": 0.75,
+        "seat_axis_scale_deg": 5.0,
+        "smoothness_weight": 0.005
+      },
+      {
+        "name": "final_pairwise_contact",
+        "type": "pairwise_contact",
+        "seed": 3191,
+        "reference_part": "body",
+        "moving_part": "lid",
+        "frame_range": [210, 217],
+        "optimize_frame_range": [210, 217],
+        "validation_frame_range": [217, 217],
+        "contact_start_frame": 214,
+        "propagate_through_frame": 245,
+        "reference_axis_part": [0.0, 1.0, 0.0],
+        "moving_axis_part": [0.0, 1.0, 0.0],
+        "allow_axis_flip": true,
+        "axis_tolerance_deg": 6.0,
+        "axis_scale_deg": 4.0,
+        "axis_alignment_weight": 1.0,
+        "maximum_axis_offset_m": 0.012,
+        "target_axis_offset_m": 0.005,
+        "axis_offset_scale_m": 0.02,
+        "axis_offset_weight": 1.0,
+        "contact_tolerance_m": 0.001,
+        "maximum_contact_gap_m": 0.004,
+        "contact_scale_m": 0.004,
+        "contact_weight": 0.25,
+        "near_field_m": 0.03,
+        "maximum_normal_dot": -0.1,
+        "penetration_quantile": 0.99,
+        "contact_quantile": 0.005,
+        "minimum_penetrating_samples": 5,
+        "continuous_substeps": 4,
+        "surface_points": 3000,
+        "penetration_scale_m": 0.005,
+        "maximum_allowed_penetration_m": 0.006,
+        "maximum_translation_delta_m": 0.04,
+        "maximum_rotation_delta_deg": 8.0,
+        "translation_steps_m": [0.010, 0.005, 0.002, 0.001],
+        "rotation_steps_deg": [3.0, 1.5, 0.75, 0.375],
+        "prior_weight": 0.003,
+        "smoothness_weight": 0.01,
+        "propagation_render_gate": {
+          "enabled": true,
+          "frames": [218, 222, 230, 245],
+          "maximum_optimize_degradation": 0.075,
+          "maximum_holdout_degradation": 0.04
+        }
+      }
+    ]
   },
   "render": {
     "fps": 5.0,

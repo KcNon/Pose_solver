@@ -20,6 +20,21 @@ from common.backproject_utils import load_palette_masks
 from common.normalized_recon import load_recon
 
 
+def reference_part(cfg: dict, configured: str | None = None) -> str:
+    """Resolve the static gauge part without assuming an object taxonomy."""
+
+    selected = configured or cfg.get("reference_part")
+    if selected:
+        return str(selected)
+    parts = cfg.get("parts", [])
+    names = list(parts) if isinstance(parts, (list, dict)) else []
+    if not names:
+        raise ValueError(
+            "depth gauge requires reference_part or a non-empty parts list"
+        )
+    return str(names[0])
+
+
 def compute_depth_gauge(
     cfg: dict,
     backend: str,
@@ -37,7 +52,7 @@ def compute_depth_gauge(
     overlap with the reference falls below ``min_pixels`` get an interpolated
     shift instead of a measured one.
     """
-    part = part or cfg.get("reference_part", "body")
+    part = reference_part(cfg, part)
     kernel = np.ones((3, 3), np.uint8)
 
     depth_stack = None
@@ -129,7 +144,7 @@ def compute_view_bias(
 
     from common.geom import backproject_view
 
-    part = part or cfg.get("reference_part", "body")
+    part = reference_part(cfg, part)
     rng = np.random.default_rng(seed)
 
     per_frame = []

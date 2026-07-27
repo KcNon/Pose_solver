@@ -11,6 +11,7 @@ import trimesh
 
 from common.cloud_io import read_ply_xyz, write_ply
 from common.pose_config import validate_pose_config
+from common.pose_autoconfig import resolve_pose_config
 from common.pose_validation import (
     validate_assembly_entries,
     validate_trajectory,
@@ -64,6 +65,55 @@ class PoseConfigTests(unittest.TestCase):
         config["part_ids"]["part"] = 1
         with self.assertRaisesRegex(ValueError, "must be unique"):
             validate_pose_config(config)
+
+    def test_automatic_state_ranges_and_anchors_are_resolved(self):
+        config = base_config()
+        config["part_start_frames"] = {"body": 0, "part": 1}
+        config["automation"] = {
+            "enabled": True,
+            "use_detected_states": True,
+            "infer_calibration_frames": True,
+            "infer_anchors": True,
+            "minimum_observing_views": 1,
+            "minimum_dynamic_frames": 1,
+            "calibration_window_frames": 2,
+            "anchor_window_frames": 2,
+        }
+        config["states"]["body"]["calibration_frames"] = [0]
+        config["states"]["part"]["anchor_frames"] = [1]
+        report = {"parts": {}}
+        for part in ("body", "part"):
+            states = {}
+            for frame in range(3):
+                moving = part == "part" and frame == 1
+                states[f"{frame:06d}"] = {
+                    "state": "moving" if moving else "static",
+                    "observing_views": 2,
+                    "motion_px": 5.0 if moving else 0.0,
+                    "surface_shift_mm": 8.0 if moving else 1.0,
+                }
+            report["parts"][part] = {
+                "states": states,
+                "detected_moving_ranges": (
+                    [[1, 1]] if part == "part" else []
+                ),
+            }
+        resolved, audit = resolve_pose_config(config, report)
+        self.assertEqual(
+            resolved["states"]["part"]["dynamic_ranges"], [[1, 1]]
+        )
+        self.assertEqual(
+            resolved["states"]["part"]["static_ranges"],
+            [[0, 0], [2, 2]],
+        )
+        self.assertEqual(
+            resolved["states"]["part"]["anchor_frames"], [1]
+        )
+        self.assertEqual(len(
+            resolved["states"]["body"]["calibration_frames"]
+        ), 2)
+        self.assertIn("part", audit["parts"])
+        validate_pose_config(resolved)
 
 
 class CloudIoTests(unittest.TestCase):
@@ -217,6 +267,22 @@ class AssemblyValidationTests(unittest.TestCase):
                 config, trajectory
             )
             self.assertTrue(failures)
+
+            advisory, advisory_failures = validate_trajectory(
+                config | {
+                    "parts": ["body", "insert"],
+                    "states": {
+                        "body": {"static_ranges": [[0, 2]], "dynamic_ranges": []},
+                        "insert": {"static_ranges": [[0, 2]], "dynamic_ranges": []},
+                    },
+                    "reference_part": "body",
+                },
+                trajectory,
+                enforce_assembly=False,
+            )
+            self.assertFalse(advisory_failures)
+            self.assertFalse(advisory["assembly"][0]["passed"])
+            self.assertTrue(advisory["assembly_advisory_failures"])
             self.assertFalse(report[0]["passed"])
 
 

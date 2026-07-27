@@ -15,6 +15,7 @@ import argparse
 import os
 from pathlib import Path
 import sys
+import tempfile
 from typing import Any
 
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
@@ -61,9 +62,6 @@ def _seed_for(
         values = config.raw.get("seed_frames", {}).get(part)
     if values is None:
         values = config.raw.get("temporal_seed_timestamps", {}).get(part)
-    if part == "body":
-        body = config.raw.get("body_seed_timestamps", {})
-        values = body.get(view, values)
     if isinstance(values, dict):
         values = values.get(view, values.get("default"))
     if isinstance(values, list):
@@ -78,6 +76,20 @@ def _fallback_labels(config: MaskPipelineConfig, part: str) -> list[str]:
         str(value)
         for value in config.raw.get("bbox_fallback_labels", {}).get(part, [])
     ]
+
+
+def _tracking_window(
+    frame_ids: list[str],
+    timestamps: list[str],
+    seed: str,
+) -> tuple[list[str], int]:
+    """Return the smallest contiguous video containing outputs and seed."""
+
+    requested = [frame_ids.index(value) for value in timestamps]
+    seed_index = frame_ids.index(seed)
+    first = min(seed_index, min(requested))
+    last = max(seed_index, max(requested))
+    return frame_ids[first:last + 1], first
 
 
 def _requested_frames(args, frame_ids: list[str], bbox_data: dict[str, Any]) -> list[str]:
@@ -232,16 +244,41 @@ def _video_mode(
             overrides=config.raw.get("bbox_overrides"),
             fallback_labels=_fallback_labels(config, args.part),
         )
-        with torch.inference_mode(), torch.autocast(
-            device_type="cuda", dtype=torch.bfloat16
-        ):
-            masks, info = track_video_part(
-                model,
-                str(config.frames_dir / view),
-                frame_ids.index(seed),
-                box,
-                part.prompts[0],
+        window_ids, window_offset = _tracking_window(
+            frame_ids, timestamps, seed
+        )
+        temporary = None
+        source_dir = config.frames_dir / view
+        if len(window_ids) != len(frame_ids):
+            temporary = tempfile.TemporaryDirectory(
+                prefix=f"pose_solver_sam_{view}_"
             )
+            source_dir = Path(temporary.name)
+            for timestamp in window_ids:
+                frame_source = frame_path(
+                    config.frames_dir, view, timestamp
+                )
+                (source_dir / frame_source.name).symlink_to(
+                    frame_source.resolve()
+                )
+        try:
+            with torch.inference_mode(), torch.autocast(
+                device_type="cuda", dtype=torch.bfloat16
+            ):
+                masks, info = track_video_part(
+                    model,
+                    str(source_dir),
+                    window_ids.index(seed),
+                    box,
+                    part.prompts[0],
+                )
+        finally:
+            if temporary is not None:
+                temporary.cleanup()
+        masks = {
+            window_offset + int(index): mask
+            for index, mask in masks.items()
+        }
         with Image.open(frame_path(config.frames_dir, view, timestamps[0])) as image:
             shape = (image.height, image.width)
         empty_frames = 0
@@ -262,6 +299,7 @@ def _video_mode(
             "qwen_bbox_2d": box,
             "written_frames": len(timestamps),
             "empty_frames": empty_frames,
+            "video_frames_loaded": len(window_ids),
         }
         print(f"{view}: {details[view]}", flush=True)
     return details

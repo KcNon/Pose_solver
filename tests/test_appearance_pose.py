@@ -2,15 +2,20 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import unittest
 
 import numpy as np
 from scipy.spatial.transform import Rotation
 
 from common.appearance_pose import (
+    _is_static_transition,
     candidate_local_rotations,
     select_candidate_chain,
 )
 from common.calibration_cache import fingerprint_files
+from common.mesh_align import align_mesh_to_cloud
+from common.pose_transforms import decompose_similarity
+import trimesh
 
 
 def _pose_x(angle_deg: float) -> np.ndarray:
@@ -76,3 +81,38 @@ def test_fingerprint_changes_for_content_and_observation_stat(tmp_path: Path) ->
     os.utime(observation, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
     third = fingerprint_files(**kwargs)["sha256"]
     assert third != second
+
+
+class CalibrationRegressionTests(unittest.TestCase):
+    def test_static_transition_includes_dynamic_boundary_anchors(self):
+        self.assertTrue(_is_static_transition(95, 206, [[96, 205]]))
+        self.assertFalse(_is_static_transition(95, 206, [[120, 180]]))
+
+    def test_fixed_scale_alignment_keeps_requested_scale(self):
+        mesh = trimesh.creation.box(extents=[1.0, 0.7, 0.35])
+        np.random.seed(13)
+        raw, _ = trimesh.sample.sample_surface(mesh, 5000)
+        scale = 0.31
+        rotation = Rotation.from_euler(
+            "xyz", [18.0, -11.0, 27.0], degrees=True
+        ).as_matrix()
+        translation = np.asarray([0.25, -0.12, 0.7])
+        observed = scale * (raw @ rotation.T) + translation
+        fit = align_mesh_to_cloud(
+            mesh,
+            observed,
+            n_mesh_sample=8000,
+            n_obs_max=5000,
+            coarse_iters=20,
+            fine_iters=80,
+            seed=17,
+            fixed_scale=scale,
+        )
+        fitted_scale, _rotation, fitted_translation = decompose_similarity(
+            fit["T_mesh_to_world"]
+        )
+        self.assertAlmostEqual(fitted_scale, scale, places=8)
+        np.testing.assert_allclose(
+            fitted_translation, translation, atol=0.025
+        )
+        self.assertLess(fit["fit_rmse"], 0.025)

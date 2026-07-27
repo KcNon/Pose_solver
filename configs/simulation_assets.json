@@ -1,6 +1,6 @@
 {
   "asset_name": "rice_cooker_three_part",
-  "trajectory": "experiments/data_1/pose_outputs/solver_repaired_highfps_inner/pose/trajectory.json",
+  "trajectory": "experiments/data_1/pose_outputs/solver_collision_refined/pose/trajectory.json",
   "meshes": {
     "body": "experiments/reconviagen_objects/reconviagen_meshes/body.glb",
     "inner_pot": "experiments/reconviagen_objects/reconviagen_meshes/inner_pot.glb",
@@ -85,7 +85,7 @@
     "container_part": "body",
     "inserted_part": "inner_pot",
     "up_axis_body": [0.0, 1.0, 0.0],
-    "align_insert_up_axis": true,
+    "align_insert_up_axis": false,
     "observed_replay_frame_range": [175, 192],
     "physics_hz": 240,
     "settle_seconds": 3.0,

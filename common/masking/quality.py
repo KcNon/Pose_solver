@@ -102,3 +102,93 @@ def summarize_area_series(
         "area_anomaly_frames": anomalous,
         "suggested_reanchor_frames": [run[len(run) // 2] for run in _runs(suggestions)],
     }
+
+
+def mask_iou(first: np.ndarray | None, second: np.ndarray) -> float | None:
+    if first is None:
+        return None
+    a = np.asarray(first, dtype=bool)
+    b = np.asarray(second, dtype=bool)
+    union = int((a | b).sum())
+    return float((a & b).sum() / union) if union else 1.0
+
+
+def summarize_track_series(
+    timestamps: Sequence[str],
+    areas: Sequence[int],
+    centroids: Sequence[Sequence[float] | None],
+    temporal_ious: Sequence[float | None],
+    *,
+    start_frame: int,
+    image_diagonal: float,
+    min_area_ratio: float = 0.2,
+    max_area_ratio: float = 4.0,
+    max_centroid_step_ratio: float = 0.08,
+    min_temporal_iou: float = 0.05,
+) -> dict:
+    """Summarize independent-track failures without assuming object class.
+
+    Area catches empty/exploded tracks.  A low temporal IoU is only considered
+    suspicious together with a large centroid jump, so legitimate deformation
+    or rapid in-place rotation is not automatically treated as a failure.
+    """
+
+    report = summarize_area_series(
+        timestamps,
+        areas,
+        start_frame=start_frame,
+        min_area_ratio=min_area_ratio,
+        max_area_ratio=max_area_ratio,
+    )
+    jumps: list[int] = []
+    low_iou: list[int] = []
+    previous_centroid: np.ndarray | None = None
+    for timestamp, area, centroid, iou in zip(
+        timestamps, areas, centroids, temporal_ious
+    ):
+        frame = int(timestamp)
+        if frame < start_frame:
+            continue
+        current = (
+            None
+            if centroid is None
+            else np.asarray(centroid, dtype=np.float64)
+        )
+        jump = (
+            0.0
+            if current is None or previous_centroid is None
+            else float(np.linalg.norm(current - previous_centroid))
+            / max(float(image_diagonal), 1.0)
+        )
+        if (
+            int(area) > 0
+            and iou is not None
+            and float(iou) < min_temporal_iou
+            and jump > max_centroid_step_ratio
+        ):
+            low_iou.append(frame)
+        if jump > max_centroid_step_ratio:
+            jumps.append(frame)
+        if current is not None:
+            previous_centroid = current
+    empty_frames = [
+        frame
+        for start, end in report["empty_runs"]
+        for frame in range(int(start), int(end) + 1)
+    ]
+    anomaly_frames = sorted(set(
+        empty_frames + report["area_anomaly_frames"] + jumps + low_iou
+    ))
+    anomaly_runs = [
+        [run[0], run[-1]]
+        for run in _runs(anomaly_frames)
+    ]
+    report.update({
+        "centroid_jump_frames": jumps,
+        "low_temporal_iou_frames": low_iou,
+        "anomaly_runs": anomaly_runs,
+        "suggested_reanchor_frames": [
+            run[len(run) // 2] for run in _runs(anomaly_frames)
+        ],
+    })
+    return report

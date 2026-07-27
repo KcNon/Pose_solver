@@ -33,6 +33,7 @@ NumPy / OpenCV / SciPy / trimesh / pyrender / small_gicp
 | `pose_transforms.py` | rigid/similarity 转换、轴旋转、点变换 |
 | `mask_io.py` | normalized mask、视角和时间戳约定 |
 | `masking/` | 任意部件配置、独立二值 track、遮挡合成、质量报告与多视角几何先验 |
+| `masking/planning.py` | Qwen 多视角出现帧/种子推导与异常段修复计划 |
 | `qwen_bbox.py` | Qwen bbox prompt、解析和可视化 |
 | `normalized_recon.py` | 当前 normalized DA3/VGGT 数据布局加载 |
 | `backproject_utils.py` / `geom.py` | mask + depth 反投影 |
@@ -41,7 +42,11 @@ NumPy / OpenCV / SciPy / trimesh / pyrender / small_gicp
 | `icp.py` / `mesh_align.py` | 基础 ICP 兼容接口与 mesh similarity 标定 |
 | `gicp.py` / `pose_tracking.py` | 正式多尺度 GICP、对称性连续化和三种跟踪策略 |
 | `pose_refinement.py` | silhouette、点云评分、装配/速度约束 |
+| `render_loss_refinement.py` | 多视角 sampled-mesh silhouette/depth 损失、有界 SE(3) 搜索和 holdout gate |
+| `trajectory_constraints.py` | 通用刚体对接触因子、任意采样表面连续检测、空腔兼容后端与有界轨迹修正 |
 | `pose_config.py` / `pose_validation.py` | pose 配置 preflight 与轨迹约束验证 |
+| `pose_autoconfig.py` / `mesh_observability.py` | 状态、锚点、标定窗口和 mesh 对称/纹理元数据推导 |
+| `stage_cache.py` | 基于命令、内容和产物树的阶段输入指纹 |
 | `appearance_pose.py` | 纹理/轮廓候选、对称轴翻面假设、时序路径选择 |
 | `symmetry.py` | 连续轴对称、有限阶对称、观测翻转歧义及统一姿态消歧 |
 | `calibration_cache.py` | mesh、锚点点云、mask/RGB/相机输入指纹 |
@@ -56,9 +61,10 @@ NumPy / OpenCV / SciPy / trimesh / pyrender / small_gicp
 
 | 阶段 | 入口 | 主要输出 |
 |---|---|---|
+| dataset workflow | `run_automated_workflow.py` | 跨阶段 resolved configs、contract、完成标记 |
 | mask | `run_mask_pipeline.py` | 独立部件 track、palette PNG、mask QA |
 | depth + 点云 | `run_depth_pipeline.py` | `depth_gauge.json`、分部件 PLY |
-| pose 调度 | `run_pose_pipeline.py` | 状态、求解、评审和渲染的断点执行 |
+| pose 调度 | `run_pose_pipeline.py` | 状态、求解、render-loss、连续几何约束、评审和渲染的断点执行 |
 | 渲染 | `render_multiview_pose.py` | overlay、纯 mesh、纹理、坐标轴视频 |
 | 仿真资产 | `export_simulation_assets.py` | canonical OBJ、URDF、manifest |
 | Isaac 验证 | `run_isaac_insertion.py` | USD、插入报告、最终截图 |
@@ -67,6 +73,18 @@ NumPy / OpenCV / SciPy / trimesh / pyrender / small_gicp
 
 诊断脚本不应改写源 trajectory。refinement 也写入新的 output root，保证每次结果都能
 回溯到输入轨迹。
+
+render-loss refinement 不是 6D pose 真值监督，而是利用已标定相机建立的可微性
+无关、可量化间接监督：将固定尺度 mesh 的表面采样点投影到多个视角，联合计算
+silhouette IoU、轮廓 Chamfer、mask coverage 和截断 depth residual。优化相机与
+holdout 相机在配置中分开；候选只有在优化集改善且 holdout 不明显退化时才写入新
+trajectory。搜索始终受相对基础 pose 的平移/旋转上限和相邻帧 correction prior
+约束，并通过统一 symmetry contract 屏蔽连续轴对称的不可观测自旋。
+
+连续几何约束不是把容器当成封闭实体做 SDF 排斥。`insert_into` 明确区分容器壁、
+底部和合法空腔，并对相邻视频帧做 SE(3) 插值采样以检测 tunnelling。接近底部时的
+轴线对齐是关系参数，不是对象名称分支。几何候选通过独立相机 render-loss gate 后
+才写入轨迹；报告同时保存优化前、纯几何候选和视觉门控后的穿透深度。
 
 可选工具不放在正式入口目录：
 
@@ -164,6 +182,6 @@ isaac.complete.json
 
 ## 9. 后续架构改进顺序
 
-1. 为 pipeline runner 增加输入哈希，避免仅凭输出存在性判断是否恢复；
-2. 增加跨视角 silhouette、depth 和时序 pose 的联合回归测试；
+1. 增加跨视角 silhouette、depth 和时序 pose 的联合回归测试；
+2. 将 Qwen/SAM/ReconViaGen 的模型版本和权重摘要纳入 workflow provenance；
 3. 将 Isaac 场景 authoring 与物理 trial 进一步拆开，便于批量无渲染验证。

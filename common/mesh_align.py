@@ -43,11 +43,20 @@ _SIGN_FLIPS = [
 ]
 
 
-def _candidate_inits(obs: np.ndarray, mesh_pts: np.ndarray) -> list[np.ndarray]:
+def _candidate_inits(
+    obs: np.ndarray,
+    mesh_pts: np.ndarray,
+    *,
+    estimate_scale: bool = True,
+) -> list[np.ndarray]:
     """Build 4x4 similarity inits mapping obs -> mesh via PCA axis matching."""
     c_o = obs.mean(0)
     c_m = mesh_pts.mean(0)
-    s = _rms_radius(mesh_pts, c_m) / max(_rms_radius(obs, c_o), 1e-9)
+    s = (
+        _rms_radius(mesh_pts, c_m) / max(_rms_radius(obs, c_o), 1e-9)
+        if estimate_scale
+        else 1.0
+    )
     V_o = _pca_axes(obs, c_o)
     V_m = _pca_axes(mesh_pts, c_m)
 
@@ -71,8 +80,18 @@ def align_mesh_to_cloud(
     coarse_iters: int = 12,
     fine_iters: int = 60,
     seed: int = 0,
+    fixed_scale: float | None = None,
 ) -> dict:
-    """Return dict with T_mesh_to_world (4x4, similarity) and fit diagnostics."""
+    """Return a raw-mesh-to-world similarity and fit diagnostics.
+
+    When ``fixed_scale`` is supplied the raw mesh is scaled first and ICP only
+    estimates a rigid transform.  This is materially different from fitting a
+    free similarity and replacing its scale afterwards: the latter leaves the
+    translation optimized for the wrong-sized object and can displace anchors
+    by many centimetres.
+    """
+    if fixed_scale is not None and float(fixed_scale) <= 0.0:
+        raise ValueError("fixed_scale must be positive")
     rng = np.random.default_rng(seed)
     obs = np.asarray(obs, dtype=np.float64)
     if len(obs) > n_obs_max:
@@ -80,24 +99,39 @@ def align_mesh_to_cloud(
 
     mesh_pts, _ = trimesh.sample.sample_surface(mesh, n_mesh_sample)
     mesh_pts = np.asarray(mesh_pts, dtype=np.float64)
+    fit_mesh_pts = (
+        mesh_pts
+        if fixed_scale is None
+        else float(fixed_scale) * mesh_pts
+    )
 
     # Target = sampled mesh points (trimesh icp uses cKDTree; avoids rtree dep).
     # Coarse: try each PCA-init, keep the lowest-cost obs->mesh fit.
     best = None
-    for T0 in _candidate_inits(obs, mesh_pts):
+    for T0 in _candidate_inits(
+        obs,
+        fit_mesh_pts,
+        estimate_scale=fixed_scale is None,
+    ):
         matrix, _, cost = reg.icp(
-            obs, mesh_pts, initial=T0, max_iterations=coarse_iters,
-            scale=True, reflection=False,
+            obs, fit_mesh_pts, initial=T0, max_iterations=coarse_iters,
+            scale=fixed_scale is None, reflection=False,
         )
         if best is None or cost < best[1]:
             best = (matrix, cost)
 
     # Fine refinement from the best coarse result.
     T_obs_to_mesh, _, cost = reg.icp(
-        obs, mesh_pts, initial=best[0], max_iterations=fine_iters,
-        scale=True, reflection=False,
+        obs, fit_mesh_pts, initial=best[0], max_iterations=fine_iters,
+        scale=fixed_scale is None, reflection=False,
     )
-    T_mesh_to_world = np.linalg.inv(T_obs_to_mesh)
+    T_fit_mesh_to_world = np.linalg.inv(T_obs_to_mesh)
+
+    # ``fit_mesh_pts`` are already scaled in fixed-scale mode.  Convert the
+    # rigid transform back to one that maps the original raw mesh to world.
+    T_mesh_to_world = T_fit_mesh_to_world.copy()
+    if fixed_scale is not None:
+        T_mesh_to_world[:3, :3] *= float(fixed_scale)
 
     # Decompose the similarity: M = s * R (assumes uniform scale).
     M = T_mesh_to_world[:3, :3]

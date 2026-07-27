@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 from scipy.spatial.transform import Rotation
 
+from common.depth_gauge import reference_part
 from common.io_utils import load_json, write_json
 from common.mask_io import list_timestamps, view_names
 from common.pose_transforms import (
@@ -18,9 +19,26 @@ from common.pose_transforms import (
     similarity_from_rigid,
     transform_points,
 )
+from common.stage_cache import (
+    checkpoint_matches,
+    stage_fingerprint,
+    write_checkpoint,
+)
 
 
 class JsonIoTests(unittest.TestCase):
+    def test_depth_reference_falls_back_to_first_configured_part(self):
+        self.assertEqual(
+            reference_part({"parts": ["static_base", "moving_piece"]}),
+            "static_base",
+        )
+        self.assertEqual(
+            reference_part(
+                {"parts": ["static_base"], "reference_part": "anchor"}
+            ),
+            "anchor",
+        )
+
     def test_json_round_trip_creates_parent_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "nested" / "value.json"
@@ -28,6 +46,28 @@ class JsonIoTests(unittest.TestCase):
             write_json(path, value)
             self.assertEqual(load_json(path), value)
             self.assertTrue(path.read_text(encoding="utf-8").endswith("\n"))
+
+    def test_stage_checkpoint_invalidates_on_nested_input_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inputs = root / "inputs"
+            inputs.mkdir()
+            nested = inputs / "value.txt"
+            nested.write_text("first", encoding="utf-8")
+            expected = root / "result.json"
+            expected.write_text("{}", encoding="utf-8")
+            first = stage_fingerprint(
+                command=["tool", "--run"],
+                stat_paths=[inputs],
+            )
+            write_checkpoint(expected, first)
+            self.assertTrue(checkpoint_matches(expected, first))
+            nested.write_text("second value", encoding="utf-8")
+            second = stage_fingerprint(
+                command=["tool", "--run"],
+                stat_paths=[inputs],
+            )
+            self.assertFalse(checkpoint_matches(expected, second))
 
     def test_configured_eight_view_layout(self) -> None:
         views = [f"camera_{index}" for index in range(8)]

@@ -8,7 +8,7 @@ from typing import Any, Iterable
 from common.mask_io import frame_path
 from common.normalized_recon import recon_npz_path
 
-CALIBRATION_ALGORITHM_REVISION = "geometry-appearance-symmetry-anchor-v4"
+CALIBRATION_ALGORITHM_REVISION = "geometry-appearance-symmetry-fixed-scale-v5"
 
 
 def _update_file_content(digest: Any, path: Path, logical_name: str) -> None:

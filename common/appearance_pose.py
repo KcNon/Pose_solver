@@ -62,7 +62,14 @@ def _is_static_transition(
     frame_b: int,
     static_ranges: list[list[int]] | list[tuple[int, int]],
 ) -> bool:
-    return any(int(start) <= frame_a and frame_b <= int(end) for start, end in static_ranges)
+    # Anchors normally sit on the first/last dynamic frame, while the interval
+    # between them is represented as a static range.  Treat those one-frame
+    # boundary offsets as static too, otherwise an axial/flip ambiguity can
+    # change by 180 degrees across an object that did not move for 100 frames.
+    return any(
+        int(start) <= frame_a + 1 and frame_b - 1 <= int(end)
+        for start, end in static_ranges
+    )
 
 
 def select_candidate_chain(

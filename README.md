@@ -17,7 +17,7 @@
 palette masks
    ↓ DA3 depth gauge + backprojection
 分部件世界系点云
-   ↓ 多视角 pose solve + body/lid refinement
+   ↓ 多视角 pose solve + 对称感知 render-loss refinement
 trajectory.json
    ├─→ overlay / mesh-only / mesh+axes 视频
    └─→ canonical mesh → URDF → Isaac Sim 插入验证
@@ -43,6 +43,7 @@ experiments/  生成结果（被 .gitignore 忽略）
 
 ## 当前推荐入口
 
+- 数据集端到端自动流程：`scripts/run_automated_workflow.py`
 - Mask 全流程：`scripts/run_mask_pipeline.py`
 - ReconViaGen 全流程：`scripts/run_reconviagen_pipeline.py`
 - 深度与点云：`scripts/run_depth_pipeline.py`
@@ -93,7 +94,40 @@ runner 会按配置切换 Qwen、SAM 和 ReconViaGen Python 环境；单阶段�
 `--stage frames|masks|rgba|mesh`。
 
 八视角正式批处理调用 `run_pose_pipeline.py`，它依次执行状态诊断、求解、多视角
-评审和主视角渲染，并默认复用已验证的阶段产物。
+渲染损失修正、连续几何约束、评审和主视角渲染，并默认复用已验证的阶段产物。渲染损失阶段以
+固定尺度的 canonical mesh 回投影为预测，以 Qwen→SAM3 mask、轮廓和 DA3 depth
+为间接监督；只优化有观测的运动区间，并保留独立相机作为 holdout gate。连续轴
+对称物体不优化不可观测的轴向自旋。该阶段写出新的
+`trajectory_render_refined.json`，不会覆盖基础轨迹。
+
+`trajectory_constraints` 随后在 pose solver 内检查原始帧及相邻帧插值，不调用
+Isaac 或其他物理引擎。通用 `pairwise_contact` 后端只接收任意 reference/moving
+刚体、几何代理和可组合的非穿透、接触、轴对齐及轴线偏移因子；`insert_into`
+保留为理解空腔语义的兼容后端。几何候选和静态传播都需通过多视角
+render-loss gate，最终写入 `trajectory_collision_refined.json`。物体名称、
+关系、代理形状、检测子帧数和修正上限都来自配置，不在 solver 中硬编码。
+pose 侧代理位于独立的 `geometry_proxy_config`，与质量、摩擦或 PhysX 配置解耦。
+
+端到端执行使用一份只引用各阶段配置的 workflow 文件。runner 会生成 runtime
+配置，将实际 mask、ReconViaGen mesh、depth gauge 和点云路径显式串起来，并拒绝
+视角、部件或 palette ID 不一致。depth、点云和 pose 阶段均使用输入内容指纹；
+mask、相机深度、mesh 或配置变化时不会仅因旧输出仍存在而错误恢复：
+
+```bash
+.venv/bin/python scripts/run_automated_workflow.py \
+  --config configs/workflow_data_1.json --stage preflight
+
+.venv/bin/python scripts/run_automated_workflow.py \
+  --config configs/workflow_data_1.json --stage all
+```
+
+只更新 mask、且 RGB 与固定相机 DA3 结果未变化时，可使用
+`--stage depth-postprocess` 仅重算 depth gauge 和分部件点云。
+
+Pose 配置中的 `automation.enabled` 会把状态诊断解析成一份普通
+`resolved_pose_config.json`。运动区间、静止补集、标定窗口、anchor 窗口及纹理
+证据帧都在求解前确定并记录来源；solver 本身不暗中修改配置。对称性分析只在没有
+显式 override 时生效，带纹理 mesh 会自动启用 appearance 证据。
 
 ## 验证
 
