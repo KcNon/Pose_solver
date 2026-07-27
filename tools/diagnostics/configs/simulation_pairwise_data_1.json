@@ -1,18 +1,14 @@
 {
-  "asset_name": "rice_cooker_three_part",
-  "trajectory": "experiments/data_1/pose_outputs/solver_collision_refined/pose/trajectory.json",
+  "asset_name": "data_1_three_part_frozen_pose_scale_query",
+  "trajectory": "experiments/data_1/pose_outputs/solver_scale_calibrated/pose/trajectory.json",
   "meshes": {
     "body": "experiments/reconviagen_objects/reconviagen_meshes/body.glb",
     "inner_pot": "experiments/reconviagen_objects/reconviagen_meshes/inner_pot.glb",
     "lid": "experiments/reconviagen_objects/reconviagen_meshes/lid.glb"
   },
-  "output_dir": "experiments/data_1/simulation_assets",
+  "output_dir": "experiments/data_1/diagnostics/simulation_assets_pairwise",
   "reference_part": "body",
-  "display_parts": [
-    "body",
-    "inner_pot",
-    "lid"
-  ],
+  "display_parts": ["body", "inner_pot", "lid"],
   "mass_kg": {
     "body": 3.0,
     "inner_pot": 0.5,
@@ -24,7 +20,7 @@
       "axis": "y",
       "inner_radius_m": 0.128,
       "outer_radius_m": 0.155,
-      "floor_top_m": -0.006,
+      "floor_top_m": -0.098,
       "rim_top_m": 0.11654,
       "floor_thickness_m": 0.008,
       "sections": 64
@@ -67,7 +63,7 @@
   },
   "assembly_targets": {
     "inner_pot": {
-      "frame_range": [192, 245],
+      "frame_range": [192, 217],
       "required_state": "static",
       "min_observing_views": 1,
       "max_translation_residual_m": 0.01,
@@ -97,16 +93,6 @@
     "success_rotation_deg": 10.0,
     "success_linear_speed_mps": 0.02,
     "success_angular_speed_radps": 0.1,
-    "trials": [
-      {"name": "aligned", "xy_offset_m": [0.0, 0.0], "yaw_deg": 0.0, "tilt_deg": [0.0, 0.0]},
-      {"name": "x_plus_2mm", "xy_offset_m": [0.002, 0.0], "yaw_deg": 0.0, "tilt_deg": [0.0, 0.0]},
-      {"name": "x_minus_2mm", "xy_offset_m": [-0.002, 0.0], "yaw_deg": 0.0, "tilt_deg": [0.0, 0.0]},
-      {"name": "y_plus_2mm", "xy_offset_m": [0.0, 0.002], "yaw_deg": 0.0, "tilt_deg": [0.0, 0.0]},
-      {"name": "y_minus_2mm", "xy_offset_m": [0.0, -0.002], "yaw_deg": 0.0, "tilt_deg": [0.0, 0.0]},
-      {"name": "yaw_plus_5deg", "xy_offset_m": [0.0, 0.0], "yaw_deg": 5.0, "tilt_deg": [0.0, 0.0]},
-      {"name": "yaw_minus_5deg", "xy_offset_m": [0.0, 0.0], "yaw_deg": -5.0, "tilt_deg": [0.0, 0.0]},
-      {"name": "tilt_x_plus_3deg", "xy_offset_m": [0.0, 0.0], "yaw_deg": 0.0, "tilt_deg": [3.0, 0.0]},
-      {"name": "tilt_y_plus_3deg", "xy_offset_m": [0.0, 0.0], "yaw_deg": 0.0, "tilt_deg": [0.0, 3.0]}
-    ]
+    "trials": []
   }
 }

@@ -293,7 +293,7 @@ def main() -> None:
             [
                 python,
                 "-u",
-                "scripts/render_multiview_pose.py",
+                "tools/stages/pose/render_multiview_pose.py",
                 "--config",
                 str(config_path),
                 "--trajectory",

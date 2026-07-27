@@ -10,6 +10,7 @@ import argparse
 import json
 import math
 import shutil
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -19,10 +20,14 @@ import omni.usd
 from isaacsim.core.experimental.prims import RigidPrim
 import isaacsim.core.experimental.utils.app as app_utils
 from isaacsim.core.simulation_manager import SimulationManager
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 from pxr import Gf, PhysxSchema, Sdf, Usd, UsdGeom, UsdLux, UsdPhysics, UsdShade
 
 from common.io_utils import write_json
+from common.physics_control import (
+    select_control_profile,
+    settled_contact_settings,
+)
 import common.isaac_runtime as runtime
 from common.isaac_runtime import (
     add_reference,
@@ -40,16 +45,6 @@ from common.isaac_runtime import (
     set_kinematic,
     set_pose,
 )
-from common.isaac_video import (
-    FONT_LARGE,
-    FONT_MEDIUM,
-    FONT_SMALL,
-    MultiViewCapture,
-    _encode_video,
-    _load_usd_cache,
-)
-
-
 CONTROLLERS = {
     "inner_pot": {
         "inertia_scale": 0.0032,
@@ -67,6 +62,70 @@ TARGET_COLORS = {
     "lid": (1.0, 0.12, 0.72),
 }
 UNOBSERVABLE_STATES = {"inferred_unobservable", "unobservable", "unknown"}
+
+
+def _font(size: int) -> ImageFont.ImageFont:
+    path = Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
+    return (
+        ImageFont.truetype(str(path), size)
+        if path.is_file()
+        else ImageFont.load_default()
+    )
+
+
+FONT_SMALL = _font(18)
+FONT_MEDIUM = _font(24)
+FONT_LARGE = _font(30)
+
+
+def _load_usd_cache(runtime_root: Path, parts: list[str]) -> dict[str, Path]:
+    cache_path = runtime_root / "usd/import_cache.json"
+    if not cache_path.is_file():
+        raise FileNotFoundError(
+            f"Isaac USD cache not found: {cache_path}. "
+            "Run scripts/run_isaac_insertion.py first."
+        )
+    cache = json.loads(cache_path.read_text(encoding="utf-8"))
+    paths = {
+        part: Path(cache["usd_paths"][part]).resolve()
+        for part in parts
+        if part in cache.get("usd_paths", {})
+    }
+    missing = [
+        part
+        for part in parts
+        if part not in paths or not paths[part].is_file()
+    ]
+    if missing:
+        raise RuntimeError(f"USD cache is missing parts: {missing}")
+    return paths
+
+
+def _encode_video(frame_dir: Path, output_path: Path, fps: float) -> None:
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-framerate",
+            f"{fps:g}",
+            "-i",
+            str(frame_dir / "%06d.jpg"),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-crf",
+            "18",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ],
+        check=True,
+    )
 
 
 def _set_visibility(prim: Usd.Prim, visible: bool) -> None:
@@ -161,6 +220,8 @@ def _control(
     target: np.ndarray,
     parameters: dict[str, float],
     natural_frequency: float,
+    damping_ratio: float,
+    mode: str,
 ) -> dict[str, Any]:
     actual, linear_velocity, angular_velocity = _read_state(view)
     mass = float(parameters["mass_kg"])
@@ -169,12 +230,16 @@ def _control(
     rotation_error = _rotation_error_vector(actual[:3, :3], target[:3, :3])
     force = (
         mass * natural_frequency**2 * position_error
-        - 2.0 * mass * natural_frequency * linear_velocity
+        - 2.0 * damping_ratio * mass * natural_frequency * linear_velocity
         + np.array([0.0, 0.0, mass * 9.81])
     )
     torque = (
         inertia * natural_frequency**2 * rotation_error
-        - 2.0 * inertia * natural_frequency * angular_velocity
+        - 2.0
+        * damping_ratio
+        * inertia
+        * natural_frequency
+        * angular_velocity
     )
     force, force_saturated = _clip_vector(force, float(parameters["force_limit_n"]))
     torque, torque_saturated = _clip_vector(
@@ -190,6 +255,9 @@ def _control(
         "torque_world_nm": torque.tolist(),
         "force_saturated": force_saturated,
         "torque_saturated": torque_saturated,
+        "controller_mode": mode,
+        "controller_frequency_radps": natural_frequency,
+        "controller_damping_ratio": damping_ratio,
     }
 
 
@@ -212,12 +280,31 @@ def _snapshot(
 
 def _contact_snapshot(view: RigidPrim, dt: float) -> dict[str, Any]:
     try:
-        forces, _points, _normals, separations, counts, _starts, _ids = (
+        forces, _points, _normals, separations, counts, starts, actor_ids = (
             view.get_raw_contact_data(dt=dt)
         )
-        force_values = forces.numpy()
-        separation_values = separations.numpy()
         count = int(np.asarray(counts.numpy()).sum())
+        start = (
+            int(np.asarray(starts.numpy()).reshape(-1)[0])
+            if count
+            else 0
+        )
+        contact_slice = slice(start, start + count)
+        force_values = forces.numpy()[contact_slice]
+        separation_values = separations.numpy()[contact_slice]
+        other_actor_paths = (
+            sorted(
+                {
+                    path
+                    for path in view.get_actor_paths_from_ids(
+                        actor_ids[contact_slice]
+                    )
+                    if path
+                }
+            )
+            if count
+            else []
+        )
         max_force = (
             float(np.linalg.norm(force_values, axis=-1).max())
             if force_values.size
@@ -233,9 +320,38 @@ def _contact_snapshot(view: RigidPrim, dt: float) -> dict[str, Any]:
             "count": count,
             "max_force_n": max_force,
             "max_penetration_m": penetration,
+            "other_actor_paths": other_actor_paths,
         }
     except Exception as error:
         return {"available": False, "error": repr(error), "count": 0}
+
+
+def _configure_contact_offsets(
+    stage: Usd.Stage,
+    collider_paths: list[str],
+    simulation: dict[str, Any],
+) -> dict[str, float] | None:
+    contact_offset = simulation.get("contact_offset_m")
+    rest_offset = simulation.get("rest_offset_m")
+    if contact_offset is None and rest_offset is None:
+        return None
+    contact_offset = float(
+        0.001 if contact_offset is None else contact_offset
+    )
+    rest_offset = float(0.0 if rest_offset is None else rest_offset)
+    if contact_offset <= rest_offset:
+        raise ValueError(
+            "simulation.contact_offset_m must be greater than rest_offset_m"
+        )
+    for path in collider_paths:
+        prim = stage.GetPrimAtPath(path)
+        collision = PhysxSchema.PhysxCollisionAPI.Apply(prim)
+        collision.CreateContactOffsetAttr().Set(contact_offset)
+        collision.CreateRestOffsetAttr().Set(rest_offset)
+    return {
+        "contact_offset_m": contact_offset,
+        "rest_offset_m": rest_offset,
+    }
 
 
 def _bind_target_material(
@@ -355,9 +471,11 @@ def render_complete_physics_video(
 ) -> dict[str, Any]:
     output_root.mkdir(parents=True, exist_ok=True)
     frame_dir = output_root / "frames/physics_driven"
-    if frame_dir.exists():
-        shutil.rmtree(frame_dir)
-    frame_dir.mkdir(parents=True)
+    capture_enabled = not bool(getattr(args, "no_capture", False))
+    if capture_enabled:
+        if frame_dir.exists():
+            shutil.rmtree(frame_dir)
+        frame_dir.mkdir(parents=True)
 
     parts = list(trajectory["parts"])
     reference_part = str(manifest["reference_part"])
@@ -427,6 +545,11 @@ def render_complete_physics_video(
         path for values in collider_paths.values() for path in values
     ]
     bind_physics_material(stage, all_colliders, simulation)
+    contact_offsets = _configure_contact_offsets(
+        stage,
+        all_colliders,
+        simulation,
+    )
 
     for part in dynamic_parts:
         physx = PhysxSchema.PhysxRigidBodyAPI.Apply(rigid_prims[part])
@@ -457,8 +580,9 @@ def render_complete_physics_video(
     }
     _set_visibility(roots[reference_part], False)
     dt = configure_physics_scene(stage, simulation)
-    carb.settings.get_settings().set("/rtx/post/tonemap/op", 4)
-    carb.settings.get_settings().set("/rtx/post/tonemap/filmIso", 200.0)
+    if capture_enabled:
+        carb.settings.get_settings().set("/rtx/post/tonemap/op", 4)
+        carb.settings.get_settings().set("/rtx/post/tonemap/filmIso", 200.0)
 
     SimulationManager.switch_physics_engine("physx")
     SimulationManager.setup_simulation(dt=dt, device=str(args.device))
@@ -476,6 +600,7 @@ def render_complete_physics_video(
             **CONTROLLERS[part],
             "mass_kg": float(manifest["parts"][part]["mass_kg"]),
         }
+    settled_settings = settled_contact_settings(simulation)
 
     trajectory_ids = sorted(int(frame_id) for frame_id in trajectory["frames"])
     output_start = int(args.start_frame) if args.start_frame is not None else 0
@@ -488,12 +613,18 @@ def render_complete_physics_video(
         raise ValueError(f"Invalid output range: {output_start}..{output_end}")
     physics_steps = max(1, int(round(1.0 / (dt * float(args.fps)))))
     active = {part: False for part in dynamic_parts}
+    contact_latched = {part: False for part in dynamic_parts}
     last_targets: dict[str, np.ndarray] = {}
     samples: list[dict[str, Any]] = []
 
     app_utils.play(commit=True)
     app.update()
-    capture = MultiViewCapture(app, int(args.rt_subframes))
+    if capture_enabled:
+        from common.isaac_video import MultiViewCapture
+
+        capture = MultiViewCapture(app, int(args.rt_subframes))
+    else:
+        capture = None
     output_index = 0
     try:
         for frame_id in range(0, output_end + 1):
@@ -536,6 +667,9 @@ def render_complete_physics_video(
                     "torque_world_nm": [0.0, 0.0, 0.0],
                     "force_saturated": False,
                     "torque_saturated": False,
+                    "controller_mode": "inactive",
+                    "controller_frequency_radps": 0.0,
+                    "controller_damping_ratio": 0.0,
                 }
                 for part in dynamic_parts
             }
@@ -543,11 +677,47 @@ def render_complete_physics_video(
                 for _ in range(physics_steps):
                     for part in dynamic_parts:
                         if active[part]:
+                            current_pose, _linear, _angular = _read_state(
+                                views[part]
+                            )
+                            current_position_error = float(
+                                np.linalg.norm(
+                                    last_targets[part][:3, 3]
+                                    - current_pose[:3, 3]
+                                )
+                            )
+                            if states[part] not in settled_settings["states"]:
+                                contact_latched[part] = False
+                            elif (
+                                settled_settings["enabled"]
+                                and not contact_latched[part]
+                                and current_position_error
+                                <= settled_settings[
+                                    "maximum_position_error_m"
+                                ]
+                            ):
+                                contact_latched[part] = (
+                                    _contact_snapshot(views[part], dt).get(
+                                        "count", 0
+                                    )
+                                    > 0
+                                )
+                            profile = select_control_profile(
+                                state=states[part],
+                                contact_latched=contact_latched[part],
+                                position_error_m=current_position_error,
+                                tracking_frequency_radps=float(
+                                    args.controller_frequency
+                                ),
+                                settled_settings=settled_settings,
+                            )
                             latest_controls[part] = _control(
                                 views[part],
                                 last_targets[part],
                                 controller_parameters[part],
-                                float(args.controller_frequency),
+                                float(profile["frequency_radps"]),
+                                float(profile["damping_ratio"]),
+                                str(profile["mode"]),
                             )
                     SimulationManager.step(steps=1)
 
@@ -578,17 +748,29 @@ def render_complete_physics_video(
                 "frame_id": frame_id,
                 "states": states,
                 "active_parts": [part for part in dynamic_parts if active[part]],
+                "settled_contact_latched": {
+                    part: contact_latched[part]
+                    for part in dynamic_parts
+                    if active[part]
+                },
                 "blocked_parts": blocked_parts,
                 "blocked": bool(blocked_parts),
                 "actual": snapshots,
                 "contacts": contacts,
             }
             samples.append(sample)
-            rendered_views = capture.capture()
-            _compose(rendered_views, frame_id, states, snapshots, contacts).save(
-                frame_dir / f"{output_index:06d}.jpg",
-                quality=94,
-            )
+            if capture is not None:
+                rendered_views = capture.capture()
+                _compose(
+                    rendered_views,
+                    frame_id,
+                    states,
+                    snapshots,
+                    contacts,
+                ).save(
+                    frame_dir / f"{output_index:06d}.jpg",
+                    quality=94,
+                )
             output_index += 1
             if output_index % 10 == 0 or frame_id == output_end:
                 print(
@@ -598,11 +780,17 @@ def render_complete_physics_video(
                     flush=True,
                 )
     finally:
-        capture.close()
+        if capture is not None:
+            capture.close()
         app_utils.stop()
 
-    video_path = output_root / "complete_physics_driven_trajectory.mp4"
-    _encode_video(frame_dir, video_path, float(args.fps))
+    video_path = (
+        output_root / "complete_physics_driven_trajectory.mp4"
+        if capture_enabled
+        else None
+    )
+    if video_path is not None:
+        _encode_video(frame_dir, video_path, float(args.fps))
     scene_path = output_root / "complete_physics_driven_scene.usda"
     stage.GetRootLayer().Export(str(scene_path))
     first_blocked = next(
@@ -612,8 +800,12 @@ def render_complete_physics_video(
     report = {
         "schema_version": 1,
         "status": "complete",
-        "mode": "complete force-controlled PhysX trajectory",
-        "output_video": str(video_path),
+        "mode": (
+            "complete force-controlled PhysX trajectory"
+            if capture_enabled
+            else "physics-only force-controlled PhysX trajectory"
+        ),
+        "output_video": str(video_path) if video_path is not None else None,
         "scene_usd": str(scene_path),
         "asset_root": str(asset_root),
         "runtime_root": str(runtime_root),
@@ -626,6 +818,8 @@ def render_complete_physics_video(
         "duration_s": len(samples) / float(args.fps),
         "controller_frequency_radps": float(args.controller_frequency),
         "controller_parameters": controller_parameters,
+        "settled_contact_control": settled_settings,
+        "contact_offsets": contact_offsets,
         "first_blocked_frame": first_blocked,
         "samples": samples,
         "interpretation": (
@@ -636,6 +830,6 @@ def render_complete_physics_video(
         ),
     }
     write_json(output_root / "complete_physics_video_report.json", report)
-    if not args.keep_frames:
+    if capture_enabled and not args.keep_frames:
         shutil.rmtree(frame_dir)
     return report

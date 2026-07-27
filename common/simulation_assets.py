@@ -229,6 +229,16 @@ def create_collision_proxy(
         else:
             raise ValueError(f"Unsupported collision proxy type: {proxy_type}")
 
+    uniform_scale = (
+        1.0 if spec is None else float(spec.get("uniform_scale", 1.0))
+    )
+    if uniform_scale <= 0.0:
+        raise ValueError("collision proxy uniform_scale must be positive")
+    if not np.isclose(uniform_scale, 1.0):
+        mesh.vertices = (
+            np.asarray(mesh.vertices, dtype=np.float64) * uniform_scale
+        )
+        metadata["uniform_scale"] = uniform_scale
     mesh.remove_unreferenced_vertices()
     metadata.update(
         {

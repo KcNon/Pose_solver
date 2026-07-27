@@ -10,9 +10,17 @@ import sys
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
-DEFAULT_ASSET_ROOT = PROJECT_ROOT / "experiments/data_1/simulation_assets"
-DEFAULT_RUNTIME_ROOT = PROJECT_ROOT / "experiments/data_1/isaac_runtime_proxy_v2"
-DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "experiments/data_1/isaac_video_physics_complete"
+DEFAULT_ASSET_ROOT = (
+    PROJECT_ROOT / "experiments/data_1/simulation_assets_scale_calibrated"
+)
+DEFAULT_RUNTIME_ROOT = (
+    PROJECT_ROOT / "experiments/data_1/isaac_runtime_scale_calibrated"
+)
+DEFAULT_OUTPUT_ROOT = (
+    PROJECT_ROOT
+    / "experiments/data_1/"
+    "isaac_video_scale_calibrated_assembly_bounce_fixed_final"
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -27,6 +35,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--blocked-error-m", type=float, default=0.02)
     parser.add_argument("--rt-subframes", type=int, default=1)
     parser.add_argument("--keep-frames", action="store_true")
+    parser.add_argument(
+        "--no-capture",
+        action="store_true",
+        help="Run CPU PhysX and write JSON/USD without loading a renderer.",
+    )
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)
     parser.add_argument("--device", choices=("cpu", "cuda:0"), default="cpu")
@@ -46,17 +59,41 @@ def main() -> None:
 
     from isaacsim import SimulationApp
 
-    app = SimulationApp(
-        {
-            "headless": True,
-            "width": args.width,
-            "height": args.height,
-            "renderer": "RayTracedLighting",
-            "multi_gpu": False,
-            "sync_loads": True,
-            "limit_cpu_threads": 16,
-        }
-    )
+    app_config = {
+        "headless": True,
+        "width": args.width,
+        "height": args.height,
+        "multi_gpu": False,
+        "sync_loads": True,
+        "limit_cpu_threads": 16,
+    }
+    if args.no_capture:
+        required_extensions = [
+            "omni.physx",
+            "omni.physx.tensors",
+            "omni.physx.fabric",
+            "omni.warp.core",
+            "usdrt.scenegraph",
+            "omni.kit.telemetry",
+            "omni.kit.loop",
+            "omni.kit.usd.mdl",
+            "omni.usd.metrics.assembler.ui",
+            "omni.hydra.usdrt_delegate",
+            "isaacsim.core.experimental.prims",
+            "isaacsim.asset.importer.urdf",
+        ]
+        app_config["extra_args"] = [
+            "--/app/exts/folders=['apps','exts','extscache','extsUser','extsDeprecated']",
+            *[
+                value
+                for extension in required_extensions
+                for value in ("--enable", extension)
+            ],
+        ]
+        app = SimulationApp(app_config, experience=None)
+    else:
+        app_config["renderer"] = "RayTracedLighting"
+        app = SimulationApp(app_config)
     try:
         from common.isaac_physics_video import render_complete_physics_video
 
@@ -69,7 +106,10 @@ def main() -> None:
             manifest,
             trajectory,
         )
-        print(f"Complete physics video: {report['output_video']}", flush=True)
+        if report["output_video"]:
+            print(f"Complete physics video: {report['output_video']}", flush=True)
+        else:
+            print("Physics-only report completed (capture disabled).", flush=True)
         print(
             f"Frames: {report['frame_count']} | "
             f"duration: {report['duration_s']:.2f}s | "

@@ -14,13 +14,22 @@ import sys
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
-DEFAULT_ASSET_ROOT = PROJECT_ROOT / "experiments/data_1/simulation_assets"
+DEFAULT_ASSET_ROOT = (
+    PROJECT_ROOT / "experiments/data_1/simulation_assets_scale_calibrated"
+)
+DEFAULT_RUNTIME_ROOT = (
+    PROJECT_ROOT / "experiments/data_1/isaac_runtime_scale_calibrated"
+)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--asset-root", type=Path, default=DEFAULT_ASSET_ROOT)
-    parser.add_argument("--runtime-output-dir", type=Path)
+    parser.add_argument(
+        "--runtime-output-dir",
+        type=Path,
+        default=DEFAULT_RUNTIME_ROOT,
+    )
     parser.add_argument("--force-import", action="store_true")
     parser.add_argument("--skip-replay", action="store_true")
     parser.add_argument("--skip-drop", action="store_true")
@@ -38,7 +47,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     asset_root = args.asset_root.resolve()
-    runtime_root = (args.runtime_output_dir or asset_root).resolve()
+    runtime_root = args.runtime_output_dir.resolve()
     manifest_path = asset_root / "manifest.json"
     if not manifest_path.is_file():
         raise FileNotFoundError(f"Asset manifest does not exist: {manifest_path}")

@@ -17,7 +17,7 @@ from common.simulation_assets import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CONFIG = json.loads((ROOT / "configs/simulation_assets.json").read_text())
+CONFIG = json.loads((ROOT / "configs/simulation_data_1.json").read_text())
 ASSET_ROOT = ROOT / CONFIG["output_dir"]
 
 
@@ -104,6 +104,29 @@ class SimulationAssetTests(unittest.TestCase):
         self.assertEqual(proxy.body_count, 2)
         self.assertLess(len(proxy.faces), 1000)
         self.assertEqual(len(info["components"]), 2)
+
+    def test_uniform_scale_applies_to_configured_proxy(self) -> None:
+        trimesh = __import__("trimesh")
+        visual = trimesh.creation.box()
+        spec = {
+            "type": "cylinder",
+            "axis": "z",
+            "radius_m": 0.2,
+            "axis_min_m": -0.1,
+            "axis_max_m": 0.1,
+            "sections": 32,
+        }
+        baseline, _ = create_collision_proxy(visual, spec)
+        scaled, info = create_collision_proxy(
+            visual, {**spec, "uniform_scale": 0.94}
+        )
+        np.testing.assert_allclose(
+            scaled.extents,
+            baseline.extents * 0.94,
+            rtol=1e-7,
+            atol=1e-9,
+        )
+        self.assertEqual(info["uniform_scale"], 0.94)
 
     def test_urdf_mesh_paths_exist(self) -> None:
         urdf_paths = sorted((ASSET_ROOT / "urdf").glob("*.urdf"))

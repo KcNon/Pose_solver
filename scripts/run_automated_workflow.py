@@ -258,7 +258,7 @@ def main() -> None:
         else:
             command = [
                 python,
-                "scripts/extract_synchronized_video_frames.py",
+                "tools/stages/preprocess/extract_synchronized_video_frames.py",
                 "--config",
                 str(source_paths["preprocess"]),
             ]

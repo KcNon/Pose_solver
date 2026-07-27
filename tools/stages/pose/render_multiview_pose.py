@@ -11,7 +11,7 @@ import numpy as np
 import trimesh
 from PIL import Image
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
 
 from common.io_utils import load_json, write_json
