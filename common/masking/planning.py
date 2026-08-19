@@ -27,12 +27,21 @@ def discovery_timestamps(
     timestamps: Iterable[str],
     *,
     stride: int,
+    maximum_frame: int | None = None,
 ) -> list[str]:
     values = list(timestamps)
     if not values:
         raise ValueError("cannot plan mask discovery without frames")
     if stride <= 0:
         raise ValueError("discovery stride must be positive")
+    if maximum_frame is not None:
+        if maximum_frame < 0:
+            raise ValueError("discovery maximum_frame must be non-negative")
+        values = [value for value in values if int(value) <= maximum_frame]
+        if not values:
+            raise ValueError(
+                "discovery maximum_frame excludes every synchronized frame"
+            )
     selected = values[::stride]
     if values[-1] not in selected:
         selected.append(values[-1])
@@ -107,7 +116,7 @@ def infer_presence_start(
     evidence: list[dict[str, Any]],
     *,
     minimum_views: int,
-    consecutive: int = 1,
+    consecutive: int = 2,
 ) -> tuple[int, dict[str, Any]]:
     if minimum_views <= 0:
         raise ValueError("minimum_views must be positive")
@@ -214,7 +223,7 @@ def resolve_mask_config(
         "minimum_views",
         max(1, min(2, len(config.views))),
     ))
-    consecutive = int(settings.get("consecutive_scans", 1))
+    consecutive = int(settings.get("consecutive_scans", 2))
     raw = deepcopy(config.raw)
     raw_parts = raw.setdefault("parts", {})
     if not isinstance(raw_parts, dict):

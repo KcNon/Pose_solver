@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+from typing import Sequence
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,8 +19,88 @@ from common.stage_cache import (
     write_checkpoint,
 )
 
-DEFAULT_CONFIG = ROOT / "configs" / "pipeline_data_1_8view.json"
 STAGES = ROOT / "tools" / "stages" / "depth"
+
+
+def _optional_path(value: str | None) -> tuple[Path, ...]:
+    return (Path(value).resolve(),) if value else ()
+
+
+def build_da3_command(
+    config: dict,
+    runtime: dict,
+    timestamps: list[str],
+    *,
+    force: bool = False,
+) -> list[str]:
+    """Build the fixed-rig DA3 command from explicit, fingerprinted settings."""
+
+    process_res = int(runtime.get("process_res", 504))
+    full_w = int(runtime.get("full_w", 1920))
+    full_h = int(runtime.get("full_h", 1080))
+    if process_res <= 0:
+        raise ValueError("depth_pipeline.process_res must be positive")
+    if full_w <= 0 or full_h <= 0:
+        raise ValueError("depth_pipeline full_w/full_h must be positive")
+
+    command = [
+        str(runtime["da3_python"]),
+        "-u",
+        str(STAGES / "run_da3_fixed_rig.py"),
+        "--frames-dir",
+        str(Path(config["frames_dir"]).resolve()),
+        "--output-dir",
+        str(Path(config["da3_self_cond_dir"]).resolve()),
+        "--views",
+        *[str(view) for view in config["views"]],
+        "--timestamps",
+        *timestamps,
+        "--batch-size",
+        str(int(runtime.get("batch_size", 1))),
+        "--device",
+        str(runtime.get("device", "cuda")),
+        "--process-res",
+        str(process_res),
+        "--process-res-method",
+        str(runtime.get("process_res_method", "upper_bound_resize")),
+        "--ref-view-strategy",
+        str(runtime.get("ref_view_strategy", "saddle_balanced")),
+        "--full-w",
+        str(full_w),
+        "--full-h",
+        str(full_h),
+    ]
+    camera_npz = runtime.get("camera_npz")
+    camera_frames = runtime.get("camera_frames")
+    if camera_npz:
+        command.extend([
+            "--camera-npz",
+            str(Path(camera_npz).resolve()),
+        ])
+    elif camera_frames:
+        command.extend([
+            "--camera-frames",
+            *[f"{int(frame):06d}" for frame in camera_frames],
+        ])
+    else:
+        command.extend([
+            "--camera-frame",
+            f"{int(runtime['camera_frame']):06d}",
+        ])
+    if runtime.get("camera_frames_dir"):
+        command.extend([
+            "--camera-frames-dir",
+            str(Path(runtime["camera_frames_dir"]).resolve()),
+        ])
+    if runtime.get("model_dir"):
+        command.extend(["--model-dir", str(Path(runtime["model_dir"]).resolve())])
+    if runtime.get("use_ray_pose", False):
+        command.append("--use-ray-pose")
+    if runtime.get("allow_legacy_shape_resume", False):
+        command.append("--allow-legacy-shape-resume")
+    if force:
+        command.append("--overwrite")
+    return command
 
 
 def _run(
@@ -47,16 +128,16 @@ def _run(
     write_checkpoint(expected, fingerprint)
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default=str(DEFAULT_CONFIG))
+    parser.add_argument("--config", required=True)
     parser.add_argument(
         "--stage",
-        choices=("all", "da3", "gauge", "cloud", "postprocess"),
+        choices=("all", "da3", "gauge", "cloud", "quality", "postprocess"),
         default="all",
     )
     parser.add_argument("--force", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     config_path = Path(args.config).resolve()
     config = json.loads(config_path.read_text(encoding="utf-8"))
@@ -69,26 +150,9 @@ def main() -> None:
     if args.stage in {"all", "da3"}:
         da3_output = Path(config["da3_self_cond_dir"]).resolve()
         expected = da3_output / timestamps[-1] / "predictions.npz"
-        command = [
-            str(runtime["da3_python"]),
-            "-u",
-            str(STAGES / "run_da3_fixed_rig.py"),
-            "--frames-dir",
-            str(Path(config["frames_dir"]).resolve()),
-            "--output-dir",
-            str(da3_output),
-            "--views",
-            *config["views"],
-            "--timestamps",
-            *timestamps,
-            "--camera-frame",
-            f"{int(runtime['camera_frame']):06d}",
-            "--batch-size",
-            str(int(runtime.get("batch_size", 1))),
-            "--device",
-            str(runtime.get("device", "cuda")),
-            "--overwrite",
-        ]
+        command = build_da3_command(
+            config, runtime, timestamps, force=args.force
+        )
         _run(
             command,
             expected,
@@ -96,8 +160,13 @@ def main() -> None:
             stat_paths=(Path(config["frames_dir"]).resolve(),),
         )
 
-    if args.stage in {"all", "gauge", "postprocess"}:
-        gauge_path = Path(config["depth_gauge_path"]).resolve()
+    gauge_value = config.get("depth_gauge_path")
+    if args.stage == "gauge" and not gauge_value:
+        raise ValueError(
+            "depth gauge stage requested but depth_gauge_path is disabled"
+        )
+    if args.stage in {"all", "gauge", "postprocess"} and gauge_value:
+        gauge_path = Path(gauge_value).resolve()
         command = [
             sys.executable,
             str(STAGES / "calibrate_depth_gauge.py"),
@@ -125,7 +194,10 @@ def main() -> None:
             ),
         )
 
-    if args.stage in {"all", "cloud", "postprocess"}:
+    quality_enabled = bool(config.get("quality_cloud", {}).get("enabled", False))
+    if args.stage == "cloud" or (
+        args.stage in {"all", "postprocess"} and not quality_enabled
+    ):
         backend = str(config["recon_backend"])
         tag = config.get("point_cloud_tag")
         name = backend if not tag else f"{backend}_{tag}"
@@ -153,7 +225,7 @@ def main() -> None:
             args.force,
             content_files=(
                 config_path,
-                Path(config["depth_gauge_path"]).resolve(),
+                *_optional_path(config.get("depth_gauge_path")),
             ),
             stat_paths=(
                 Path(config["masks_dir"]).resolve(),
@@ -161,6 +233,39 @@ def main() -> None:
             ),
         )
 
-
-if __name__ == "__main__":
-    main()
+    if args.stage == "quality" or (
+        args.stage in {"all", "postprocess"} and quality_enabled
+    ):
+        quality = config.get("quality_cloud", {})
+        quality_root = Path(
+            quality.get(
+                "point_cloud_root",
+                Path(config.get(
+                    "point_cloud_output_root", config["output_root"]
+                ))
+                / "parts_ply"
+                / quality.get(
+                    "variant", f"{config['recon_backend']}_quality"
+                ),
+            )
+        ).resolve()
+        expected = quality_root / "complete.json"
+        _run(
+            [
+                sys.executable,
+                "-u",
+                str(STAGES / "build_quality_point_clouds.py"),
+                "--pipeline",
+                str(config_path),
+            ],
+            expected,
+            args.force,
+            content_files=(
+                config_path,
+                *_optional_path(config.get("depth_gauge_path")),
+            ),
+            stat_paths=(
+                Path(config["masks_dir"]).resolve(),
+                Path(config["da3_self_cond_dir"]).resolve(),
+            ),
+        )

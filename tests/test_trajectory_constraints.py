@@ -7,11 +7,15 @@ from common.trajectory_constraints import (
     CylindricalContainer,
     SampledSurface,
     evaluate_insertion_trajectory,
+    evaluate_screw_trajectory,
     evaluate_surface_contact_trajectory,
     insertion_pose_metrics,
     pairwise_alignment_metrics,
+    project_coaxial_pose,
     project_pairwise_alignment,
     refine_insert_trajectory,
+    refine_screw_trajectory,
+    solve_monotonic_axial_path,
     surface_pair_pose_metrics,
 )
 
@@ -86,6 +90,46 @@ class InsertionMetricTests(unittest.TestCase):
         self.assertGreater(result["max_penetration_m"], 0.0)
 
 
+class AxialPathTests(unittest.TestCase):
+    def test_dynamic_program_rejects_visual_backtracking(self):
+        # Independent visual minima would select 0, 2, 1, 3.  The physical
+        # insertion path must remain directed and finish at the stable anchor.
+        costs = np.asarray(
+            [
+                [0.0, 1.0, 2.0, 3.0],
+                [2.0, 1.0, 0.0, 1.0],
+                [2.0, 0.0, 1.0, 2.0],
+                [3.0, 2.0, 1.0, 0.0],
+            ]
+        )
+        grid = np.asarray([0.0, 0.01, 0.02, 0.03])
+        path, total = solve_monotonic_axial_path(
+            costs,
+            grid,
+            direction=1.0,
+            maximum_step_m=0.02,
+            maximum_backtrack_m=0.0,
+            temporal_weight=0.01,
+            terminal_index=3,
+        )
+        self.assertTrue(np.all(np.diff(grid[path]) >= 0.0))
+        self.assertEqual(int(path[-1]), 3)
+        self.assertTrue(np.isfinite(total))
+
+    def test_descending_path_uses_negative_direction(self):
+        costs = np.zeros((3, 3), dtype=np.float64)
+        grid = np.asarray([0.0, 0.01, 0.02])
+        path, _ = solve_monotonic_axial_path(
+            costs,
+            grid,
+            direction=-1.0,
+            maximum_step_m=0.02,
+            terminal_index=0,
+        )
+        self.assertTrue(np.all(np.diff(grid[path]) <= 0.0))
+        self.assertEqual(int(path[-1]), 0)
+
+
 class InsertionOptimizationTests(unittest.TestCase):
     def test_bounded_search_removes_floor_penetration(self):
         moving = trimesh.creation.cylinder(
@@ -116,6 +160,60 @@ class InsertionOptimizationTests(unittest.TestCase):
         self.assertGreater(report["before"]["max_penetration_m"], 0.0)
         self.assertEqual(report["proposed_after"]["max_penetration_m"], 0.0)
         self.assertGreater(refined[0][1, 3], poses[0][1, 3])
+
+
+class ScrewInsertionTests(unittest.TestCase):
+    def test_screw_projection_aligns_axes_and_couples_pitch(self):
+        values = {frame: np.eye(4) for frame in range(7)}
+        for frame, value in values.items():
+            value[:3, 3] = [0.02 * (1.0 - frame / 6.0), 0.0, 0.0]
+        config = {
+            "insertion_start_frame": 0,
+            "contact_frame": 2,
+            "seat_frame": 6,
+            "terminal_anchor_frame": 6,
+            "reference_axis_part": "z",
+            "moving_axis_part": "z",
+            "reference_axis_origin_part_m": [0.0, 0.0, 0.0],
+            "moving_axis_origin_part_m": [0.0, 0.0, 0.0],
+            "target_axis_offset_m": 0.0,
+            "pitch_m_per_turn": 0.01,
+            "turns": 1.0,
+            "handedness": 1.0,
+            "phase_observation_weight": 0.0,
+        }
+        refined, optimization = refine_screw_trajectory(values, config)
+        report = evaluate_screw_trajectory(refined, config)
+        self.assertAlmostEqual(report["max_axis_angle_deg"], 0.0, places=6)
+        self.assertAlmostEqual(report["max_axis_offset_m"], 0.0, places=6)
+        self.assertAlmostEqual(report["max_helix_residual_m"], 0.0, places=6)
+        self.assertEqual(report["monotonic_axial_violations"], 0)
+        self.assertAlmostEqual(
+            refined[6][2, 3] - refined[2][2, 3], 0.01, places=6
+        )
+        self.assertAlmostEqual(optimization["effective_turns"], 1.0, places=6)
+
+    def test_screw_evaluation_requires_and_reports_real_collision_geometry(self):
+        fixed = sampled_box([1.0, 1.0, 1.0], 31)
+        moving = sampled_box([1.0, 1.0, 1.0], 32)
+        values = {0: pose(0.75, 0.0), 1: pose(0.75, 0.0)}
+        report = evaluate_screw_trajectory(
+            values,
+            {
+                "contact_frame": 0,
+                "reference_axis_part": "z",
+                "moving_axis_part": "z",
+                "pitch_m_per_turn": 0.0,
+                "collision_continuous_substeps": 1,
+                "contact_tolerance_m": 0.0,
+                "near_field_m": 0.3,
+            },
+            moving_surface=moving,
+            reference_surface=fixed,
+        )
+        self.assertTrue(report["collision_evaluated"])
+        self.assertGreater(report["max_penetration_m"], 0.0)
+        self.assertGreater(report["violating_samples"], 0)
 
 
 def sampled_box(extents: list[float], seed: int) -> SampledSurface:
@@ -171,6 +269,36 @@ class GenericPairwiseContactTests(unittest.TestCase):
         )
         self.assertAlmostEqual(metrics["axis_angle_deg"], 0.0, places=6)
         self.assertAlmostEqual(metrics["axis_offset_m"], 0.01, places=6)
+
+    def test_coaxial_projection_uses_axis_origins_not_part_origins(self):
+        value = np.eye(4)
+        value[:3, :3] = trimesh.transformations.rotation_matrix(
+            np.deg2rad(35.0), [1.0, 0.0, 0.0]
+        )[:3, :3]
+        value[:3, 3] = [0.3, 0.2, -0.1]
+        fixed_origin = np.asarray([0.2, 0.0, -0.1])
+        moving_origin = np.asarray([0.1, 0.0, 0.0])
+        projected = project_coaxial_pose(
+            value,
+            reference_axis=[0.0, 1.0, 0.0],
+            moving_axis=[0.0, 0.0, 1.0],
+            reference_axis_origin_m=fixed_origin,
+            moving_axis_origin_m=moving_origin,
+            target_axis_offset_m=0.0,
+        )
+        transformed_origin = (
+            projected[:3, :3] @ moving_origin + projected[:3, 3]
+        )
+        offset = transformed_origin - fixed_origin
+        radial = offset - np.dot(offset, [0.0, 1.0, 0.0]) * np.asarray(
+            [0.0, 1.0, 0.0]
+        )
+        np.testing.assert_allclose(radial, np.zeros(3), atol=1e-9)
+        np.testing.assert_allclose(
+            projected[:3, :3] @ np.asarray([0.0, 0.0, 1.0]),
+            [0.0, 1.0, 0.0],
+            atol=1e-9,
+        )
 
     def test_continuous_pairwise_evaluation_catches_tunnelling(self):
         fixed = sampled_box([1.0, 1.0, 1.0], 21)

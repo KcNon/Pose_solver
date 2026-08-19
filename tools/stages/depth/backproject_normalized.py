@@ -63,7 +63,8 @@ def backproject_timestamp(
     global_thr = float(np.median(conf))
     img = load_recon_colors(recon, cfg, timestamp)
     view_masks = load_palette_masks(
-        masks_dir(cfg), timestamp, parts, recon["depth_hw"], views=views
+        masks_dir(cfg), timestamp, parts, recon["depth_hw"], views=views,
+        part_ids=cfg.get("part_ids"),
     )
 
     out_dir = os.path.join(parts_ply_root(cfg, backend, tag), timestamp)

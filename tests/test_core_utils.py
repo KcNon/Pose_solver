@@ -5,11 +5,14 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+from PIL import Image
 from scipy.spatial.transform import Rotation
 
-from common.depth_gauge import reference_part
+from common.backproject_utils import load_palette_masks
+from common.depth_gauge import gauge_masks, reference_part
 from common.io_utils import load_json, write_json
 from common.mask_io import list_timestamps, view_names
+from common.normalized_recon import load_recon
 from common.pose_transforms import (
     axis_rotation,
     axis_rotation_degrees,
@@ -19,6 +22,7 @@ from common.pose_transforms import (
     similarity_from_rigid,
     transform_points,
 )
+from common.pose_visualization import tile_image_panels
 from common.stage_cache import (
     checkpoint_matches,
     stage_fingerprint,
@@ -38,6 +42,30 @@ class JsonIoTests(unittest.TestCase):
             ),
             "anchor",
         )
+
+    def test_background_gauge_excludes_every_part(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            frame = root / "000000"
+            frame.mkdir(parents=True)
+            labels = np.zeros((4, 5), np.uint8)
+            labels[1, 1] = 1
+            labels[2, 3] = 2
+            Image.fromarray(labels).save(frame / "view.png")
+            masks = gauge_masks(
+                {
+                    "masks_dir": str(root),
+                    "parts": ["main", "collector"],
+                    "part_ids": {"main": 1, "collector": 2},
+                    "views": ["view"],
+                },
+                "000000",
+                (4, 5),
+                "__background__",
+            )
+            self.assertFalse(masks[0][1, 1])
+            self.assertFalse(masks[0][2, 3])
+            self.assertEqual(int(masks[0].sum()), 18)
 
     def test_json_round_trip_creates_parent_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -87,6 +115,86 @@ class JsonIoTests(unittest.TestCase):
     def test_duplicate_view_names_are_rejected(self) -> None:
         with self.assertRaises(ValueError):
             view_names({"views": ["camera_a", "camera_a"]})
+
+    def test_palette_mask_preserves_configured_label_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            frame = root / "000000"
+            frame.mkdir()
+            labels = np.asarray([[0, 1, 3], [3, 1, 0]], dtype=np.uint8)
+            image = Image.fromarray(labels, mode="P")
+            image.putpalette([0, 0, 0] * 256)
+            image.save(frame / "camera.png")
+            masks = load_palette_masks(
+                str(root),
+                "000000",
+                ["lid"],
+                (2, 3),
+                views=["camera"],
+                part_ids={"lid": 3},
+            )
+            np.testing.assert_array_equal(masks["lid"][0], labels == 3)
+
+    def test_reconstruction_arrays_follow_configured_view_subset(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            frame = root / "000000"
+            frame.mkdir()
+            np.savez(
+                frame / "predictions.npz",
+                depth=np.arange(24, dtype=np.float32).reshape(3, 2, 4, 1),
+                depth_conf=np.arange(24, dtype=np.float32).reshape(3, 2, 4),
+                intrinsic=np.stack([np.eye(3) * value for value in (1, 2, 3)]),
+                extrinsic=np.stack([np.eye(4)[:3] * value for value in (1, 2, 3)]),
+                images=np.stack([
+                    np.full((3, 2, 4), value, np.float32)
+                    for value in (10, 20, 30)
+                ]),
+                view_names=np.asarray(["left", "middle", "right"]),
+            )
+            recon = load_recon(
+                {
+                    "da3_self_cond_dir": str(root),
+                    "views": ["right", "left"],
+                },
+                "000000",
+            )
+            self.assertEqual(recon["view_names"], ["right", "left"])
+            self.assertEqual(recon["n_views"], 2)
+            self.assertEqual(float(recon["depth"][0, 0, 0]), 16.0)
+            self.assertEqual(float(recon["depth"][1, 0, 0]), 0.0)
+            self.assertEqual(float(recon["images"][0, 0, 0, 0]), 30.0)
+
+    def test_reconstruction_subset_requires_view_name_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            frame = root / "000000"
+            frame.mkdir()
+            np.savez(
+                frame / "predictions.npz",
+                depth=np.ones((3, 2, 2, 1), np.float32),
+                depth_conf=np.ones((3, 2, 2), np.float32),
+                intrinsic=np.stack([np.eye(3)] * 3),
+                extrinsic=np.stack([np.eye(4)[:3]] * 3),
+            )
+            with self.assertRaisesRegex(ValueError, "cannot select configured subset"):
+                load_recon(
+                    {
+                        "da3_self_cond_dir": str(root),
+                        "views": ["left", "right"],
+                    },
+                    "000000",
+                )
+
+    def test_image_panel_tiling_pads_incomplete_final_row(self) -> None:
+        panels = [
+            np.full((2, 3, 3), value, np.uint8) for value in range(6)
+        ]
+        sheet = tile_image_panels(panels, columns=4)
+        self.assertEqual(sheet.shape, (4, 12, 3))
+        np.testing.assert_array_equal(sheet[:2, 9:12], panels[3])
+        np.testing.assert_array_equal(sheet[2:, 3:6], panels[5])
+        self.assertFalse(sheet[2:, 6:].any())
 
 
 class PoseTransformTests(unittest.TestCase):

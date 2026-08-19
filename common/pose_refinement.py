@@ -8,19 +8,16 @@ import numpy as np
 import trimesh
 from PIL import Image
 from scipy.spatial import cKDTree
-from scipy.spatial.transform import Rotation
+from scipy.spatial.transform import Rotation, Slerp
 
 from common.pose_transforms import transform_points
 
 
 def sample_canonical(mesh: trimesh.Trimesh, scale: float, origin: np.ndarray,
                      count: int, seed: int) -> np.ndarray:
-    state = np.random.get_state()
-    np.random.seed(seed)
-    try:
-        points, _ = trimesh.sample.sample_surface(mesh, count)
-    finally:
-        np.random.set_state(state)
+    points, _ = trimesh.sample.sample_surface(
+        mesh, count, seed=np.random.default_rng(seed)
+    )
     return scale * (np.asarray(points, float) - origin)
 
 
@@ -133,3 +130,124 @@ def limit_pose_velocity(poses: dict[int, np.ndarray], max_translation_m: float,
         "final_max_translation_step_m": max(final_t, default=0.0),
         "final_max_rotation_step_deg": max(final_r, default=0.0),
     }
+
+
+def smooth_pose_ranges(
+    poses: dict[int, np.ndarray],
+    ranges: list[tuple[int, int]] | list[list[int]],
+    *,
+    passes: int = 2,
+    fixed_frames: set[int] | None = None,
+) -> dict[int, np.ndarray]:
+    """Smooth configured dynamic ranges while keeping their neighbours fixed.
+
+    The fixed frame immediately before and after each range prevents an
+    independently refined moving interval from introducing a jump at either
+    stable boundary.  Missing boundary frames are handled by leaving the
+    available endpoint fixed.
+    """
+
+    result = {
+        int(frame): np.asarray(pose, dtype=np.float64).copy()
+        for frame, pose in poses.items()
+    }
+    if passes <= 0 or not result:
+        return result
+    available = set(result)
+    fixed = {int(frame) for frame in (fixed_frames or set())}
+    for raw_start, raw_end in ranges:
+        start, end = int(raw_start), int(raw_end)
+        if end < start:
+            raise ValueError(f"invalid smoothing range [{start}, {end}]")
+        for _ in range(int(passes)):
+            old = {frame: pose.copy() for frame, pose in result.items()}
+            for frame in range(start, end + 1):
+                if frame in fixed:
+                    continue
+                if not {frame - 1, frame, frame + 1}.issubset(available):
+                    continue
+                translations = np.stack([
+                    old[frame - 1][:3, 3],
+                    old[frame][:3, 3],
+                    old[frame + 1][:3, 3],
+                ])
+                rotations = Rotation.from_matrix(np.stack([
+                    old[frame - 1][:3, :3],
+                    old[frame][:3, :3],
+                    old[frame + 1][:3, :3],
+                ]))
+                result[frame][:3, 3] = np.average(
+                    translations,
+                    axis=0,
+                    weights=np.asarray([1.0, 4.0, 1.0]),
+                )
+                result[frame][:3, :3] = rotations.mean(
+                    weights=np.asarray([1.0, 4.0, 1.0])
+                ).as_matrix()
+    return result
+
+
+def interpolate_untrusted_pose_frames(
+    poses: dict[int, np.ndarray],
+    ranges: list[tuple[int, int]] | list[list[int]],
+    *,
+    trusted_frames: set[int],
+) -> tuple[dict[int, np.ndarray], list[int]]:
+    """Replace rejected/missing measurements between trusted temporal poses.
+
+    A rejected render refinement is evidence that the measurement is weak; it
+    must not become a fixed smoothing anchor.  This fills such frames by SE(3)
+    interpolation between the nearest accepted measurements (or the fixed
+    static neighbours of the dynamic range) before the normal local smoother
+    is applied.
+    """
+
+    result = {
+        int(frame): np.asarray(pose, dtype=np.float64).copy()
+        for frame, pose in poses.items()
+    }
+    available = set(result)
+    trusted = {int(frame) for frame in trusted_frames if int(frame) in available}
+    replaced: list[int] = []
+    for raw_start, raw_end in ranges:
+        start, end = int(raw_start), int(raw_end)
+        if end < start:
+            raise ValueError(f"invalid interpolation range [{start}, {end}]")
+        local_trusted = {
+            frame for frame in trusted if start <= frame <= end
+        }
+        if start - 1 in available:
+            local_trusted.add(start - 1)
+        if end + 1 in available:
+            local_trusted.add(end + 1)
+        ordered = sorted(local_trusted)
+        if not ordered:
+            continue
+        source = {frame: result[frame].copy() for frame in ordered}
+        for frame in range(start, end + 1):
+            if frame not in available or frame in local_trusted:
+                continue
+            left = max((value for value in ordered if value < frame), default=None)
+            right = min((value for value in ordered if value > frame), default=None)
+            if left is None and right is None:
+                continue
+            if left is None:
+                result[frame] = source[right].copy()
+            elif right is None:
+                result[frame] = source[left].copy()
+            else:
+                fraction = (frame - left) / (right - left)
+                pose = np.eye(4, dtype=np.float64)
+                pose[:3, 3] = (
+                    (1.0 - fraction) * source[left][:3, 3]
+                    + fraction * source[right][:3, 3]
+                )
+                rotations = Rotation.from_matrix(np.stack([
+                    source[left][:3, :3], source[right][:3, :3]
+                ]))
+                pose[:3, :3] = Slerp([0.0, 1.0], rotations)(
+                    [fraction]
+                ).as_matrix()[0]
+                result[frame] = pose
+            replaced.append(frame)
+    return result, sorted(set(replaced))

@@ -27,15 +27,21 @@ from common.render_loss_refinement import (
     MultiViewRenderObjective,
     RenderObservation,
 )
-from common.simulation_assets import create_collision_proxy
+from common.simulation_assets import (
+    canonicalize_mesh,
+    create_collision_proxy,
+    load_flat_mesh,
+)
 from common.trajectory_constraints import (
     CylindricalContainer,
     SampledSurface,
     evaluate_insertion_trajectory,
+    evaluate_screw_trajectory,
     evaluate_surface_contact_trajectory,
     interpolate_pose,
     pose_delta,
     refine_insert_trajectory,
+    refine_screw_trajectory,
     refine_surface_contact_trajectory,
 )
 from common.trajectory_io import (
@@ -82,6 +88,34 @@ def sample_proxy_surface(
     return SampledSurface(points, normals)
 
 
+def load_part_collision_geometry(
+    cfg: dict[str, Any],
+    baseline: dict[str, Any],
+    proxies: dict[str, Any],
+    part: str,
+) -> tuple[trimesh.Trimesh, dict[str, Any]]:
+    """Resolve configured proxy or fall back to the canonical visual mesh.
+
+    Geometry configs deliberately allow an empty ``collision_proxies`` map:
+    in that case the reconstructed part mesh is the collision geometry.  Keep
+    it in the same canonical frame used by the solver and simulator.
+    """
+    mesh_path = Path(cfg["mesh_dir"]) / f"{part}.glb"
+    raw_mesh = load_flat_mesh(mesh_path)
+    visual_mesh = canonicalize_mesh(
+        raw_mesh,
+        float(baseline["scales"][part]),
+        baseline["raw_mesh_origins"][part],
+    )
+    spec = proxies.get(part)
+    proxy, metadata = create_collision_proxy(visual_mesh, spec)
+    metadata["source"] = (
+        "configured_proxy" if spec is not None else "canonical_visual_mesh"
+    )
+    metadata["visual_mesh"] = str(mesh_path)
+    return proxy, metadata
+
+
 def load_render_observations(
     cfg: dict[str, Any],
     timestamp: str,
@@ -111,6 +145,11 @@ def load_render_observations(
             (width, height),
             interpolation=cv2.INTER_LINEAR,
         )
+        known_occluder = cv2.resize(
+            ((labels != 0) & (labels != part_id)).astype(np.uint8),
+            (width, height),
+            interpolation=cv2.INTER_NEAREST,
+        ).astype(bool)
         observations.append(
             RenderObservation(
                 view=view,
@@ -118,6 +157,10 @@ def load_render_observations(
                 extrinsics=extrinsics,
                 target_mask=target,
                 observed_depth=observed_depth,
+                depth_loss_enabled=bool(
+                    gate.get("use_depth_loss", False)
+                ),
+                known_occluder_mask=known_occluder,
             )
         )
     return observations
@@ -299,7 +342,12 @@ def main() -> None:
         # trajectory behind when that relation ultimately fails validation.
         relation_input_trajectory = copy.deepcopy(trajectory)
         relation_type = str(relation.get("type", "insert_into"))
-        if relation_type not in {"insert_into", "pairwise_contact"}:
+        if relation_type not in {
+            "insert_into",
+            "nonpenetration",
+            "pairwise_contact",
+            "screw_insert",
+        }:
             raise ValueError(
                 f"unsupported trajectory constraint type: {relation.get('type')}"
             )
@@ -327,12 +375,11 @@ def main() -> None:
             relation.get("seed", default_seed + stable_offset)
         )
 
-        dummy = trimesh.creation.box(extents=[1.0, 1.0, 1.0])
-        reference_proxy, reference_proxy_info = create_collision_proxy(
-            dummy, proxies[reference_part]
+        reference_proxy, reference_proxy_info = load_part_collision_geometry(
+            cfg, baseline, proxies, reference_part
         )
-        moving_proxy, moving_proxy_info = create_collision_proxy(
-            dummy, proxies[moving_part]
+        moving_proxy, moving_proxy_info = load_part_collision_geometry(
+            cfg, baseline, proxies, moving_part
         )
         relative_initial = {}
         for frame in frames:
@@ -349,14 +396,43 @@ def main() -> None:
                 np.linalg.inv(reference_world) @ moving_world
             )
 
+        relation_parameters = relation
+        if relation_type == "screw_insert":
+            relation_parameters = copy.deepcopy(relation)
+            for role, part in (
+                ("reference", reference_part),
+                ("moving", moving_part),
+            ):
+                raw_key = f"{role}_axis_origin_raw"
+                metric_key = f"{role}_axis_origin_part_m"
+                if raw_key not in relation_parameters:
+                    continue
+                raw_origin = np.asarray(
+                    relation_parameters[raw_key], dtype=np.float64
+                )
+                canonical_origin = float(baseline["scales"][part]) * (
+                    raw_origin
+                    - np.asarray(
+                        baseline["raw_mesh_origins"][part], dtype=np.float64
+                    )
+                )
+                relation_parameters[metric_key] = canonical_origin.tolist()
+
         geometry_metadata: dict[str, Any]
         if relation_type == "insert_into":
+            reference_spec = proxies.get(reference_part)
+            if reference_spec is None:
+                raise ValueError(
+                    f"{name}: insert_into requires an analytic collision proxy "
+                    f"for container part {reference_part!r}; raw mesh fallback "
+                    "is supported for pairwise_contact relations"
+                )
             points = sample_proxy_points(
                 moving_proxy,
                 int(relation.get("surface_points", 2000)),
                 relation_seed,
             )
-            container = CylindricalContainer.from_spec(proxies[reference_part])
+            container = CylindricalContainer.from_spec(reference_spec)
             proposed, optimization = refine_insert_trajectory(
                 relative_initial, points, container, relation
             )
@@ -379,12 +455,21 @@ def main() -> None:
                 )
 
             geometry_metadata = {
-                "reference_proxy": proxies[reference_part],
+                "reference_proxy": reference_proxy_info,
                 "moving_proxy": moving_proxy_info,
                 "collision_sample_points": int(len(points)),
                 "entry_frame": optimization["entry_frame"],
             }
-        else:
+        elif relation_type in {"nonpenetration", "pairwise_contact"}:
+            surface_relation = relation
+            if relation_type == "nonpenetration":
+                surface_relation = {
+                    **relation,
+                    "contact_start_frame": end + 1,
+                    "contact_weight": 0.0,
+                    "axis_alignment_weight": 0.0,
+                    "axis_offset_weight": 0.0,
+                }
             surface_count = int(relation.get("surface_points", 6000))
             reference_surface = sample_proxy_surface(
                 reference_proxy,
@@ -400,7 +485,7 @@ def main() -> None:
                 relative_initial,
                 moving_surface,
                 reference_surface,
-                relation,
+                surface_relation,
             )
 
             def evaluate_selected(
@@ -410,7 +495,7 @@ def main() -> None:
                     values,
                     moving_surface,
                     reference_surface,
-                    relation,
+                    surface_relation,
                 )
 
             geometry_metadata = {
@@ -421,10 +506,64 @@ def main() -> None:
                 ),
                 "moving_surface_points": int(len(moving_surface.points)),
             }
+        else:
+            surface_count = int(
+                relation.get("collision_surface_points", 4000)
+            )
+            reference_surface = sample_proxy_surface(
+                reference_proxy,
+                surface_count,
+                relation_seed,
+            )
+            moving_surface = sample_proxy_surface(
+                moving_proxy,
+                surface_count,
+                relation_seed + 1,
+            )
+            proposed, optimization = refine_screw_trajectory(
+                relative_initial, relation_parameters
+            )
+
+            def evaluate_selected(
+                values: dict[int, np.ndarray],
+            ) -> dict[str, Any]:
+                return evaluate_screw_trajectory(
+                    values,
+                    relation_parameters,
+                    moving_surface=moving_surface,
+                    reference_surface=reference_surface,
+                )
+
+            geometry_metadata = {
+                "reference_proxy": reference_proxy_info,
+                "moving_proxy": moving_proxy_info,
+                "reference_axis_part": relation.get(
+                    "reference_axis_part", "z"
+                ),
+                "moving_axis_part": relation.get("moving_axis_part", "z"),
+                "pitch_m_per_turn": float(relation["pitch_m_per_turn"]),
+                "configured_turns": float(relation.get("turns", 1.0)),
+                "contact_frame": int(relation["contact_frame"]),
+                "seat_frame": int(relation.get("seat_frame", end)),
+                "terminal_anchor_frame": int(
+                    relation.get("terminal_anchor_frame", end)
+                ),
+                "effective_turns": float(optimization["effective_turns"]),
+                "reference_axis_origin_part_m": relation_parameters.get(
+                    "reference_axis_origin_part_m"
+                ),
+                "moving_axis_origin_part_m": relation_parameters.get(
+                    "moving_axis_origin_part_m"
+                ),
+                "reference_surface_points": int(
+                    len(reference_surface.points)
+                ),
+                "moving_surface_points": int(len(moving_surface.points)),
+            }
         gate = dict(settings.get("render_gate", {}))
         gate.update(relation.get("render_gate", {}))
-        raw_mesh = trimesh.load(
-            Path(cfg["mesh_dir"]) / f"{moving_part}.glb", force="mesh"
+        raw_mesh = load_flat_mesh(
+            Path(cfg["mesh_dir"]) / f"{moving_part}.glb"
         )
         canonical_points = sample_canonical(
             raw_mesh,
@@ -596,12 +735,33 @@ def main() -> None:
             relation.get("maximum_allowed_penetration_m", 0.001)
         )
         relation_passed = validation_after["max_penetration_m"] <= limit
+        collision_required = True
         if relation_type == "pairwise_contact":
             relation_passed = bool(
                 relation_passed
                 and validation_after["max_contact_gap_violation_m"] <= 1e-9
                 and validation_after["max_axis_angle_violation_deg"] <= 1e-9
                 and validation_after["max_axis_offset_violation_m"] <= 1e-9
+            )
+        elif relation_type == "screw_insert":
+            collision_required = bool(
+                relation.get("collision_required", True)
+            )
+            relation_passed = bool(
+                (
+                    not collision_required
+                    or (
+                        validation_after.get("collision_evaluated", False)
+                        and validation_after["max_penetration_m"] <= limit
+                    )
+                )
+                and validation_after["max_axis_angle_deg"]
+                <= float(relation.get("axis_tolerance_deg", 1.0))
+                and validation_after["max_axis_offset_m"]
+                <= float(relation.get("maximum_axis_offset_m", 0.002))
+                and validation_after["max_helix_residual_m"]
+                <= float(relation.get("maximum_helix_residual_m", 0.001))
+                and validation_after["monotonic_axial_violations"] == 0
             )
         required = bool(relation.get("required", True))
         apply_on_failure = bool(relation.get("apply_on_failure", False))
@@ -633,6 +793,7 @@ def main() -> None:
                 "frame_reports": propagation_gate_reports,
             },
             "maximum_allowed_penetration_m": limit,
+            "collision_required": collision_required,
             "required": required,
             "applied": applied,
             "rollback_reason": (
@@ -642,14 +803,26 @@ def main() -> None:
             ),
             "passed": relation_passed,
         }
-        print(
-            f"{name} [{relation_type}]: penetration "
-            f"{1000.0 * optimization['before']['max_penetration_m']:.2f}mm -> "
-            f"{1000.0 * after['max_penetration_m']:.2f}mm; "
-            f"violating samples {optimization['before']['violating_samples']} -> "
-            f"{after['violating_samples']}",
-            flush=True,
-        )
+        if relation_type == "screw_insert":
+            print(
+                f"{name} [screw_insert]: axis "
+                f"{optimization['before']['max_axis_angle_deg']:.2f}deg -> "
+                f"{after['max_axis_angle_deg']:.2f}deg; offset "
+                f"{1000.0 * optimization['before']['max_axis_offset_m']:.2f}mm -> "
+                f"{1000.0 * after['max_axis_offset_m']:.2f}mm; helix residual "
+                f"{1000.0 * after['max_helix_residual_m']:.3f}mm; penetration "
+                f"{1000.0 * after['max_penetration_m']:.3f}mm",
+                flush=True,
+            )
+        else:
+            print(
+                f"{name} [{relation_type}]: penetration "
+                f"{1000.0 * optimization['before']['max_penetration_m']:.2f}mm -> "
+                f"{1000.0 * after['max_penetration_m']:.2f}mm; "
+                f"violating samples {optimization['before']['violating_samples']} -> "
+                f"{after['violating_samples']}",
+                flush=True,
+            )
 
     refresh_trajectory_derived_fields(trajectory)
     validation, validation_failures = validate_trajectory(cfg, trajectory)

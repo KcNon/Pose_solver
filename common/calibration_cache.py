@@ -8,7 +8,9 @@ from typing import Any, Iterable
 from common.mask_io import frame_path
 from common.normalized_recon import recon_npz_path
 
-CALIBRATION_ALGORITHM_REVISION = "geometry-appearance-symmetry-fixed-scale-v5"
+CALIBRATION_ALGORITHM_REVISION = (
+    "reference-anchor-table-tangent-refine-v12"
+)
 
 
 def _update_file_content(digest: Any, path: Path, logical_name: str) -> None:
@@ -77,7 +79,7 @@ def fingerprint_files(
 
 def _geometry_frames(cfg: dict[str, Any], part: str) -> list[int]:
     state = cfg["states"][part]
-    if part == cfg["reference_part"]:
+    if "anchor_frames" not in state:
         return sorted({int(value) for value in state["calibration_frames"]})
     windows = state.get("anchor_windows", {})
     frames: set[int] = set()
@@ -159,6 +161,17 @@ def build_calibration_fingerprint(
         "parts": cfg["parts"],
         "part_ids": cfg["part_ids"],
         "reference_part": cfg["reference_part"],
+        "support_plane": cfg.get("support_plane"),
+        "automation_calibration": {
+            key: cfg.get("automation", {}).get(key)
+            for key in (
+                "allow_moving_reference",
+                "silhouette_scale_calibration",
+                "align_reference_to_table",
+                "align_parts_to_table",
+                "maximum_table_alignment_m",
+            )
+        },
         "recon_backend": cfg["recon_backend"],
         "states": {
             part: {

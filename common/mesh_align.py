@@ -81,6 +81,7 @@ def align_mesh_to_cloud(
     fine_iters: int = 60,
     seed: int = 0,
     fixed_scale: float | None = None,
+    return_candidates: bool = False,
 ) -> dict:
     """Return a raw-mesh-to-world similarity and fit diagnostics.
 
@@ -97,7 +98,9 @@ def align_mesh_to_cloud(
     if len(obs) > n_obs_max:
         obs = obs[rng.choice(len(obs), n_obs_max, replace=False)]
 
-    mesh_pts, _ = trimesh.sample.sample_surface(mesh, n_mesh_sample)
+    mesh_pts, _ = trimesh.sample.sample_surface(
+        mesh, n_mesh_sample, seed=rng
+    )
     mesh_pts = np.asarray(mesh_pts, dtype=np.float64)
     fit_mesh_pts = (
         mesh_pts
@@ -107,7 +110,7 @@ def align_mesh_to_cloud(
 
     # Target = sampled mesh points (trimesh icp uses cKDTree; avoids rtree dep).
     # Coarse: try each PCA-init, keep the lowest-cost obs->mesh fit.
-    best = None
+    coarse_results = []
     for T0 in _candidate_inits(
         obs,
         fit_mesh_pts,
@@ -117,14 +120,29 @@ def align_mesh_to_cloud(
             obs, fit_mesh_pts, initial=T0, max_iterations=coarse_iters,
             scale=fixed_scale is None, reflection=False,
         )
-        if best is None or cost < best[1]:
-            best = (matrix, cost)
+        coarse_results.append((matrix, float(cost)))
 
-    # Fine refinement from the best coarse result.
-    T_obs_to_mesh, _, cost = reg.icp(
-        obs, fit_mesh_pts, initial=best[0], max_iterations=fine_iters,
-        scale=fixed_scale is None, reflection=False,
+    # Fine-refine every PCA basin when requested.  Keeping only the cheapest
+    # geometric basin is unsafe for partial or near-symmetric objects: several
+    # orientations can have similar ICP cost but only one agrees with all
+    # calibrated images.
+    selected_coarse = (
+        coarse_results
+        if return_candidates
+        else [min(coarse_results, key=lambda item: item[1])]
     )
+    refined_results = []
+    for coarse_matrix, _coarse_cost in selected_coarse:
+        matrix, _, candidate_cost = reg.icp(
+            obs,
+            fit_mesh_pts,
+            initial=coarse_matrix,
+            max_iterations=fine_iters,
+            scale=fixed_scale is None,
+            reflection=False,
+        )
+        refined_results.append((matrix, float(candidate_cost)))
+    T_obs_to_mesh, cost = min(refined_results, key=lambda item: item[1])
     T_fit_mesh_to_world = np.linalg.inv(T_obs_to_mesh)
 
     # ``fit_mesh_pts`` are already scaled in fixed-scale mode.  Convert the
@@ -143,6 +161,31 @@ def align_mesh_to_cloud(
     mesh_world = mesh_pts @ M.T + t
     fit_rmse = nearest_neighbor_rmse(obs, mesh_world, np.eye(4))
 
+    candidate_fits = []
+    if return_candidates:
+        for candidate_index, (matrix, candidate_cost) in enumerate(
+            refined_results
+        ):
+            candidate_transform = np.linalg.inv(matrix)
+            if fixed_scale is not None:
+                candidate_transform[:3, :3] *= float(fixed_scale)
+            candidate_mesh_world = (
+                mesh_pts @ candidate_transform[:3, :3].T
+                + candidate_transform[:3, 3]
+            )
+            candidate_fits.append(
+                {
+                    "label": f"pca_basin_{candidate_index}",
+                    "T_mesh_to_world": candidate_transform,
+                    "fit_rmse": float(
+                        nearest_neighbor_rmse(
+                            obs, candidate_mesh_world, np.eye(4)
+                        )
+                    ),
+                    "icp_cost": candidate_cost,
+                }
+            )
+
     return {
         "T_mesh_to_world": T_mesh_to_world,
         "scale": scale,
@@ -152,4 +195,5 @@ def align_mesh_to_cloud(
         "icp_cost": float(cost),
         "n_obs": int(len(obs)),
         "n_mesh_sample": int(len(mesh_pts)),
+        "candidate_fits": candidate_fits,
     }

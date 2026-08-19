@@ -21,7 +21,18 @@ def validate_world_poses(
     failures = []
     for part in config["parts"]:
         validation = config["states"][part].get("validation", {})
-        frames = sorted(world_poses[part])
+        first_observable = int(
+            config.get("part_start_frames", {}).get(
+                part,
+                config.get("frames", {}).get(
+                    "start", min(world_poses[part], default=0)
+                ),
+            )
+        )
+        frames = sorted(
+            frame for frame in world_poses[part]
+            if frame >= first_observable
+        )
         translations = []
         rotations = []
         axes = []
@@ -75,6 +86,7 @@ def validate_world_poses(
             return {"frame": frame, unit: value}
 
         report[part] = {
+            "validated_from_frame": first_observable,
             "symmetry": symmetry.as_dict(),
             "limits": limits,
             "max_translation_step": maximum(translations, "value_m"),

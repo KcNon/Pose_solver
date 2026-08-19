@@ -26,6 +26,71 @@ class ViewCloud:
     candidate_pixels: int
 
 
+def filter_centroid_consistent_views(
+    clouds: list[ViewCloud],
+    *,
+    radius_m: float,
+    minimum_points: int = 30,
+) -> tuple[list[ViewCloud], dict]:
+    """Keep the largest group of view clouds with nearby robust centroids."""
+    active = [
+        index for index, cloud in enumerate(clouds)
+        if len(cloud.points) >= int(minimum_points)
+    ]
+    centers = {
+        index: np.median(clouds[index].points, axis=0)
+        for index in active
+    }
+    if len(active) <= 1:
+        selected = list(active)
+    else:
+        candidates = []
+        for index in active:
+            members = [
+                other for other in active
+                if np.linalg.norm(centers[other] - centers[index])
+                <= float(radius_m)
+            ]
+            distances = [
+                float(np.linalg.norm(centers[other] - centers[index]))
+                for other in members
+            ]
+            candidates.append((
+                len(members),
+                -float(np.mean(distances)) if distances else 0.0,
+                -index,
+                members,
+            ))
+        best = max(candidates, key=lambda item: (item[0], item[1], item[2]))
+        selected = list(best[3])
+    selected_set = set(selected)
+    filtered = []
+    for index, cloud in enumerate(clouds):
+        if index in selected_set:
+            filtered.append(cloud)
+            continue
+        filtered.append(ViewCloud(
+            points=np.empty((0, 3), dtype=np.float64),
+            colors=np.empty((0, 3), dtype=np.uint8),
+            confidence=np.empty((0,), dtype=np.float32),
+            support=np.empty((0,), dtype=np.int16),
+            candidate_pixels=cloud.candidate_pixels,
+        ))
+    return filtered, {
+        "enabled": True,
+        "radius_m": float(radius_m),
+        "minimum_points": int(minimum_points),
+        "active_view_indices": active,
+        "selected_view_indices": selected,
+        "rejected_view_indices": [
+            index for index in active if index not in selected_set
+        ],
+        "centroids_world": {
+            str(index): centers[index].tolist() for index in active
+        },
+    }
+
+
 def eroded_mask(mask: np.ndarray, iterations: int) -> np.ndarray:
     value = mask.astype(np.uint8)
     if iterations > 0:
@@ -70,6 +135,8 @@ def prepare_view_clouds(
     stride: int = 2,
 ) -> list[ViewCloud]:
     """Backproject independently filtered clouds for every view."""
+    if int(stride) < 1:
+        raise ValueError("point-cloud stride must be at least 1")
     result: list[ViewCloud] = []
     for view in range(depth.shape[0]):
         mask = eroded_mask(masks[view], mask_erode)
@@ -114,11 +181,14 @@ def fuse_supported_clouds(
     *,
     min_support: int = 1,
     retain_unsupported_fraction: float = 0.0,
+    voxel_size_m: float = 0.0,
     max_points: int = 80000,
     seed: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, dict]:
     """Fuse supported samples, optionally retaining top-confidence singletons."""
-    points, colors = [], []
+    if float(voxel_size_m) < 0:
+        raise ValueError("voxel_size_m cannot be negative")
+    points, colors, confidences, supports = [], [], [], []
     stats = {"views": [], "support_histogram": {}}
     rng = np.random.default_rng(seed)
     for cloud in clouds:
@@ -131,6 +201,8 @@ def fuse_supported_clouds(
                 keep[ranked] = True
         points.append(cloud.points[keep])
         colors.append(cloud.colors[keep])
+        confidences.append(cloud.confidence[keep])
+        supports.append(cloud.support[keep])
         stats["views"].append({
             "candidate_points": int(len(cloud.points)),
             "supported_points": int((cloud.support >= min_support).sum()),
@@ -142,11 +214,186 @@ def fuse_supported_clouds(
             stats["support_histogram"][key] = stats["support_histogram"].get(key, 0) + int(count)
     fused_points = np.concatenate(points) if points else np.empty((0, 3), np.float64)
     fused_colors = np.concatenate(colors) if colors else np.empty((0, 3), np.uint8)
+    fused_confidence = (
+        np.concatenate(confidences) if confidences else np.empty((0,), np.float32)
+    )
+    fused_support = (
+        np.concatenate(supports) if supports else np.empty((0,), np.int16)
+    )
+    stats["pre_voxel_points"] = int(len(fused_points))
+    if voxel_size_m > 0 and len(fused_points):
+        cells = np.floor(fused_points / float(voxel_size_m)).astype(np.int64)
+        _, inverse = np.unique(cells, axis=0, return_inverse=True)
+        count = int(inverse.max()) + 1
+        confidence_cap = float(
+            np.quantile(fused_confidence, 0.99)
+            if len(fused_confidence) >= 100
+            else np.max(fused_confidence)
+        )
+        weights = np.minimum(fused_confidence, confidence_cap).astype(np.float64)
+        weights = np.maximum(weights, 1e-6) * (1.0 + fused_support)
+        weight_sum = np.bincount(inverse, weights=weights, minlength=count)
+        averaged_points = np.column_stack([
+            np.bincount(
+                inverse,
+                weights=weights * fused_points[:, axis],
+                minlength=count,
+            ) / weight_sum
+            for axis in range(3)
+        ])
+        averaged_colors = np.column_stack([
+            np.bincount(
+                inverse,
+                weights=weights * fused_colors[:, channel],
+                minlength=count,
+            ) / weight_sum
+            for channel in range(3)
+        ])
+        fused_points = averaged_points
+        fused_colors = np.clip(np.rint(averaged_colors), 0, 255).astype(np.uint8)
     if len(fused_points) > max_points:
         index = rng.choice(len(fused_points), max_points, replace=False)
         fused_points, fused_colors = fused_points[index], fused_colors[index]
     stats["fused_points"] = int(len(fused_points))
+    stats["fusion_voxel_m"] = float(voxel_size_m)
     return fused_points, fused_colors, stats
+
+
+def supported_view_clouds(
+    clouds: list[ViewCloud],
+    *,
+    min_support: int = 1,
+) -> list[ViewCloud]:
+    """Return per-view clouds containing only cross-view-supported samples.
+
+    Quality metrics must be computed on the points that will actually reach
+    registration.  Measuring the unfiltered candidates lets a single bad
+    camera dominate the frame report even when the supported subset is sound;
+    conversely, retaining unsupported points can make a non-empty cloud look
+    usable when no camera agrees with any other camera.
+    """
+
+    result = []
+    for cloud in clouds:
+        keep = cloud.support >= int(min_support)
+        result.append(ViewCloud(
+            points=cloud.points[keep],
+            colors=cloud.colors[keep],
+            confidence=cloud.confidence[keep],
+            support=cloud.support[keep],
+            candidate_pixels=cloud.candidate_pixels,
+        ))
+    return result
+
+
+def quality_gate(
+    stats: dict,
+    cross_view: dict,
+    reprojection_depth: dict,
+    *,
+    minimum_fused_points: int = 300,
+    minimum_supported_views: int = 3,
+    minimum_supported_points_per_view: int = 30,
+    minimum_support_fraction: float = 0.02,
+    maximum_cross_view_median_m: float = 0.04,
+    minimum_cross_view_overlap_ratio: float = 0.10,
+    maximum_reprojection_median_m: float = 0.04,
+    minimum_reprojection_inlier_ratio: float = 0.10,
+    allow_single_view: bool = False,
+    allow_reprojection_override: bool = False,
+) -> dict:
+    """Fail-closed quality decision for a fused multi-view cloud."""
+
+    view_rows = list(stats.get("views", []))
+    candidates = int(sum(row.get("candidate_points", 0) for row in view_rows))
+    supported = int(sum(row.get("supported_points", 0) for row in view_rows))
+    supported_views = int(sum(
+        int(row.get("supported_points", 0))
+        >= int(minimum_supported_points_per_view)
+        for row in view_rows
+    ))
+    support_fraction = float(supported / max(candidates, 1))
+    single_view_fallback_used = bool(
+        allow_single_view and supported_views == 1
+    )
+    reprojection_median = reprojection_depth.get("median_m")
+    reprojection_inlier = reprojection_depth.get("inlier_ratio")
+    reprojection_override_used = bool(
+        allow_reprojection_override
+        and supported_views >= 2
+        and reprojection_median is not None
+        and reprojection_inlier is not None
+        and float(reprojection_median) <= float(maximum_reprojection_median_m)
+        and float(reprojection_inlier) >= float(minimum_reprojection_inlier_ratio)
+    )
+    reasons = []
+    if int(stats.get("fused_points", 0)) < int(minimum_fused_points):
+        reasons.append("too_few_fused_points")
+    if supported_views < int(minimum_supported_views):
+        reasons.append("too_few_supported_views")
+    if support_fraction < float(minimum_support_fraction):
+        reasons.append("support_fraction_below_minimum")
+
+    cross_median = cross_view.get("median_m")
+    cross_overlap = cross_view.get("overlap_ratio")
+    if cross_median is None:
+        if not single_view_fallback_used and not reprojection_override_used:
+            reasons.append("missing_cross_view_consistency")
+    elif (
+        not reprojection_override_used
+        and float(cross_median) > float(maximum_cross_view_median_m)
+    ):
+        reasons.append("cross_view_median_above_maximum")
+    if cross_overlap is None:
+        if not single_view_fallback_used and not reprojection_override_used:
+            reasons.append("missing_cross_view_overlap")
+    elif (
+        not reprojection_override_used
+        and float(cross_overlap) < float(minimum_cross_view_overlap_ratio)
+    ):
+        reasons.append("cross_view_overlap_below_minimum")
+
+    if reprojection_median is None:
+        if not single_view_fallback_used:
+            reasons.append("missing_reprojection_consistency")
+    elif float(reprojection_median) > float(maximum_reprojection_median_m):
+        reasons.append("reprojection_median_above_maximum")
+    if reprojection_inlier is None:
+        if not single_view_fallback_used:
+            reasons.append("missing_reprojection_inliers")
+    elif float(reprojection_inlier) < float(minimum_reprojection_inlier_ratio):
+        reasons.append("reprojection_inlier_ratio_below_minimum")
+
+    return {
+        "passed": not reasons,
+        "reasons": reasons,
+        "candidate_points": candidates,
+        "supported_points": supported,
+        "supported_views": supported_views,
+        "support_fraction": support_fraction,
+        "single_view_fallback_used": single_view_fallback_used,
+        "reprojection_override_used": reprojection_override_used,
+        "thresholds": {
+            "minimum_fused_points": int(minimum_fused_points),
+            "minimum_supported_views": int(minimum_supported_views),
+            "minimum_supported_points_per_view": int(
+                minimum_supported_points_per_view
+            ),
+            "minimum_support_fraction": float(minimum_support_fraction),
+            "maximum_cross_view_median_m": float(
+                maximum_cross_view_median_m
+            ),
+            "minimum_cross_view_overlap_ratio": float(
+                minimum_cross_view_overlap_ratio
+            ),
+            "maximum_reprojection_median_m": float(
+                maximum_reprojection_median_m
+            ),
+            "minimum_reprojection_inlier_ratio": float(
+                minimum_reprojection_inlier_ratio
+            ),
+        },
+    }
 
 
 def cross_view_consistency(clouds: list[ViewCloud], radius_m: float) -> dict:

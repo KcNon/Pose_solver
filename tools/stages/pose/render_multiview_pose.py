@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
 
 from common.io_utils import load_json, write_json
+from common.depth_gauge import apply_depth_gauge, load_depth_gauge
 from common.mesh_render import SceneRenderer
 from common.normalized_recon import load_recon
 from common.pose_visualization import camera_from_recon, part_color, solid_mesh
@@ -75,6 +76,44 @@ def iou(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.logical_and(a, b).sum() / union) if union else 1.0
 
 
+def record_visible_in_view(record: dict, view: str) -> bool:
+    """Return per-camera render visibility with legacy compatibility."""
+
+    if record.get("pose_valid") is False:
+        return False
+    visible_views = record.get("visible_views")
+    if visible_views is not None:
+        return str(view) in {str(value) for value in visible_views}
+    return int(record.get("observing_views", 0)) > 0
+
+
+def depth_visible_foreground(
+    mesh_depth: np.ndarray,
+    observed_depth: np.ndarray,
+    *,
+    margin_m: float,
+    dilation_pixels: int = 1,
+) -> np.ndarray:
+    """Remove rendered pixels hidden behind measured scene geometry."""
+
+    rendered = np.asarray(mesh_depth, dtype=np.float32) > 0.0
+    observed = np.asarray(observed_depth, dtype=np.float32)
+    occluded = (
+        rendered
+        & np.isfinite(observed)
+        & (observed > 1e-4)
+        & (observed + float(margin_m) < mesh_depth)
+    )
+    if dilation_pixels > 0 and occluded.any():
+        size = 2 * int(dilation_pixels) + 1
+        occluded = cv2.dilate(
+            occluded.astype(np.uint8),
+            np.ones((size, size), dtype=np.uint8),
+            iterations=1,
+        ).astype(bool)
+    return rendered & ~occluded
+
+
 def annotate_axes(image: np.ndarray, records: dict, K: np.ndarray, E: np.ndarray) -> None:
     for part, record in records.items():
         T = np.asarray(record["T_world_from_part"], float)
@@ -103,9 +142,7 @@ def annotate_status(image: np.ndarray, frame: int, records: dict) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--config", default=str(ROOT / "configs" / "pose_data_1_8view.json")
-    )
+    parser.add_argument("--config", required=True)
     parser.add_argument("--view", default=None)
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)
@@ -118,6 +155,8 @@ def main() -> None:
         nargs="+",
         help="render only these timestamps; useful for fast multi-stage QA",
     )
+    parser.add_argument("--start-frame", type=int, default=None)
+    parser.add_argument("--end-frame", type=int, default=None)
     parser.add_argument(
         "--include-source-prelude",
         action="store_true",
@@ -208,6 +247,10 @@ def main() -> None:
         raise RuntimeError("could not open output video writers")
 
     trajectory_items = list(trajectory["frames"].items())
+    if args.timestamps and (
+        args.start_frame is not None or args.end_frame is not None
+    ):
+        raise ValueError("--timestamps cannot be combined with frame bounds")
     if args.timestamps:
         if args.include_source_prelude:
             raise ValueError("--timestamps and --include-source-prelude are mutually exclusive")
@@ -217,6 +260,17 @@ def main() -> None:
             raise ValueError(f"timestamps not in trajectory: {unknown}")
         trajectory_items = [
             item for item in trajectory_items if item[0] in wanted
+        ]
+    elif args.start_frame is not None or args.end_frame is not None:
+        if args.include_source_prelude:
+            raise ValueError(
+                "frame bounds and --include-source-prelude are mutually exclusive"
+            )
+        trajectory_items = [
+            item
+            for item in trajectory_items
+            if (args.start_frame is None or int(item[0]) >= args.start_frame)
+            and (args.end_frame is None or int(item[0]) <= args.end_frame)
         ]
     elif args.include_source_prelude:
         first_trajectory_frame = min(int(key) for key in trajectory["frames"])
@@ -228,17 +282,44 @@ def main() -> None:
         trajectory_items = [
             (key, None) for key in source_keys
         ] + trajectory_items
-    sample_frames = (
-        {int(key) for key, _ in trajectory_items}
-        if args.timestamps
-        else {40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150,
-              160, 170, 180, 190, 200, 210, 220, 230, 240}
-    )
+    available_frames = [int(key) for key, _ in trajectory_items]
+    if args.timestamps:
+        sample_frames = set(available_frames)
+    else:
+        available_set = set(available_frames)
+        sample_frames = {
+            int(value)
+            for value in cfg.get("review_keyframes", [])
+            if int(value) in available_set
+        }
+        if sample_frames and available_frames:
+            sample_frames.update((available_frames[0], available_frames[-1]))
+        elif available_frames:
+            sample_indices = np.linspace(
+                0,
+                len(available_frames) - 1,
+                min(10, len(available_frames)),
+                dtype=int,
+            )
+            sample_frames = {
+                available_frames[int(index)] for index in sample_indices
+            }
     samples = []
     metrics = {"view": view, "frames": {}}
     mask_root = Path(cfg["masks_dir"])
+    render_settings = cfg.get("render", {})
+    use_depth_occlusion = bool(
+        render_settings.get("occlusion_aware", False)
+    )
+    depth_gauge = (
+        load_depth_gauge(str(cfg["depth_gauge_path"]))
+        if use_depth_occlusion and cfg.get("depth_gauge_path")
+        else None
+    )
     try:
-        with SceneRenderer(width, height) as renderer:
+        with SceneRenderer(
+            width, height, cache_mesh_resources=True
+        ) as renderer:
             for item_index, (key, frame_record) in enumerate(trajectory_items, start=1):
                 frame = int(key)
                 image_path = Path(cfg["frames_dir"]) / view / f"{key}.jpg"
@@ -281,14 +362,40 @@ def main() -> None:
                 }
                 visible_parts = [
                     part for part in cfg["parts"]
-                    if int(records[part].get("observing_views", 0)) > 0
+                    if record_visible_in_view(records[part], view)
                 ]
                 mesh_parts = [
                     (color_meshes[part], transforms[part]) for part in visible_parts
                 ]
                 mesh_rgb, mesh_depth = renderer.render(mesh_parts, K, E)
                 mesh_bgr = cv2.cvtColor(mesh_rgb, cv2.COLOR_RGB2BGR)
-                mesh_bgr[mesh_depth <= 0] = 0
+                foreground = mesh_depth > 0
+                if use_depth_occlusion:
+                    observed_depths = recon["depth"]
+                    if depth_gauge is not None:
+                        observed_depths = apply_depth_gauge(
+                            observed_depths, depth_gauge, key
+                        )
+                    observed_depth = cv2.resize(
+                        observed_depths[view_index].astype(np.float32),
+                        (width, height),
+                        interpolation=cv2.INTER_LINEAR,
+                    )
+                    foreground = depth_visible_foreground(
+                        mesh_depth,
+                        observed_depth,
+                        margin_m=float(
+                            render_settings.get(
+                                "occlusion_depth_margin_m", 0.02
+                            )
+                        ),
+                        dilation_pixels=int(
+                            render_settings.get(
+                                "occlusion_dilation_pixels", 1
+                            )
+                        ),
+                    )
+                mesh_bgr[~foreground] = 0
 
                 if args.mesh_operation_only:
                     annotate_status(mesh_bgr, frame, records)
@@ -313,7 +420,6 @@ def main() -> None:
                     )
                     continue
 
-                foreground = mesh_depth > 0
                 overlay = source.copy().astype(np.float32)
                 overlay[foreground] = (
                     0.42 * overlay[foreground]

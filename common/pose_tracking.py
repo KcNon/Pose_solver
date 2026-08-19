@@ -12,6 +12,7 @@ from scipy.spatial.transform import Rotation, Slerp
 from common.cloud_io import read_ply_xyz
 from common.gicp import multiscale_gicp, subsample, transform_angle, voxel_unique
 from common.normalized_recon import load_recon, recon_npz_path, scale_intrinsics
+from common.multiview_quality import mask_area_quality
 from common.pose_transforms import transform_points
 from common.symmetry import SymmetrySpec, resolve_symmetric_pose
 
@@ -77,6 +78,27 @@ def interpolate_transform(delta: np.ndarray, fraction: float) -> np.ndarray:
     return result
 
 
+def interpolate_rigid_pose(
+    first: np.ndarray, second: np.ndarray, fraction: float
+) -> np.ndarray:
+    """Interpolate SE(3) without rotating translation around the world origin."""
+
+    amount = float(fraction)
+    first = np.asarray(first, dtype=np.float64)
+    second = np.asarray(second, dtype=np.float64)
+    result = np.eye(4, dtype=np.float64)
+    result[:3, 3] = (
+        (1.0 - amount) * first[:3, 3] + amount * second[:3, 3]
+    )
+    rotations = Rotation.from_matrix(
+        np.stack([first[:3, :3], second[:3, :3]])
+    )
+    result[:3, :3] = Slerp([0.0, 1.0], rotations)(
+        [amount]
+    ).as_matrix()[0]
+    return result
+
+
 def smooth_pose_sequence(
     poses: dict[int, np.ndarray],
     start: int,
@@ -103,6 +125,83 @@ def smooth_pose_sequence(
             )
             current[:3, :3] = rotations.mean(weights=weights).as_matrix()
             poses[frame] = current
+
+
+def bridge_pose_ranges(
+    poses: dict[int, np.ndarray],
+    ranges: list[list[int]] | list[tuple[int, int]],
+) -> list[dict]:
+    """Interpolate only a short unreliable transition between two estimates.
+
+    This is intended for the seam where forward-from-initial and
+    backward-from-final anchor branches meet inside a known occlusion.  The
+    endpoints are independently estimated neighbouring frames, not the two
+    distant anchors, so observed motion outside the seam is preserved.
+    """
+
+    reports = []
+    for raw_start, raw_end in ranges:
+        start, end = int(raw_start), int(raw_end)
+        left, right = start - 1, end + 1
+        if start > end or left not in poses or right not in poses:
+            raise ValueError(
+                f"pose bridge {start}..{end} requires endpoints "
+                f"{left} and {right}"
+            )
+        for frame in range(start, end + 1):
+            fraction = (frame - left) / (right - left)
+            poses[frame] = interpolate_rigid_pose(
+                poses[left], poses[right], fraction
+            )
+        reports.append({
+            "range": [start, end],
+            "endpoint_frames": [left, right],
+            "method": "local_se3_bridge_between_independent_branches",
+        })
+    return reports
+
+
+def select_temporal_anchor(
+    frame: int,
+    anchor_frames: list[int],
+    *,
+    static_ranges: list[list[int]] | list[tuple[int, int]] = (),
+    dynamic_ranges: list[list[int]] | list[tuple[int, int]] = (),
+) -> int:
+    """Select an anchor without switching inside a known static interval.
+
+    Nearest-frame selection can switch to a post-motion anchor before the
+    detected motion starts whenever anchors are unevenly spaced.  Static
+    intervals instead prefer an anchor from their own interval; a dynamic
+    interval switches between its bracketing anchors near the motion midpoint.
+    """
+
+    anchors = sorted(int(value) for value in anchor_frames)
+    if not anchors:
+        raise ValueError("temporal anchor selection requires an anchor")
+    frame = int(frame)
+    for raw_start, raw_end in static_ranges:
+        start, end = int(raw_start), int(raw_end)
+        if not start <= frame <= end:
+            continue
+        local = [value for value in anchors if start <= value <= end]
+        if local:
+            return min(local, key=lambda value: abs(value - frame))
+        break
+    for raw_start, raw_end in dynamic_ranges:
+        start, end = int(raw_start), int(raw_end)
+        if not start <= frame <= end:
+            continue
+        before = [value for value in anchors if value <= start]
+        after = [value for value in anchors if value >= end]
+        if before and after:
+            return max(before) if frame <= (start + end) / 2.0 else min(after)
+        if before:
+            return max(before)
+        if after:
+            return min(after)
+        break
+    return min(anchors, key=lambda value: abs(value - frame))
 
 
 def _best_pair_registration(
@@ -171,9 +270,14 @@ def track_cloud_registration(
             seed=1000 + frame,
         )
         rejected = (
-            quality["translation_m"] > 0.12 * gap
-            or quality["rotation_deg"] > 30.0 * gap
-            or quality["fitness_8mm"] < 0.15
+            quality["translation_m"]
+            > float(registration_config.get("max_pair_translation_m", 0.12))
+            * gap
+            or quality["rotation_deg"]
+            > float(registration_config.get("max_pair_rotation_deg", 30.0))
+            * gap
+            or quality["fitness_8mm"]
+            < float(registration_config.get("minimum_pair_fitness", 0.15))
         )
         if rejected:
             pair = (
@@ -252,6 +356,519 @@ def track_cloud_registration(
     return poses, registrations
 
 
+def track_cloud_registration_reverse(
+    part: str,
+    start: int,
+    end: int,
+    end_pose: np.ndarray,
+    cloud_root: Path,
+    registration_config: dict,
+    symmetry: SymmetrySpec | None,
+) -> tuple[dict[int, np.ndarray], dict]:
+    """Track backward from a reliable end anchor.
+
+    A part's first visible frame is often only a sliver and is a poor absolute
+    mesh-registration anchor.  Pairwise cloud registration still carries
+    useful motion, so this mirrors :func:`track_cloud_registration` while
+    fixing the reliable pose at the end of the segment.
+    """
+
+    clouds = {
+        frame: load_part_cloud(cloud_root, frame, part)
+        for frame in range(start, end + 1)
+    }
+    observed = [frame for frame, cloud in clouds.items() if cloud is not None]
+    if not observed or observed[0] != start or observed[-1] != end:
+        bounds = "none" if not observed else f"{observed[0]}..{observed[-1]}"
+        raise RuntimeError(
+            f"{part}: dynamic endpoints must have clouds, got {bounds}"
+        )
+    poses: dict[int, np.ndarray] = {end: end_pose.copy()}
+    registrations = {}
+    previous_pair = None
+    previous_frame = end
+    for frame in reversed(observed[:-1]):
+        gap = previous_frame - frame
+        pair, quality = _best_pair_registration(
+            clouds[frame],
+            clouds[previous_frame],
+            previous_pair,
+            registration_config,
+            seed=2000 + frame,
+        )
+        rejected = (
+            quality["translation_m"]
+            > float(registration_config.get("max_pair_translation_m", 0.12))
+            * gap
+            or quality["rotation_deg"]
+            > float(registration_config.get("max_pair_rotation_deg", 30.0))
+            * gap
+            or quality["fitness_8mm"]
+            < float(registration_config.get("minimum_pair_fitness", 0.15))
+        )
+        if rejected:
+            pair = (
+                np.linalg.matrix_power(previous_pair, gap)
+                if previous_pair is not None
+                else np.eye(4)
+            )
+            quality["rejected"] = True
+            quality["fallback"] = (
+                "constant_velocity" if previous_pair is not None else "identity"
+            )
+        else:
+            quality["rejected"] = False
+            previous_pair = pair
+        current = np.linalg.inv(pair) @ poses[previous_frame]
+        if symmetry is not None and registration_config.get(
+            "symmetry_lock", True
+        ):
+            current = resolve_symmetric_pose(
+                current,
+                poses[previous_frame],
+                symmetry,
+                include_observation_ambiguities=False,
+            ).pose
+        poses[frame] = current
+        registrations[f"{frame:06d}_to_{previous_frame:06d}"] = {
+            "source": frame,
+            "target": previous_frame,
+            "T_target_from_source": pair.tolist(),
+            "quality": quality,
+            "tracking_direction": "reverse_from_end_anchor",
+        }
+        print(
+            f"{part} {frame:03d}->{previous_frame:03d} reverse "
+            f"fitness={quality['fitness_8mm']:.3f} "
+            f"t={quality['translation_m']:.3f}m "
+            f"r={quality['rotation_deg']:.1f}deg "
+            f"rejected={quality['rejected']}",
+            flush=True,
+        )
+        previous_frame = frame
+    for left, right in zip(observed[:-1], observed[1:]):
+        if right == left + 1:
+            continue
+        slerp = Slerp(
+            [0.0, 1.0],
+            Rotation.from_matrix(
+                np.stack([poses[left][:3, :3], poses[right][:3, :3]])
+            ),
+        )
+        for frame in range(left + 1, right):
+            fraction = (frame - left) / (right - left)
+            pose = np.eye(4)
+            pose[:3, :3] = slerp([fraction]).as_matrix()[0]
+            pose[:3, 3] = (
+                (1.0 - fraction) * poses[left][:3, 3]
+                + fraction * poses[right][:3, 3]
+            )
+            poses[frame] = pose
+    smooth_pose_sequence(poses, start, end, passes=2)
+    poses[end] = end_pose.copy()
+    return poses, registrations
+
+
+def track_anchor_relative_registration(
+    part: str,
+    mesh: trimesh.Trimesh,
+    scale: float,
+    origin_raw: np.ndarray,
+    start: int,
+    end: int,
+    anchor_poses: dict[int, np.ndarray],
+    cloud_root: Path,
+    registration_config: dict,
+    observable_frames: set[int] | None = None,
+) -> tuple[dict[int, np.ndarray], dict]:
+    """Fit every observed frame directly from a stable absolute anchor.
+
+    Unlike pairwise cloud tracking, no fitted transform is used to initialize
+    the next frame.  Each frame starts from the nearest configured anchor's
+    orientation and the current cloud centroid, so registration errors cannot
+    accumulate along the sequence.
+    """
+
+    if not anchor_poses:
+        raise ValueError(f"{part}: anchor-relative tracking needs an anchor")
+    rng = np.random.default_rng(4103 + start)
+    raw, _ = trimesh.sample.sample_surface(
+        mesh,
+        int(registration_config.get("anchor_model_points", 20000)),
+        seed=rng,
+    )
+    canonical = float(scale) * (
+        np.asarray(raw, dtype=np.float64)
+        - np.asarray(origin_raw, dtype=np.float64)
+    )
+    canonical = subsample(
+        canonical,
+        int(registration_config.get("max_points", 16000)),
+        5103 + start,
+    )
+    canonical_center = np.median(canonical, axis=0)
+    anchor_frames = sorted(anchor_poses)
+    static_ranges = registration_config.get("state_static_ranges", [])
+    dynamic_ranges = registration_config.get("state_dynamic_ranges", [])
+    owner_by_frame = {
+        frame: select_temporal_anchor(
+            frame,
+            anchor_frames,
+            static_ranges=static_ranges,
+            dynamic_ranges=dynamic_ranges,
+        )
+        for frame in range(start, end + 1)
+    }
+    tracking_frames = (
+        set(range(start, end + 1))
+        if observable_frames is None
+        else {
+            int(frame)
+            for frame in observable_frames
+            if start <= int(frame) <= end
+        }
+    )
+    # Calibrated anchors remain authoritative even if a later visibility
+    # configuration becomes stricter than the calibration gate.
+    tracking_frames.update(anchor_frames)
+    tracklet_by_frame: dict[int, int] = {}
+    tracklet_ranges: list[list[int]] = []
+    for frame in sorted(tracking_frames):
+        if not tracklet_ranges or frame != tracklet_ranges[-1][1] + 1:
+            tracklet_ranges.append([frame, frame])
+        else:
+            tracklet_ranges[-1][1] = frame
+        tracklet_by_frame[frame] = len(tracklet_ranges) - 1
+    max_rotation_step = float(
+        registration_config.get("maximum_absolute_rotation_step_deg", 35.0)
+    )
+    max_translation_step = float(
+        registration_config.get("maximum_absolute_translation_step_m", 0.08)
+    )
+    rotation_gap_scale_cap = float(
+        registration_config.get(
+            "maximum_absolute_rotation_gap_scale", 2.0
+        )
+    )
+    poses: dict[int, np.ndarray] = {}
+    cloud_centroids: dict[int, np.ndarray] = {}
+    reports: dict[str, dict] = {
+        "tracking_summary": {
+            "method": (
+                "bidirectional_anchor_relative_registration"
+                if len(anchor_frames) >= 2
+                else "single_anchor_relative_registration"
+            ),
+            "anchor_frames": [int(value) for value in anchor_frames],
+            "no_pairwise_pose_accumulation": True,
+            "visibility_tracklets": tracklet_ranges,
+            "reacquisition": "independent_absolute_pose_at_tracklet_entry",
+        }
+    }
+    accepted_frames: list[int] = []
+    for frame in range(start, end + 1):
+        if frame in anchor_poses:
+            poses[frame] = anchor_poses[frame].copy()
+            accepted_frames.append(frame)
+            reports[f"{frame:06d}"] = {
+                "status": "anchor",
+                "anchor_frame": frame,
+                "initialization": "stable_absolute_anchor",
+                "tracklet_id": int(tracklet_by_frame[frame]),
+            }
+            continue
+        if frame not in tracking_frames:
+            reports[f"{frame:06d}"] = {
+                "status": "visibility_rejected",
+                "pose_valid": False,
+            }
+            continue
+        cloud = load_part_cloud(cloud_root, frame, part)
+        if cloud is None:
+            reports[f"{frame:06d}"] = {
+                "status": "missing_quality_cloud",
+            }
+            continue
+        anchor_frame = owner_by_frame[frame]
+        initial_pose = anchor_poses[anchor_frame].copy()
+        rotation = initial_pose[:3, :3]
+        cloud_centroid = np.median(cloud, axis=0)
+        cloud_centroids[frame] = cloud_centroid
+        initial_pose[:3, 3] = cloud_centroid - canonical_center @ rotation.T
+        cloud_sample = subsample(
+            cloud,
+            int(registration_config.get("max_points", 16000)),
+            6103 + frame,
+        )
+        initializations = [("absolute_anchor", initial_pose)]
+        # Once an anchor has been reached, add a local orientation proposal
+        # from the preceding fitted frame.  Both proposals still register the
+        # canonical mesh directly to the current cloud; the previous pose is
+        # only an optimizer seed, never a composed pairwise transform.  This
+        # lets genuine rotation advance gradually while preventing GICP from
+        # repeatedly re-entering a distant 90/180-degree symmetric basin.
+        previous_frames = [
+            previous
+            for previous in poses
+            if previous < frame
+            and owner_by_frame.get(previous) == anchor_frame
+            and previous >= anchor_frame
+            and tracklet_by_frame.get(previous) == tracklet_by_frame.get(frame)
+        ]
+        continuity_frame = max(previous_frames) if previous_frames else anchor_frame
+        continuity_pose = poses.get(continuity_frame, anchor_poses[anchor_frame])
+        if previous_frames:
+            local_pose = continuity_pose.copy()
+            local_rotation = local_pose[:3, :3]
+            local_pose[:3, 3] = (
+                cloud_centroid - canonical_center @ local_rotation.T
+            )
+            initializations.append(("previous_orientation", local_pose))
+
+        candidate_rows = []
+        for candidate_index, (initialization_name, candidate_initial) in enumerate(
+            initializations
+        ):
+            canonical_from_world, candidate_quality = multiscale_gicp(
+                cloud_sample,
+                canonical,
+                np.linalg.inv(candidate_initial),
+                registration_config,
+            )
+            candidate_pose = np.linalg.inv(canonical_from_world)
+            gap = max(1, frame - continuity_frame)
+            rotation_step = float(np.degrees(Rotation.from_matrix(
+                candidate_pose[:3, :3] @ continuity_pose[:3, :3].T
+            ).magnitude()))
+            translation_step = float(np.linalg.norm(
+                candidate_pose[:3, 3] - continuity_pose[:3, 3]
+            ))
+            quality_passed = bool(
+                candidate_quality["fitness_8mm"]
+                >= float(
+                    registration_config.get("minimum_absolute_fitness", 0.08)
+                )
+                and candidate_quality["median_nn_m"]
+                <= float(
+                    registration_config.get(
+                        "maximum_absolute_median_nn_m", 0.04
+                    )
+                )
+            )
+            continuity_passed = bool(
+                not previous_frames
+                or (
+                    rotation_step
+                    <= max_rotation_step
+                    * min(float(gap), rotation_gap_scale_cap)
+                    and translation_step <= max_translation_step * gap
+                )
+            )
+            candidate_rows.append({
+                "index": candidate_index,
+                "initialization": initialization_name,
+                "pose": candidate_pose,
+                "quality": candidate_quality,
+                "quality_passed": quality_passed,
+                "continuity_passed": continuity_passed,
+                "rotation_from_previous_deg": rotation_step,
+                "translation_from_previous_m": translation_step,
+            })
+        selected_candidate = min(
+            candidate_rows,
+            key=lambda row: (
+                not row["quality_passed"],
+                not row["continuity_passed"],
+                float(row["quality"]["median_nn_m"]),
+                -float(row["quality"]["fitness_8mm"]),
+            ),
+        )
+        pose = selected_candidate["pose"]
+        quality = selected_candidate["quality"]
+        accepted = bool(
+            selected_candidate["quality_passed"]
+        )
+        is_reentry = bool(
+            not previous_frames
+            and frame > start
+            and frame - 1 not in tracking_frames
+        )
+        if is_reentry:
+            accepted = bool(
+                accepted
+                and quality["fitness_8mm"]
+                >= float(
+                    registration_config.get(
+                        "reentry_minimum_absolute_fitness",
+                        registration_config.get(
+                            "minimum_absolute_fitness", 0.08
+                        ),
+                    )
+                )
+                and quality["median_nn_m"]
+                <= float(
+                    registration_config.get(
+                        "reentry_maximum_absolute_median_nn_m",
+                        registration_config.get(
+                            "maximum_absolute_median_nn_m", 0.04
+                        ),
+                    )
+                )
+            )
+        reports[f"{frame:06d}"] = {
+            "status": "accepted" if accepted else "rejected",
+            "anchor_frame": int(anchor_frame),
+            "tracking_direction": (
+                "forward_from_earlier_anchor"
+                if anchor_frame < frame
+                else "backward_from_later_anchor"
+            ),
+            "initialization": selected_candidate["initialization"],
+            "initialization_candidates": [
+                {
+                    key: value
+                    for key, value in row.items()
+                    if key != "pose"
+                }
+                for row in candidate_rows
+            ],
+            "continuity_reference_frame": int(continuity_frame),
+            "tracklet_id": int(tracklet_by_frame[frame]),
+            "tracklet_entry": is_reentry,
+            "continuity_enforced": bool(previous_frames),
+            "quality": quality,
+        }
+        if is_reentry:
+            reports[f"{frame:06d}"]["reacquisition"] = (
+                "current_cloud_absolute_pose"
+            )
+        if accepted:
+            poses[frame] = pose
+            accepted_frames.append(frame)
+
+    if not accepted_frames:
+        raise RuntimeError(f"{part}: no frame passed anchor-relative registration")
+    # Missing quality clouds should not turn a short occlusion into permission
+    # for an arbitrary 90/180-degree ICP basin switch.  Allow a small amount
+    # of gap scaling for genuine motion, but cap it independently from the
+    # number of missing frames.
+    def gate_from_anchor(anchor_frame: int, frames: list[int]) -> None:
+        previous_frame = anchor_frame
+        previous_pose = poses[anchor_frame]
+        previous_tracklet = tracklet_by_frame.get(anchor_frame)
+        for frame in frames:
+            if frame not in poses:
+                continue
+            current_tracklet = tracklet_by_frame.get(frame)
+            if current_tracklet != previous_tracklet:
+                row = reports[f"{frame:06d}"]
+                row["continuity_reset"] = "visibility_tracklet_reacquisition"
+                previous_frame = frame
+                previous_pose = poses[frame]
+                previous_tracklet = current_tracklet
+                continue
+            gap = max(1, abs(frame - previous_frame))
+            rotation_gap_scale = min(float(gap), rotation_gap_scale_cap)
+            pose = poses[frame]
+            rotation_step = float(np.degrees(Rotation.from_matrix(
+                pose[:3, :3] @ previous_pose[:3, :3].T
+            ).magnitude()))
+            translation_step = float(np.linalg.norm(
+                pose[:3, 3] - previous_pose[:3, 3]
+            ))
+            row = reports[f"{frame:06d}"]
+            row["continuity_from_frame"] = int(previous_frame)
+            row["absolute_rotation_step_deg"] = rotation_step
+            row["absolute_translation_step_m"] = translation_step
+            if translation_step > max_translation_step * gap:
+                del poses[frame]
+                row["status"] = "rejected_translation_discontinuity"
+                continue
+            if rotation_step > max_rotation_step * rotation_gap_scale:
+                pose[:3, :3] = previous_pose[:3, :3]
+                # The GICP translation was optimized jointly with the rejected
+                # rotation basin.  Keeping it after replacing only the rotation
+                # creates an internally inconsistent pose and visible position
+                # jumps even for a static object.  Reuse the anchor-rotation
+                # centroid initialization, which was computed from this frame's
+                # observed cloud, whenever orientation falls back.
+                cloud_centroid = cloud_centroids.get(frame)
+                if cloud_centroid is not None:
+                    pose[:3, 3] = (
+                        cloud_centroid
+                        - canonical_center @ previous_pose[:3, :3].T
+                    )
+                    row["translation_fallback"] = (
+                        "accepted_rotation_current_cloud_centroid"
+                    )
+                row["orientation_fallback"] = "previous_accepted_orientation"
+            previous_frame = frame
+            previous_pose = pose
+            previous_tracklet = current_tracklet
+
+    for anchor_frame in anchor_frames:
+        gate_from_anchor(
+            anchor_frame,
+            sorted(
+                (
+                    frame
+                    for frame, owner in owner_by_frame.items()
+                    if owner == anchor_frame and frame < anchor_frame
+                ),
+                reverse=True,
+            ),
+        )
+        gate_from_anchor(
+            anchor_frame,
+            sorted(
+                frame
+                for frame, owner in owner_by_frame.items()
+                if owner == anchor_frame and frame > anchor_frame
+            ),
+        )
+    observed = sorted(poses)
+    for frame in range(start, end + 1):
+        if frame in poses:
+            continue
+        left = max((value for value in observed if value < frame), default=None)
+        right = min((value for value in observed if value > frame), default=None)
+        if left is None:
+            poses[frame] = poses[right].copy()
+        elif right is None:
+            poses[frame] = poses[left].copy()
+        else:
+            fraction = (frame - left) / (right - left)
+            poses[frame] = interpolate_rigid_pose(
+                poses[left], poses[right], fraction
+            )
+        reports[f"{frame:06d}"]["fallback"] = "absolute_pose_interpolation"
+    bridge_reports = bridge_pose_ranges(
+        poses,
+        registration_config.get("anchor_transition_ranges", []),
+    )
+    for bridge in bridge_reports:
+        for frame in range(bridge["range"][0], bridge["range"][1] + 1):
+            reports[f"{frame:06d}"]["fallback"] = (
+                "bidirectional_local_transition_bridge"
+            )
+    reports["tracking_summary"]["transition_bridges"] = bridge_reports
+    smoothing_passes = int(
+        registration_config.get("anchor_smoothing_passes", 1)
+    )
+    for tracklet_start, tracklet_end in tracklet_ranges:
+        if tracklet_end - tracklet_start >= 2:
+            smooth_pose_sequence(
+                poses,
+                tracklet_start,
+                tracklet_end,
+                passes=smoothing_passes,
+            )
+    for frame, pose in anchor_poses.items():
+        if start <= frame <= end:
+            poses[frame] = pose.copy()
+    return poses, reports
+
+
 def track_model_translation(
     part: str,
     mesh: trimesh.Trimesh,
@@ -266,7 +883,7 @@ def track_model_translation(
 ) -> tuple[dict[int, np.ndarray], dict]:
     """Track a near-axisymmetric object using translation-only ICP."""
     rng = np.random.default_rng(seed)
-    raw, _ = trimesh.sample.sample_surface(mesh, 30000)
+    raw, _ = trimesh.sample.sample_surface(mesh, 30000, seed=rng)
     canonical = scale * (np.asarray(raw, float) - origin_raw)
     if len(canonical) > 18000:
         canonical = canonical[
@@ -354,18 +971,32 @@ def _load_mask_bboxes(
     frame: int,
     part_id: int,
     views: list[str],
+    *,
+    minimum_pixels: int = 1000,
+    maximum_area_ratio: float = 4.0,
 ) -> list[tuple[np.ndarray, tuple[int, int]] | None]:
     from PIL import Image
 
-    result = []
-    for view in views:
-        labels = np.asarray(
+    labels_by_view = {
+        view: np.asarray(
             Image.open(mask_root / f"{frame:06d}" / f"{view}.png")
         )
-        rows, columns = np.where(labels == part_id)
-        if len(columns) < 1000:
+        for view in views
+        if (mask_root / f"{frame:06d}" / f"{view}.png").exists()
+    }
+    quality = mask_area_quality(
+        labels_by_view,
+        part_id,
+        minimum_pixels=minimum_pixels,
+        maximum_area_ratio=maximum_area_ratio,
+    )
+    result = []
+    for view in views:
+        if not quality["views"].get(view, {}).get("valid", False):
             result.append(None)
             continue
+        labels = labels_by_view[view]
+        rows, columns = np.where(labels == part_id)
         bbox = np.asarray([
             columns.min(), rows.min(), columns.max(), rows.max()
         ], dtype=float)
@@ -380,7 +1011,7 @@ def track_mask_bbox_translation(
     origin_raw: np.ndarray,
     start: int,
     end: int,
-    start_pose: np.ndarray,
+    start_pose: np.ndarray | None,
     end_pose: np.ndarray,
     mask_root: Path,
     part_id: int,
@@ -397,10 +1028,12 @@ def track_mask_bbox_translation(
         ]
     canonical = scale * (envelope - origin_raw)
     final = end_pose.copy()
+    has_start_anchor = start_pose is not None
+    start_template = final.copy() if start_pose is None else start_pose.copy()
     rotation_slerp = Slerp(
         [0.0, 1.0],
         Rotation.from_matrix(
-            np.stack([start_pose[:3, :3], final[:3, :3]])
+            np.stack([start_template[:3, :3], final[:3, :3]])
         ),
     )
 
@@ -417,7 +1050,19 @@ def track_mask_bbox_translation(
 
     def observations(frame: int):
         if frame not in bbox_cache:
-            boxes = _load_mask_bboxes(mask_root, frame, part_id, views)
+            view_quality = config.get("view_quality", {})
+            boxes = _load_mask_bboxes(
+                mask_root,
+                frame,
+                part_id,
+                views,
+                minimum_pixels=int(
+                    view_quality.get("minimum_full_mask_pixels", 800)
+                ),
+                maximum_area_ratio=float(
+                    view_quality.get("maximum_mask_area_ratio", 4.0)
+                ),
+            )
             with np.load(
                 recon_npz_path(config, f"{frame:06d}", backend)
             ) as data:
@@ -476,12 +1121,20 @@ def track_mask_bbox_translation(
         int(value)
         for value in tracker_config.get("end_bias_frames", [end])
     ]
-    bias_start = anchor_bias(start_pose, start_bias_frames)
     bias_end = anchor_bias(final, end_bias_frames)
-    poses = {start: start_pose.copy()}
+    bias_start = (
+        anchor_bias(start_template, start_bias_frames)
+        if has_start_anchor
+        else bias_end.copy()
+    )
+    poses = {start: start_template.copy()} if has_start_anchor else {}
     records = {}
     velocity = np.zeros(3)
-    rotations = {start: start_pose[:3, :3].copy()}
+    rotations = (
+        {start: start_template[:3, :3].copy()}
+        if has_start_anchor
+        else {}
+    )
     velocity_cap = float(
         tracker_config.get("prediction_velocity_cap_m", 0.15)
     )
@@ -496,18 +1149,23 @@ def track_mask_bbox_translation(
     maximum_step = float(
         tracker_config.get("max_translation_step_m", 0.35)
     )
-    for frame in range(start + 1, end + 1):
+    first_frame = start + 1 if has_start_anchor else start
+    for frame in range(first_frame, end + 1):
         boxes, cameras = observations(frame)
         fraction = (frame - start) / max(end - start, 1)
         current_rotation = rotation_at(fraction)
         rotations[frame] = current_rotation
         bias = (1.0 - fraction) * bias_start + fraction * bias_end
-        previous = poses[frame - 1][:3, 3]
+        previous = (
+            poses[frame - 1][:3, 3]
+            if frame - 1 in poses
+            else final[:3, 3]
+        )
         predicted_motion = previous + np.clip(
             velocity, -velocity_cap, velocity_cap
         )
         linear_prior = (
-            (1.0 - fraction) * start_pose[:3, 3]
+            (1.0 - fraction) * start_template[:3, 3]
             + fraction * final[:3, 3]
         )
         edge_count = 0
@@ -570,7 +1228,7 @@ def track_mask_bbox_translation(
                 maximum_step / np.linalg.norm(step)
             )
         velocity = 0.65 * velocity + 0.35 * (center - previous)
-        pose = start_pose.copy()
+        pose = start_template.copy()
         pose[:3, :3] = current_rotation
         pose[:3, 3] = center
         poses[frame] = pose
@@ -588,12 +1246,14 @@ def track_mask_bbox_translation(
     smooth_pose_sequence(poses, start, end, passes=2)
     for frame, pose in poses.items():
         pose[:3, :3] = rotations[frame]
-    poses[start] = start_pose.copy()
+    if has_start_anchor:
+        poses[start] = start_template.copy()
     poses[end] = final.copy()
     records["calibration"] = {
         "start_bias_frames": start_bias_frames,
         "end_bias_frames": end_bias_frames,
         "start_edge_bias_px": bias_start.tolist(),
         "end_edge_bias_px": bias_end.tolist(),
+        "has_start_anchor": has_start_anchor,
     }
     return poses, records

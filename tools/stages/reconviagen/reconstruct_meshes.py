@@ -18,8 +18,10 @@ os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
 RECON_ROOT = Path("/data_ft_9_10/wentai/projects/ReconViaGen")
 TRELLIS2_ROOT = RECON_ROOT / "wheels" / "TRELLIS.2"
+VGGT_ROOT = RECON_ROOT / "wheels" / "vggt"
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(TRELLIS2_ROOT))
+sys.path.insert(0, str(VGGT_ROOT))
 sys.path.insert(0, str(RECON_ROOT))
 
 import o_voxel
@@ -106,7 +108,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--config",
-        default=str(PROJECT_ROOT / "configs" / "reconviagen_objects.json"),
+        required=True,
     )
     parser.add_argument("--input-root")
     parser.add_argument("--output-root")

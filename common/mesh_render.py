@@ -43,10 +43,42 @@ def _baked_mesh(mesh: trimesh.Trimesh, T_world: np.ndarray) -> trimesh.Trimesh:
 class SceneRenderer:
     """Reusable EGL offscreen renderer for a fixed image size."""
 
-    def __init__(self, width: int, height: int):
+    def __init__(
+        self,
+        width: int,
+        height: int,
+        *,
+        cache_mesh_resources: bool = False,
+    ):
         self.width = int(width)
         self.height = int(height)
         self._r = pyrender.OffscreenRenderer(self.width, self.height)
+        self._cache_mesh_resources = bool(cache_mesh_resources)
+        self._mesh_cache: dict[int, pyrender.Mesh] = {}
+
+    def _scene_mesh(
+        self,
+        scene: pyrender.Scene,
+        mesh: trimesh.Trimesh,
+        transform: np.ndarray,
+    ) -> None:
+        if not self._cache_mesh_resources:
+            scene.add(
+                pyrender.Mesh.from_trimesh(
+                    _baked_mesh(mesh, transform), smooth=False
+                )
+            )
+            return
+        # Candidate scoring repeatedly renders the same visual asset.  Upload
+        # its vertex/texture buffers once and apply the uniform similarity in
+        # the scene graph; recreating and uploading a textured mesh for every
+        # camera/candidate dominates runtime by orders of magnitude.
+        key = id(mesh)
+        resource = self._mesh_cache.get(key)
+        if resource is None:
+            resource = pyrender.Mesh.from_trimesh(mesh, smooth=False)
+            self._mesh_cache[key] = resource
+        scene.add(resource, pose=np.asarray(transform, dtype=np.float64))
 
     def close(self):
         self._r.delete()
@@ -76,7 +108,7 @@ class SceneRenderer:
         scene = pyrender.Scene(bg_color=[0.0, 0.0, 0.0, 0.0],
                                ambient_light=[0.45, 0.45, 0.45])
         for mesh, T in parts:
-            scene.add(pyrender.Mesh.from_trimesh(_baked_mesh(mesh, T), smooth=False))
+            self._scene_mesh(scene, mesh, T)
         cam_pose = self._camera_node(scene, K, E)
         scene.add(pyrender.DirectionalLight(color=[1.0, 1.0, 1.0], intensity=4.0),
                   pose=cam_pose)
@@ -96,7 +128,21 @@ class SceneRenderer:
         scene = pyrender.Scene(bg_color=[0.0, 0.0, 0.0, 0.0], ambient_light=[1, 1, 1])
         node_color = {}
         for i, (name, mesh, T) in enumerate(parts):
-            node = scene.add(pyrender.Mesh.from_trimesh(_baked_mesh(mesh, T), smooth=False))
+            if self._cache_mesh_resources:
+                key = id(mesh)
+                resource = self._mesh_cache.get(key)
+                if resource is None:
+                    resource = pyrender.Mesh.from_trimesh(mesh, smooth=False)
+                    self._mesh_cache[key] = resource
+                node = scene.add(
+                    resource, pose=np.asarray(T, dtype=np.float64)
+                )
+            else:
+                node = scene.add(
+                    pyrender.Mesh.from_trimesh(
+                        _baked_mesh(mesh, T), smooth=False
+                    )
+                )
             # distinct, well-separated colors
             node_color[node] = np.array([(i * 67 + 40) % 256,
                                          (i * 113 + 90) % 256,

@@ -3,10 +3,59 @@ import unittest
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from common.pose_refinement import cap_pose_delta, limit_pose_velocity
+from common.pose_refinement import (
+    cap_pose_delta,
+    interpolate_untrusted_pose_frames,
+    limit_pose_velocity,
+    smooth_pose_ranges,
+)
+from tools.stages.pose.stabilize_static_pose import interpolate_pose
+from tools.stages.pose.refine_pose_render_loss import exact_holdout_gate
 
 
 class PoseConstraintTests(unittest.TestCase):
+    def test_exact_triangle_stage_cannot_bypass_holdout_gate(self):
+        accepted, report = exact_holdout_gate(
+            {"loss": 0.30, "mean_iou": 0.70},
+            {"loss": 0.34, "mean_iou": 0.65},
+            {
+                "maximum_holdout_degradation": 0.015,
+                "minimum_holdout_iou": 0.20,
+            },
+        )
+        self.assertFalse(accepted)
+        self.assertIn("holdout_loss_degradation", report["failures"])
+
+    def test_exact_triangle_holdout_gate_accepts_improvement(self):
+        accepted, report = exact_holdout_gate(
+            {"loss": 0.40, "mean_iou": 0.55},
+            {"loss": 0.32, "mean_iou": 0.65},
+            {
+                "maximum_holdout_degradation": 0.015,
+                "minimum_holdout_iou": 0.20,
+            },
+        )
+        self.assertTrue(accepted)
+        self.assertLess(report["loss_degradation"], 0.0)
+
+    def test_pose_bridge_uses_geodesic_rotation(self):
+        start = np.eye(4)
+        end = np.eye(4)
+        end[:3, :3] = Rotation.from_euler(
+            "z", 90.0, degrees=True
+        ).as_matrix()
+        end[:3, 3] = [0.3, -0.15, 0.06]
+
+        middle = interpolate_pose(start, end, 0.5)
+
+        angle = np.degrees(
+            Rotation.from_matrix(middle[:3, :3]).magnitude()
+        )
+        self.assertAlmostEqual(angle, 45.0, places=7)
+        np.testing.assert_allclose(
+            middle[:3, 3], [0.15, -0.075, 0.03], atol=1e-10
+        )
+
     def test_assembly_delta_is_bounded(self):
         delta = np.eye(4)
         delta[:3, 3] = [0.03, 0.0, 0.0]
@@ -25,6 +74,51 @@ class PoseConstraintTests(unittest.TestCase):
         self.assertAlmostEqual(np.degrees(Rotation.from_matrix(
             limited[1][:3, :3]).magnitude()), 3.0, places=8)
         self.assertEqual(report["limited_frames"], [1])
+
+    def test_range_smoothing_reduces_spike_and_keeps_boundaries(self):
+        poses = {frame: np.eye(4) for frame in range(5)}
+        poses[2][:3, 3] = [0.12, 0.0, 0.0]
+        poses[2][:3, :3] = Rotation.from_euler(
+            "x", 60, degrees=True
+        ).as_matrix()
+        smoothed = smooth_pose_ranges(poses, [(1, 3)], passes=2)
+        np.testing.assert_allclose(smoothed[0], poses[0])
+        np.testing.assert_allclose(smoothed[4], poses[4])
+        self.assertLess(smoothed[2][0, 3], poses[2][0, 3])
+        self.assertLess(
+            np.degrees(Rotation.from_matrix(smoothed[2][:3, :3]).magnitude()),
+            60.0,
+        )
+
+    def test_range_smoothing_preserves_rejected_frame_anchor(self):
+        poses = {frame: np.eye(4) for frame in range(5)}
+        poses[2][:3, 3] = [0.12, 0.0, 0.0]
+        smoothed = smooth_pose_ranges(
+            poses, [(1, 3)], passes=3, fixed_frames={2}
+        )
+        np.testing.assert_allclose(smoothed[2], poses[2])
+
+    def test_untrusted_pose_is_interpolated_not_fixed(self):
+        poses = {frame: np.eye(4) for frame in range(5)}
+        poses[1][:3, 3] = [0.02, 0.0, 0.0]
+        poses[2][:3, 3] = [0.30, 0.0, 0.0]
+        poses[3][:3, 3] = [0.06, 0.0, 0.0]
+        poses[1][:3, :3] = Rotation.from_euler(
+            "z", 10.0, degrees=True
+        ).as_matrix()
+        poses[3][:3, :3] = Rotation.from_euler(
+            "z", 30.0, degrees=True
+        ).as_matrix()
+        filled, replaced = interpolate_untrusted_pose_frames(
+            poses, [(1, 3)], trusted_frames={1, 3}
+        )
+        self.assertEqual(replaced, [2])
+        self.assertAlmostEqual(filled[2][0, 3], 0.04, places=8)
+        self.assertAlmostEqual(
+            np.degrees(Rotation.from_matrix(filled[2][:3, :3]).magnitude()),
+            20.0,
+            places=7,
+        )
 
 
 if __name__ == "__main__":

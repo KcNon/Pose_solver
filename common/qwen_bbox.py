@@ -59,7 +59,10 @@ def build_batch_prompt(parts) -> str:
     allowed_labels = ", ".join(labels)
     example_label = labels[0]
     return (
-        "Detect each configured object part IF it is visible in this image.\n"
+        "Detect each configured physical object part IF it is visible in this image. "
+        "Each label names one physical component, not the complete assembled object. "
+        "Draw a tight box around only that component; when components touch or are "
+        "assembled, do not include neighboring components in its box.\n"
         + "\n".join(rows)
         + "\nOmit parts that are not visible. Do not detect hands, people, the "
           "table, backdrop, or containers that are not listed above. "

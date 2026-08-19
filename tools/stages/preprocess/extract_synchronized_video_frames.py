@@ -6,6 +6,8 @@ import argparse
 import json
 import subprocess
 from pathlib import Path
+from fractions import Fraction
+from typing import Sequence
 
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
@@ -26,6 +28,33 @@ def probe_duration(path: Path) -> float:
     return float(subprocess.check_output(command, text=True).strip())
 
 
+def parse_frame_rate(value: str) -> float:
+    """Parse ffprobe's rational frame-rate representation."""
+
+    rate = float(Fraction(str(value)))
+    if rate <= 0:
+        raise ValueError(f"invalid video frame rate: {value!r}")
+    return rate
+
+
+def probe_frame_rate(path: Path) -> float:
+    command = [
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=avg_frame_rate,r_frame_rate",
+        "-of", "json", str(path),
+    ]
+    data = json.loads(subprocess.check_output(command, text=True))
+    streams = data.get("streams", [])
+    if not streams:
+        raise RuntimeError(f"video has no probeable stream: {path}")
+    stream = streams[0]
+    for key in ("avg_frame_rate", "r_frame_rate"):
+        value = stream.get(key)
+        if value and value != "0/0":
+            return parse_frame_rate(value)
+    raise RuntimeError(f"video has no valid frame rate: {path}")
+
+
 def image_ids(directory: Path) -> list[str]:
     return sorted(
         path.stem
@@ -34,19 +63,15 @@ def image_ids(directory: Path) -> list[str]:
     )
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
     parser.add_argument("--force", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     config_path = Path(args.config).resolve()
     config = load_json(config_path)
     output_dir = Path(config["frames_dir"]).resolve()
-    fps = float(config["sample_fps"])
-    if fps <= 0:
-        raise ValueError("sample_fps must be positive")
-
     views = [str(view) for view in config["views"]]
     videos = {str(key): Path(value).resolve() for key, value in config["videos"].items()}
     offsets = {
@@ -68,10 +93,33 @@ def main() -> None:
         )
 
     durations = {}
+    source_fps = {}
     for view in views:
         if not videos[view].is_file():
             raise FileNotFoundError(videos[view])
         durations[view] = probe_duration(videos[view])
+        source_fps[view] = probe_frame_rate(videos[view])
+    requested_fps = config.get("sample_fps", "source")
+    if isinstance(requested_fps, str) and requested_fps.lower() in {
+        "source", "maximum", "max"
+    }:
+        # A synchronized grid cannot contain more real images than its slowest
+        # camera. Use the highest common native rate without frame duplication.
+        fps = min(source_fps.values())
+        fps_policy = "highest_common_native_rate"
+    else:
+        fps = float(requested_fps)
+        fps_policy = "configured_numeric_rate"
+        if fps <= 0:
+            raise ValueError("sample_fps must be positive")
+        common_native = min(source_fps.values())
+        if fps > common_native + 1e-6 and not config.get(
+            "allow_frame_duplication", False
+        ):
+            raise ValueError(
+                f"sample_fps={fps:g} exceeds the slowest source camera "
+                f"({common_native:g}); use sample_fps='source'"
+            )
     available = {view: durations[view] - starts[view] for view in views}
     duration = min(available.values())
     requested = config.get("duration_s")
@@ -127,8 +175,10 @@ def main() -> None:
         },
         "source_start_s": starts,
         "source_duration_s": durations,
+        "source_fps": source_fps,
         "common_duration_s": duration,
         "sample_fps": fps,
+        "sample_fps_policy": fps_policy,
         "frame_count": len(reference_ids),
         "first_timestamp": reference_ids[0],
         "last_timestamp": reference_ids[-1],

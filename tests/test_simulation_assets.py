@@ -10,23 +10,53 @@ from scipy.spatial.transform import Rotation
 
 from common.simulation_assets import (
     canonical_from_raw_matrix,
+    carve_observed_overlap_components,
     create_collision_proxy,
     robust_average_pose,
     rotation_align_vectors,
 )
+from common.simulation_autoconfig import final_state_run
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CONFIG = json.loads((ROOT / "configs/simulation_data_1.json").read_text())
-ASSET_ROOT = ROOT / CONFIG["output_dir"]
+ASSET_ROOT = ROOT / "experiments/data_1/simulation_assets_scale_calibrated"
+
+
+def _synthetic_trajectory() -> dict:
+    pose = np.eye(4)
+    pose[:3, 3] = [10.0, 20.0, 30.0]
+    canonical = np.diag([2.0, 2.0, 2.0, 1.0])
+    canonical[:3, 3] = [-2.0, -4.0, -6.0]
+    return {
+        "parts": ["sample"],
+        "scales": {"sample": 2.0},
+        "raw_mesh_origins": {"sample": [1.0, 2.0, 3.0]},
+        "frames": {
+            "000000": {
+                "parts": {
+                    "sample": {
+                        "T_world_from_part": pose.tolist(),
+                        "S_world_from_raw_mesh": (pose @ canonical).tolist(),
+                    }
+                }
+            }
+        },
+    }
 
 
 class SimulationAssetTests(unittest.TestCase):
+    def test_final_state_run_chooses_last_contiguous_visible_run(self) -> None:
+        rows = {
+            "000010": {"state": "assembled", "observing_views": 2},
+            "000011": {"state": "assembled", "observing_views": 0},
+            "000020": {"state": "assembled", "observing_views": 3},
+            "000021": {"state": "assembled", "observing_views": 2},
+        }
+        self.assertEqual(final_state_run(rows, {"assembled"}), (20, 21))
+
     @classmethod
     def setUpClass(cls) -> None:
-        cls.trajectory = json.loads(
-            (ROOT / CONFIG["trajectory"]).read_text()
-        )
+        cls.trajectory = _synthetic_trajectory()
         manifest_path = ASSET_ROOT / "manifest.json"
         cls.manifest = (
             json.loads(manifest_path.read_text()) if manifest_path.exists() else None
@@ -127,6 +157,76 @@ class SimulationAssetTests(unittest.TestCase):
             atol=1e-9,
         )
         self.assertEqual(info["uniform_scale"], 0.94)
+
+    def test_voxel_shell_is_watertight_compound_without_filling_cavity(self) -> None:
+        trimesh = __import__("trimesh")
+        outer = trimesh.creation.box(extents=[0.12, 0.12, 0.12])
+        # Remove the top and bottom faces so the input is intentionally
+        # non-watertight and has an observed passage through its center.
+        normals = outer.face_normals
+        shell = outer.submesh(
+            [np.flatnonzero(np.abs(normals[:, 2]) < 0.9)],
+            append=True,
+            repair=False,
+        )
+        proxy, info = create_collision_proxy(
+            shell,
+            {"type": "voxel_shell", "pitch_m": 0.02, "resolution": 12},
+        )
+        self.assertTrue(proxy.is_watertight)
+        self.assertGreater(info["convex_components"], 1)
+        self.assertLess(info["convex_components"], info["surface_voxels"])
+        centers = np.asarray(
+            [component.centroid for component in proxy.split(only_watertight=False)]
+        )
+        self.assertFalse(np.any(np.linalg.norm(centers, axis=1) < 0.01))
+
+    def test_filtered_surface_removes_small_reconstruction_fragments(self) -> None:
+        trimesh = __import__("trimesh")
+        main = trimesh.creation.icosphere(subdivisions=2, radius=1.0)
+        fragment = trimesh.creation.icosphere(subdivisions=1, radius=0.01)
+        fragment.apply_translation([3.0, 0.0, 0.0])
+        visual = trimesh.util.concatenate([main, fragment])
+        proxy, info = create_collision_proxy(
+            visual,
+            {"type": "filtered_surface", "minimum_component_faces": 100},
+        )
+        self.assertEqual(info["input_components"], 2)
+        self.assertEqual(info["kept_components"], 1)
+        self.assertEqual(proxy.body_count, 1)
+        self.assertLess(proxy.bounds[1, 0], 2.0)
+
+    def test_observed_overlap_carves_crossed_cell_not_boundary_contact(self) -> None:
+        trimesh = __import__("trimesh")
+        first = trimesh.creation.box(extents=[0.1, 0.1, 0.1])
+        second = trimesh.creation.box(
+            extents=[0.1, 0.1, 0.1],
+            transform=trimesh.transformations.translation_matrix([0.2, 0.0, 0.0]),
+        )
+        reference = np.asarray(
+            [
+                [0.0, 0.0, 0.0],
+                [0.01, 0.0, 0.0],
+                [-0.01, 0.0, 0.0],
+                [0.0, 0.01, 0.0],
+                [0.0, -0.01, 0.0],
+                [0.15, 0.0, 0.0],  # boundary contact on the second box
+            ]
+        )
+        kept, report = carve_observed_overlap_components(
+            [first, second],
+            reference,
+            np.eye(4),
+            penetration_tolerance_m=0.001,
+            minimum_reference_vertices=3,
+            maximum_removed_fraction=0.6,
+        )
+        self.assertTrue(report["applied"])
+        self.assertEqual(report["removed_components"], 1)
+        self.assertEqual(len(kept), 1)
+        np.testing.assert_allclose(
+            kept[0].centroid, [0.2, 0.0, 0.0], atol=1e-15
+        )
 
     def test_urdf_mesh_paths_exist(self) -> None:
         urdf_paths = sorted((ASSET_ROOT / "urdf").glob("*.urdf"))

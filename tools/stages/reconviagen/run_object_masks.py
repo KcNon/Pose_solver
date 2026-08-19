@@ -12,7 +12,6 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_CONFIG = ROOT / "configs" / "reconviagen_objects.json"
 
 
 def _runtime_config(config: dict[str, Any], part: str) -> dict[str, Any]:
@@ -48,7 +47,7 @@ def _run(command: list[str], gpu: int) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default=str(DEFAULT_CONFIG))
+    parser.add_argument("--config", required=True)
     parser.add_argument("--parts", nargs="+")
     parser.add_argument("--qwen-gpu", type=int, default=0)
     parser.add_argument("--sam-gpu", type=int, default=0)

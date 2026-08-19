@@ -25,8 +25,11 @@ from pxr import Gf, PhysxSchema, Sdf, Usd, UsdGeom, UsdLux, UsdPhysics, UsdShade
 
 from common.io_utils import write_json
 from common.physics_control import (
+    dynamic_collision_approximation,
+    rigid_body_controller_parameters,
     select_control_profile,
     settled_contact_settings,
+    transformed_bounds_minimum_z,
 )
 import common.isaac_runtime as runtime
 from common.isaac_runtime import (
@@ -45,23 +48,23 @@ from common.isaac_runtime import (
     set_kinematic,
     set_pose,
 )
-CONTROLLERS = {
-    "inner_pot": {
-        "inertia_scale": 0.0032,
-        "force_limit_n": 12.0,
-        "torque_limit_nm": 0.35,
-    },
-    "lid": {
-        "inertia_scale": 0.0038,
-        "force_limit_n": 16.0,
-        "torque_limit_nm": 0.45,
-    },
-}
 TARGET_COLORS = {
     "inner_pot": (0.05, 0.92, 0.96),
     "lid": (1.0, 0.12, 0.72),
 }
-UNOBSERVABLE_STATES = {"inferred_unobservable", "unobservable", "unknown"}
+DEFAULT_TARGET_COLORS = (
+    (0.05, 0.92, 0.96),
+    (1.0, 0.12, 0.72),
+    (1.0, 0.72, 0.10),
+    (0.42, 0.96, 0.28),
+    (0.58, 0.35, 1.0),
+)
+UNOBSERVABLE_STATES = {
+    "inferred_unobservable",
+    "unobservable",
+    "out_of_frame",
+    "unknown",
+}
 
 
 def _font(size: int) -> ImageFont.ImageFont:
@@ -380,6 +383,7 @@ def _create_target_ghost(
     asset_root: Path,
     part: str,
     collision_mesh: str,
+    color: tuple[float, float, float],
 ) -> dict[str, Any]:
     root = UsdGeom.Xform.Define(stage, f"/World/Targets/{part}")
     transform_op = root.AddTransformOp(UsdGeom.XformOp.PrecisionDouble)
@@ -390,12 +394,12 @@ def _create_target_ghost(
     mesh.CreateFaceVertexIndicesAttr(indices)
     mesh.CreateSubdivisionSchemeAttr().Set(UsdGeom.Tokens.none)
     mesh.CreateDoubleSidedAttr().Set(True)
-    _bind_target_material(stage, mesh.GetPrim(), part, TARGET_COLORS[part])
+    _bind_target_material(stage, mesh.GetPrim(), part, color)
     _set_visibility(root.GetPrim(), False)
     return {"root": root.GetPrim(), "transform_op": transform_op}
 
 
-def _create_environment(stage: Usd.Stage) -> list[str]:
+def _create_environment(stage: Usd.Stage, floor_top_z: float) -> list[str]:
     UsdGeom.Scope.Define(stage, "/World/PhysicsMaterials")
     UsdGeom.Scope.Define(stage, "/World/TargetMaterials")
     UsdGeom.Scope.Define(stage, "/World/Targets")
@@ -408,10 +412,46 @@ def _create_environment(stage: Usd.Stage) -> list[str]:
     )
     floor = UsdGeom.Cube.Define(stage, "/World/Floor")
     floor.CreateSizeAttr().Set(2.0)
-    floor.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, -0.10))
+    floor.AddTranslateOp().Set(
+        Gf.Vec3d(0.0, 0.0, float(floor_top_z) - 0.01)
+    )
     floor.AddScaleOp().Set(Gf.Vec3d(0.8, 0.8, 0.01))
     UsdPhysics.CollisionAPI.Apply(floor.GetPrim())
     return [str(floor.GetPath())]
+
+
+def _trajectory_floor_top(
+    manifest: dict[str, Any],
+    trajectory: dict[str, Any],
+    reference_part: str,
+    world_from_body: np.ndarray,
+) -> float:
+    simulation = manifest["simulation"]
+    clearance = float(simulation.get("floor_clearance_m", 0.03))
+    if clearance < 0.0:
+        raise ValueError("simulation.floor_clearance_m must be non-negative")
+    minimum_z = transformed_bounds_minimum_z(
+        manifest["parts"][reference_part]["canonical_bounds_m"],
+        world_from_body,
+    )
+    for frame_record in trajectory["frames"].values():
+        for part, record in frame_record["parts"].items():
+            if str(record.get("state", "unknown")) in UNOBSERVABLE_STATES:
+                continue
+            target = _world_from_part(
+                frame_record,
+                part,
+                reference_part,
+                world_from_body,
+            )
+            minimum_z = min(
+                minimum_z,
+                transformed_bounds_minimum_z(
+                    manifest["parts"][part]["canonical_bounds_m"],
+                    target,
+                ),
+            )
+    return float(minimum_z - clearance)
 
 
 def _compose(
@@ -420,6 +460,7 @@ def _compose(
     states: dict[str, str],
     snapshots: dict[str, dict[str, Any]],
     contacts: dict[str, dict[str, Any]],
+    dynamic_parts: list[str],
 ) -> Image.Image:
     canvas = Image.new("RGB", (1280, 720), (22, 22, 24))
     canvas.paste(views["perspective"], (0, 0))
@@ -433,10 +474,8 @@ def _compose(
         font=FONT_LARGE,
         fill=(255, 255, 255, 255),
     )
-    lines = [
-        "Textured = actual PhysX pose | cyan = inner target | magenta = lid target",
-    ]
-    for part in ("inner_pot", "lid"):
+    lines = ["Textured = actual PhysX pose | transparent colored = solver target"]
+    for part in dynamic_parts:
         if part not in snapshots:
             lines.append(f"{part}: {states.get(part, 'not started')} | inactive")
             continue
@@ -480,9 +519,6 @@ def render_complete_physics_video(
     parts = list(trajectory["parts"])
     reference_part = str(manifest["reference_part"])
     dynamic_parts = [part for part in parts if part != reference_part]
-    missing_controllers = [part for part in dynamic_parts if part not in CONTROLLERS]
-    if missing_controllers:
-        raise RuntimeError(f"Physics controller parameters are missing: {missing_controllers}")
     usd_paths = _load_usd_cache(runtime_root, parts)
     simulation = manifest["simulation"]
     world_from_body = np.eye(4, dtype=np.float64)
@@ -499,7 +535,13 @@ def render_complete_physics_video(
     UsdGeom.SetStageMetersPerUnit(stage, 1.0)
     UsdGeom.Xform.Define(stage, "/World")
     UsdGeom.Scope.Define(stage, "/World/PhysicsAssets")
-    floor_colliders = _create_environment(stage)
+    floor_top_z = _trajectory_floor_top(
+        manifest,
+        trajectory,
+        reference_part,
+        world_from_body,
+    )
+    floor_colliders = _create_environment(stage, floor_top_z)
 
     roots = {
         reference_part: add_reference(
@@ -534,7 +576,11 @@ def render_complete_physics_video(
     collider_paths = {
         reference_part: configure_collision(roots[reference_part], "none"),
         **{
-            part: configure_collision(roots[part], "convexDecomposition")
+            part: configure_collision(
+                roots[part],
+                dynamic_collision_approximation(simulation),
+                sdf_resolution=int(simulation.get("sdf_resolution", 192)),
+            )
             for part in dynamic_parts
         },
     }
@@ -569,12 +615,20 @@ def render_complete_physics_video(
         _set_collisions(stage, collider_paths[part], False)
         _set_visibility(roots[part], False)
 
+    target_colors = {
+        part: TARGET_COLORS.get(
+            part,
+            DEFAULT_TARGET_COLORS[index % len(DEFAULT_TARGET_COLORS)],
+        )
+        for index, part in enumerate(dynamic_parts)
+    }
     ghosts = {
         part: _create_target_ghost(
             stage,
             asset_root,
             part,
             str(manifest["parts"][part]["collision_mesh"]),
+            target_colors[part],
         )
         for part in dynamic_parts
     }
@@ -594,12 +648,14 @@ def render_complete_physics_video(
         )
         for part in dynamic_parts
     }
-    controller_parameters = {}
-    for part in dynamic_parts:
-        controller_parameters[part] = {
-            **CONTROLLERS[part],
-            "mass_kg": float(manifest["parts"][part]["mass_kg"]),
-        }
+    controller_overrides = simulation.get("controllers", {})
+    controller_parameters = {
+        part: rigid_body_controller_parameters(
+            manifest["parts"][part],
+            controller_overrides.get(part),
+        )
+        for part in dynamic_parts
+    }
     settled_settings = settled_contact_settings(simulation)
 
     trajectory_ids = sorted(int(frame_id) for frame_id in trajectory["frames"])
@@ -767,6 +823,7 @@ def render_complete_physics_video(
                     states,
                     snapshots,
                     contacts,
+                    dynamic_parts,
                 ).save(
                     frame_dir / f"{output_index:06d}.jpg",
                     quality=94,
@@ -797,6 +854,45 @@ def render_complete_physics_video(
         (sample["frame_id"] for sample in samples if sample["blocked"]),
         None,
     )
+    blocked_ids = [
+        int(sample["frame_id"]) for sample in samples if sample["blocked"]
+    ]
+    blocked_ranges: list[list[int]] = []
+    for frame_id in blocked_ids:
+        if not blocked_ranges or frame_id > blocked_ranges[-1][1] + 1:
+            blocked_ranges.append([frame_id, frame_id])
+        else:
+            blocked_ranges[-1][1] = frame_id
+    active_snapshots = [
+        snapshot
+        for sample in samples
+        for snapshot in sample["actual"].values()
+    ]
+    maximum_position_error = max(
+        (float(item["position_error_m"]) for item in active_snapshots),
+        default=0.0,
+    )
+    maximum_rotation_error = max(
+        (float(item["rotation_error_deg"]) for item in active_snapshots),
+        default=0.0,
+    )
+    contact_actor_paths = sorted(
+        {
+            str(path)
+            for sample in samples
+            for contact in sample["contacts"].values()
+            for path in contact.get("other_actor_paths", [])
+        }
+    )
+    physics_validation = {
+        "passed": not blocked_ids,
+        "blocked_frame_count": len(blocked_ids),
+        "blocked_frame_ranges": blocked_ranges,
+        "maximum_position_error_m": maximum_position_error,
+        "maximum_rotation_error_deg": maximum_rotation_error,
+        "contact_actor_paths": contact_actor_paths,
+        "blocked_error_threshold_m": float(args.blocked_error_m),
+    }
     report = {
         "schema_version": 1,
         "status": "complete",
@@ -820,11 +916,13 @@ def render_complete_physics_video(
         "controller_parameters": controller_parameters,
         "settled_contact_control": settled_settings,
         "contact_offsets": contact_offsets,
+        "floor_top_z": floor_top_z,
         "first_blocked_frame": first_blocked,
+        "physics_validation": physics_validation,
         "samples": samples,
         "interpretation": (
-            "Textured meshes are actual PhysX rigid-body poses. Cyan and "
-            "magenta meshes are pose-solver targets. Once a part becomes "
+            "Textured meshes are actual PhysX rigid-body poses. Transparent "
+            "colored meshes are pose-solver targets. Once a part becomes "
             "observable, its pose is controlled only by bounded forces and "
             "torques while collision remains enabled."
         ),

@@ -1,9 +1,8 @@
 #!/usr/bin/env python
-"""Orchestrate reusable Qwen -> SAM -> compose mask extraction.
+"""Internal Qwen -> SAM -> compose adapter used by :mod:`pose_solver`.
 
 Qwen and SAM keep separate Python environments.  This runner owns only task
-planning, resumability, optional depth-aware multi-view priors, and final mask
-composition.
+planning, resumability, seed validation, and final mask composition.
 """
 from __future__ import annotations
 
@@ -15,24 +14,18 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
-from typing import Any, Iterable
-
-import numpy as np
+from typing import Any, Iterable, Sequence
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from common.masking.compose import compose_track_tree
 from common.masking.io import (
-    frame_path,
     load_bbox_json,
-    load_binary_mask,
-    save_binary_mask,
     track_path,
     validate_synchronized_frames,
     write_json,
 )
-from common.masking.multiview import multiview_geometric_prior
 from common.masking.planning import (
     discovery_timestamps,
     needs_discovery,
@@ -101,16 +94,49 @@ def _seed_frames(
     selected_parts: Iterable[str] | None = None,
 ) -> list[str]:
     frames = []
-    for part in selected_parts or config.part_names:
+    requested_parts = list(selected_parts or config.part_names)
+    event_parts = (
+        list(config.part_names)
+        if config.raw.get("qwen_reanchor_on_part_events", False)
+        else requested_parts
+    )
+    seed_window = config.raw.get("qwen_seed_window", {})
+    window_length = int(seed_window.get("length", 0))
+    window_stride = max(1, int(seed_window.get("stride", 1)))
+    for part in event_parts:
         tracking = _tracking_config(config, part)
         mode = tracking.get("mode", "video")
         if mode == "image":
             explicit = tracking.get("frames", config.raw.get("qwen_timestamps"))
             frames.extend(_flatten_frames(explicit))
         else:
-            frames.extend(_flatten_frames(_seed_value(config, part)))
-        for segment in tracking.get("segments", []):
-            frames.extend(_flatten_frames(segment.get("seed_frame")))
+            seeds = _flatten_frames(_seed_value(config, part))
+            frames.extend(seeds)
+            if window_length > 0:
+                for seed in seeds:
+                    if not seed.isdigit():
+                        continue
+                    start = int(seed)
+                    frames.extend(
+                        f"{frame:06d}"
+                        for frame in range(
+                            start + window_stride,
+                            start + window_length + 1,
+                            window_stride,
+                        )
+                    )
+        if part in requested_parts:
+            for segment in tracking.get("segments", []):
+                frames.extend(_flatten_frames(segment.get("seed_frame")))
+    periodic_stride = int(config.raw.get("qwen_periodic_stride", 0))
+    if periodic_stride > 0 and requested_parts:
+        frame_ids = validate_synchronized_frames(config.frames_dir, config.views)
+        first = min(config.part_map[part].start_frame for part in requested_parts)
+        last = int(frame_ids[-1])
+        frames.extend(
+            f"{frame:06d}"
+            for frame in range(first, last + 1, periodic_stride)
+        )
     return sorted(set(frames), key=int)
 
 
@@ -168,6 +194,8 @@ def _run_qwen(
     parts: list[str],
     gpu: int,
     force: bool,
+    reference_guided: bool = False,
+    initialization: bool = False,
 ) -> None:
     if not seed_frames:
         raise ValueError("no Qwen seed frames were configured")
@@ -187,6 +215,21 @@ def _run_qwen(
     ]
     if force:
         command.append("--force")
+    if reference_guided:
+        command.append("--mesh-references")
+    if config.raw.get("qwen_separate_parts", False):
+        command.append("--separate-parts")
+    if initialization:
+        seed_window = config.raw.get("qwen_seed_window", {})
+        if config.raw.get("qwen_reanchor_on_part_events", False):
+            command.append("--reanchor-active-parts")
+        if int(seed_window.get("length", 0)) > 0:
+            command.extend([
+                "--start-window",
+                str(int(seed_window["length"])),
+            ])
+        elif config.raw.get("qwen_only_starting_parts", False):
+            command.append("--only-starting-parts")
     _run(command, gpu)
 
 
@@ -244,12 +287,40 @@ def _job_bbox_fingerprint(
             else _seed_value(config, job["part"])
         )
         seed_by_view = {}
+        mesh_dir = Path(
+            config.raw.get("mesh_dir", config.frames_dir.parent / "meshes")
+        )
+        require_mesh_assignment = bool(
+            config.raw.get(
+                "require_mesh_assignment",
+                (mesh_dir / f"{job['part']}.glb").exists(),
+            )
+        )
         for view in job["views"]:
             value = configured
             if isinstance(value, dict):
                 value = value.get(view, value.get("default"))
             values = _flatten_frames(value)
             seed_by_view[view] = values[:1]
+            # Video mode can use every trusted Qwen re-anchor in the job
+            # range. Include all corresponding evidence so changing an
+            # adaptive or periodic anchor invalidates the resumability marker.
+            seed_by_view[view].extend(
+                timestamp
+                for timestamp, records in bbox_data.get("frames", {}).items()
+                if job["range"][0] <= int(timestamp) <= job["range"][1]
+                if any(
+                    row.get("label") == job["part"]
+                    for row in records.get(view, {}).get("parts", [])
+                )
+                and (
+                    not require_mesh_assignment
+                    or records.get(view, {}).get("mesh_assignment", {}).get(
+                        "status"
+                    ) == "ok"
+                )
+            )
+            seed_by_view[view] = sorted(set(seed_by_view[view]), key=int)
     evidence = {
         view: {
             timestamp: selected_record(timestamp, view)
@@ -343,105 +414,34 @@ def _run_sam_jobs(
         write_json(marker_path, marker_payload)
 
 
-def _multiview_priors(
+def _run_multiview_seed_validation(
     config: MaskPipelineConfig,
-    timestamps: list[str],
-    selected_parts: Iterable[str],
-    selected_views: Iterable[str] | None = None,
-) -> dict:
-    import cv2
-
-    settings = config.raw.get("multiview_completion", {})
-    if not settings.get("enabled", False):
-        return {"enabled": False}
-    from common.normalized_recon import load_recon
-
-    prior_root = config.work_root / "multiview_priors"
-    minimum_pixels = int(settings.get("minimum_source_pixels", 100))
-    target_threshold = int(settings.get("target_failure_pixels", 100))
-    minimum_views = int(settings.get("minimum_source_views", 1))
-    depth_tolerance = float(settings.get("depth_tolerance", 0.03))
-    apply_mode = str(settings.get("apply_mode", "prior_only"))
-    if apply_mode not in {"prior_only", "replace_failed"}:
-        raise ValueError("multiview_completion.apply_mode must be prior_only or replace_failed")
-    reports: dict[str, Any] = {}
-    views = list(selected_views or config.views)
-    view_indices = [config.views.index(view) for view in views]
-    for timestamp in timestamps:
-        recon = load_recon(config.raw, timestamp)
-        depth = recon["depth"][view_indices]
-        intrinsics = recon["intrinsics"][view_indices]
-        extrinsics = recon["extrinsics"][view_indices]
-        height, width = recon["depth_hw"]
-        timestamp_report = {}
-        for part in selected_parts:
-            if int(timestamp) < config.part_map[part].start_frame:
-                continue
-            masks = []
-            reliable = []
-            full_shapes = []
-            for view in views:
-                source_path = track_path(config.tracks_root, part, timestamp, view)
-                if source_path.exists():
-                    mask = load_binary_mask(source_path)
-                else:
-                    image = cv2.imread(
-                        str(frame_path(config.frames_dir, view, timestamp)),
-                        cv2.IMREAD_GRAYSCALE,
-                    )
-                    if image is None:
-                        raise RuntimeError(f"failed to read frame {timestamp}/{view}")
-                    mask = np.zeros(image.shape, dtype=bool)
-                full_shapes.append(mask.shape)
-                small = cv2.resize(
-                    mask.astype(np.uint8),
-                    (width, height),
-                    interpolation=cv2.INTER_NEAREST,
-                ).astype(bool)
-                masks.append(small)
-                reliable.append(int(small.sum()) >= minimum_pixels)
-            part_report = {}
-            for target_index, view in enumerate(views):
-                if int(masks[target_index].sum()) >= target_threshold:
-                    continue
-                prior, report = multiview_geometric_prior(
-                    masks,
-                    reliable,
-                    depth,
-                    intrinsics,
-                    extrinsics,
-                    target_index,
-                    minimum_source_views=minimum_views,
-                    depth_tolerance=depth_tolerance,
-                    minimum_pixels=minimum_pixels,
-                )
-                full = cv2.resize(
-                    prior.astype(np.uint8),
-                    (full_shapes[target_index][1], full_shapes[target_index][0]),
-                    interpolation=cv2.INTER_NEAREST,
-                ).astype(bool)
-                destination = track_path(prior_root, part, timestamp, view)
-                save_binary_mask(destination, full)
-                report["full_resolution_pixels"] = int(full.sum())
-                part_report[view] = report
-                if apply_mode == "replace_failed" and int(full.sum()) >= target_threshold:
-                    save_binary_mask(
-                        track_path(config.tracks_root, part, timestamp, view),
-                        full,
-                    )
-            if part_report:
-                timestamp_report[part] = part_report
-        if timestamp_report:
-            reports[timestamp] = timestamp_report
-    summary = {
-        "enabled": True,
-        "apply_mode": apply_mode,
-        "prior_root": str(prior_root),
-        "frames_with_candidates": len(reports),
-        "reports": reports,
-    }
-    write_json(config.work_root / "multiview_completion.json", summary)
-    return summary
+    seed_frames: list[str],
+    *,
+    views: list[str],
+    parts: list[str],
+    gpu: int,
+) -> None:
+    if not config.raw.get("multiview_seed_validation", {}).get(
+        "enabled", False
+    ):
+        return
+    command = [
+        config.raw["sam_python"],
+        "-u",
+        "tools/stages/masking/validate_multiview_seeds.py",
+        "--config",
+        str(config.source_path),
+        "--timestamps",
+        *seed_frames,
+        "--views",
+        *views,
+        "--parts",
+        *parts,
+        "--gpu",
+        str(gpu),
+    ]
+    _run(command, gpu)
 
 
 def _anomalies_in(
@@ -522,6 +522,10 @@ def _automatic_repairs(
         parts=sorted({job["part"] for job in jobs}),
         gpu=qwen_gpu,
         force=force_qwen,
+        # Repair must preserve the same object-agnostic contract as initial
+        # discovery.  Mesh/reconstruction labels are optional and can be
+        # semantically wrong for a new object category.
+        reference_guided=bool(config.raw.get("qwen_reference_guided", True)),
     )
     bbox = load_bbox_json(config.bbox_path)
     runnable = []
@@ -552,7 +556,12 @@ def _automatic_repairs(
                     / f"{job['views'][0]}.png"
                 )
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(source, destination)
+                # Repair backups only need the mask bytes.  ``copy2`` also
+                # attempts to preserve timestamps, which is rejected by some
+                # read/write data mounts even though creating the backup is
+                # allowed.  Avoid making pipeline success depend on metadata
+                # operations that are irrelevant to rollback.
+                shutil.copyfile(source, destination)
                 backups[(job["part"], timestamp, job["views"][0])] = destination
 
     _run_sam_jobs(
@@ -576,7 +585,7 @@ def _automatic_repairs(
                 (job["part"], timestamp, job["views"][0])
             )
             if backup is not None:
-                shutil.copy2(
+                shutil.copyfile(
                     backup,
                     track_path(
                         config.tracks_root,
@@ -601,13 +610,13 @@ def _automatic_repairs(
     return _write_repair_report(config, report)
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     parser.add_argument(
         "--stage",
         choices=(
-            "all", "discover", "qwen", "sam", "geometry", "compose", "repair"
+            "all", "discover", "qwen", "sam", "compose", "repair"
         ),
         default="all",
     )
@@ -615,9 +624,19 @@ def main() -> None:
     parser.add_argument("--views", nargs="+")
     parser.add_argument("--qwen-gpu", type=int)
     parser.add_argument("--sam-gpu", type=int)
+    parser.add_argument(
+        "--range-start",
+        type=int,
+        help="only process synchronized frames at or after this frame index",
+    )
+    parser.add_argument(
+        "--range-end",
+        type=int,
+        help="only process synchronized frames at or before this frame index",
+    )
     parser.add_argument("--force-qwen", action="store_true")
     parser.add_argument("--force-sam", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     source_config = load_mask_pipeline_config(args.config)
     resolved_path = (
@@ -643,6 +662,24 @@ def main() -> None:
     if unknown_parts:
         raise ValueError(f"unknown parts: {sorted(unknown_parts)}")
     timestamps = validate_synchronized_frames(config.frames_dir, views)
+    if (
+        args.range_start is not None
+        and args.range_end is not None
+        and args.range_start > args.range_end
+    ):
+        raise ValueError("--range-start must not exceed --range-end")
+    if args.range_start is not None:
+        timestamps = [
+            timestamp for timestamp in timestamps
+            if int(timestamp) >= args.range_start
+        ]
+    if args.range_end is not None:
+        timestamps = [
+            timestamp for timestamp in timestamps
+            if int(timestamp) <= args.range_end
+        ]
+    if not timestamps:
+        raise ValueError("requested frame range contains no synchronized frames")
     qwen_gpu = args.qwen_gpu
     if qwen_gpu is None:
         qwen_gpu = int(config.raw.get("runtime", {}).get("qwen_gpu", 0))
@@ -654,24 +691,60 @@ def main() -> None:
         discovery = source_config.raw.get(
             "automation", {}
         ).get("discovery", {})
-        scan_frames = discovery_timestamps(
+        planned_scan_frames = discovery_timestamps(
             timestamps,
             stride=int(discovery.get("stride", 10)),
+            maximum_frame=(
+                int(discovery["maximum_frame"])
+                if discovery.get("maximum_frame") is not None
+                else None
+            ),
         )
-        _run_qwen(
-            source_config,
-            scan_frames,
-            views=views,
-            parts=selected_parts,
-            gpu=qwen_gpu,
-            force=args.force_qwen,
-        )
-        _coarse_raw, coarse_report = resolve_mask_config(
-            source_config,
-            load_bbox_json(source_config.bbox_path),
-            scan_frames,
-            output_path=resolved_path,
-        )
+        stop_when_resolved = bool(discovery.get("stop_when_resolved", False))
+        batch_size = int(discovery.get("batch_size", len(planned_scan_frames)))
+        if batch_size <= 0:
+            raise ValueError("discovery batch_size must be positive")
+        scan_frames: list[str] = []
+        coarse_report = None
+        for offset in range(0, len(planned_scan_frames), batch_size):
+            batch = planned_scan_frames[offset:offset + batch_size]
+            _run_qwen(
+                source_config,
+                batch,
+                views=views,
+                parts=selected_parts,
+                gpu=qwen_gpu,
+                force=args.force_qwen,
+                reference_guided=True,
+            )
+            scan_frames.extend(batch)
+            if not stop_when_resolved:
+                continue
+            try:
+                _coarse_raw, coarse_report = resolve_mask_config(
+                    source_config,
+                    load_bbox_json(source_config.bbox_path),
+                    scan_frames,
+                    output_path=resolved_path,
+                )
+            except RuntimeError:
+                if offset + batch_size >= len(planned_scan_frames):
+                    raise
+                continue
+            print(
+                "discovery stopped after all parts had consecutive "
+                "multi-view support and per-view seeds: "
+                f"{scan_frames[-1]}",
+                flush=True,
+            )
+            break
+        if coarse_report is None:
+            _coarse_raw, coarse_report = resolve_mask_config(
+                source_config,
+                load_bbox_json(source_config.bbox_path),
+                scan_frames,
+                output_path=resolved_path,
+            )
         refinement_frames: set[str] = set()
         for part in source_config.parts:
             if not part.start_frame_auto:
@@ -687,20 +760,56 @@ def main() -> None:
             )
         if refinement_frames:
             ordered_refinement = sorted(refinement_frames, key=int)
-            _run_qwen(
-                source_config,
-                ordered_refinement,
-                views=views,
-                parts=selected_parts,
-                gpu=qwen_gpu,
-                force=args.force_qwen,
+            refinement_batch_size = int(
+                discovery.get("refinement_batch_size", len(ordered_refinement))
             )
-            resolve_mask_config(
-                source_config,
-                load_bbox_json(source_config.bbox_path),
-                sorted(set(scan_frames) | refinement_frames, key=int),
-                output_path=resolved_path,
+            if refinement_batch_size <= 0:
+                raise ValueError("discovery refinement_batch_size must be positive")
+            stop_when_refined = bool(
+                discovery.get("stop_when_refined_resolved", False)
             )
+            processed_refinement: list[str] = []
+            for offset in range(0, len(ordered_refinement), refinement_batch_size):
+                batch = ordered_refinement[offset:offset + refinement_batch_size]
+                _run_qwen(
+                    source_config,
+                    batch,
+                    views=views,
+                    parts=selected_parts,
+                    gpu=qwen_gpu,
+                    force=args.force_qwen,
+                    reference_guided=True,
+                )
+                processed_refinement.extend(batch)
+                _refined_raw, refined_report = resolve_mask_config(
+                    source_config,
+                    load_bbox_json(source_config.bbox_path),
+                    sorted(set(scan_frames) | set(processed_refinement), key=int),
+                    output_path=resolved_path,
+                )
+                if not stop_when_refined:
+                    continue
+                consecutive = int(discovery.get("consecutive_scans", 2))
+                latest_resolvable_start = int(processed_refinement[-1]) - consecutive + 1
+                auto_parts = [
+                    part.name for part in source_config.parts
+                    if part.start_frame_auto and part.name in selected_parts
+                ]
+                all_refined = all(
+                    int(
+                        refined_report["parts"][part]["start_evidence"]
+                        ["selected_scan_frame"]
+                    ) <= latest_resolvable_start
+                    for part in auto_parts
+                )
+                if all_refined:
+                    print(
+                        "discovery refinement stopped after every automatic "
+                        "part had an earliest consecutive run: "
+                        f"{processed_refinement[-1]}",
+                        flush=True,
+                    )
+                    break
         config = load_mask_pipeline_config(resolved_path)
         print(f"resolved mask config -> {resolved_path}", flush=True)
     elif args.stage == "discover":
@@ -720,8 +829,19 @@ def main() -> None:
             parts=selected_parts,
             gpu=qwen_gpu,
             force=args.force_qwen,
+            reference_guided=bool(
+                config.raw.get("qwen_reference_guided", True)
+            ),
+            initialization=True,
         )
     if args.stage in {"all", "sam"}:
+        _run_multiview_seed_validation(
+            config,
+            _seed_frames(config, selected_parts),
+            views=views,
+            parts=selected_parts,
+            gpu=sam_gpu,
+        )
         _run_sam_jobs(
             config,
             _sam_jobs(config, timestamps, selected_parts, views),
@@ -729,8 +849,6 @@ def main() -> None:
             timestamps=timestamps,
             force=args.force_sam,
         )
-    if args.stage in {"all", "geometry"}:
-        _multiview_priors(config, timestamps, selected_parts, views)
     if args.stage in {"all", "compose", "repair"}:
         compose_views = (
             list(config.views)
@@ -767,7 +885,3 @@ def main() -> None:
             f"accepted={report['accepted']} rejected={report['rejected']}",
             flush=True,
         )
-
-
-if __name__ == "__main__":
-    main()

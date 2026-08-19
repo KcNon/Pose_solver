@@ -113,7 +113,9 @@ def main() -> None:
         print(
             f"Frames: {report['frame_count']} | "
             f"duration: {report['duration_s']:.2f}s | "
-            f"first blocked: {report['first_blocked_frame']}",
+            f"first blocked: {report['first_blocked_frame']} | "
+            "validation: "
+            f"{'PASS' if report['physics_validation']['passed'] else 'FAIL'}",
             flush=True,
         )
     finally:

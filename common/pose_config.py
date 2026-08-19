@@ -8,6 +8,7 @@ from common.symmetry import symmetry_spec_from_state
 
 TRACKING_METHODS = {
     "cloud_registration",
+    "anchor_relative_registration",
     "model_tracking",
     "mask_bbox_tracking",
     "trajectory_prior",
@@ -116,6 +117,27 @@ def validate_pose_config(
             "registration voxel_sizes_m and max_correspondence_m must have "
             "the same non-zero length"
         )
+    support_ranges = config.get("automation", {}).get(
+        "table_support_ranges", {}
+    )
+    unknown_support_parts = set(support_ranges).difference(parts)
+    if unknown_support_parts:
+        raise ValueError(
+            "table_support_ranges contains unknown parts: "
+            f"{sorted(unknown_support_parts)}"
+        )
+    for part, part_ranges in support_ranges.items():
+        for range_start, range_end in part_ranges:
+            range_start, range_end = int(range_start), int(range_end)
+            if (
+                range_start < start
+                or range_end > end
+                or range_start > range_end
+            ):
+                raise ValueError(
+                    f"{part}: table support range {range_start}..{range_end} "
+                    f"must lie in configured frames {start}..{end}"
+                )
     constraints = config.get("trajectory_constraints", {})
     if constraints.get("enabled", False):
         proxy_config = constraints.get(
@@ -139,7 +161,12 @@ def validate_pose_config(
         for relation in relations:
             name = str(relation["name"])
             relation_type = str(relation.get("type", "insert_into"))
-            if relation_type not in {"insert_into", "pairwise_contact"}:
+            if relation_type not in {
+                "insert_into",
+                "nonpenetration",
+                "pairwise_contact",
+                "screw_insert",
+            }:
                 raise ValueError(
                     f"{name}: unsupported trajectory constraint type"
                 )
@@ -175,6 +202,14 @@ def validate_pose_config(
                 raise ValueError(
                     f"{name}: entry_center_radius_m must be positive"
                 )
+            if relation_type in {"nonpenetration", "pairwise_contact"}:
+                if (
+                    float(relation.get("surface_points", 6000)) < 1000
+                    or float(relation.get("near_field_m", 0.03)) <= 0.0
+                ):
+                    raise ValueError(
+                        f"{name}: invalid pairwise surface sampling/distance settings"
+                    )
             if relation_type == "pairwise_contact":
                 contact_start = int(
                     relation.get("contact_start_frame", relation_start)
@@ -184,9 +219,7 @@ def validate_pose_config(
                         f"{name}: contact_start_frame must lie in frame_range"
                     )
                 if (
-                    float(relation.get("surface_points", 6000)) < 1000
-                    or float(relation.get("near_field_m", 0.03)) <= 0.0
-                    or float(
+                    float(
                         relation.get("maximum_contact_gap_m", 0.004)
                     )
                     <= 0.0

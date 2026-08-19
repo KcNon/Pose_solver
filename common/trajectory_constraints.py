@@ -771,6 +771,8 @@ def pairwise_alignment_metrics(
     reference_axis: np.ndarray | list[float] | str | None,
     moving_axis: np.ndarray | list[float] | str | None,
     allow_axis_flip: bool = False,
+    reference_axis_origin_m: np.ndarray | list[float] | None = None,
+    moving_axis_origin_m: np.ndarray | list[float] | None = None,
 ) -> dict[str, float | None]:
     """Return generic axis-angle and axis-origin offset measurements."""
     if reference_axis is None or moving_axis is None:
@@ -786,8 +788,26 @@ def pairwise_alignment_metrics(
             np.arccos(np.clip(float(np.dot(moving, target)), -1.0, 1.0))
         )
     )
-    translation = np.asarray(relative_pose, dtype=np.float64)[:3, 3]
-    radial = translation - float(np.dot(translation, fixed)) * fixed
+    if reference_axis_origin_m is not None or moving_axis_origin_m is not None:
+        _, radial = _axis_origin_coordinates(
+            np.asarray(relative_pose, dtype=np.float64),
+            fixed,
+            np.asarray(
+                reference_axis_origin_m
+                if reference_axis_origin_m is not None
+                else [0.0, 0.0, 0.0],
+                dtype=np.float64,
+            ),
+            np.asarray(
+                moving_axis_origin_m
+                if moving_axis_origin_m is not None
+                else [0.0, 0.0, 0.0],
+                dtype=np.float64,
+            ),
+        )
+    else:
+        translation = np.asarray(relative_pose, dtype=np.float64)[:3, 3]
+        radial = translation - float(np.dot(translation, fixed)) * fixed
     return {
         "axis_angle_deg": angle,
         "axis_offset_m": float(np.linalg.norm(radial)),
@@ -835,6 +855,602 @@ def project_pairwise_alignment(
         radial *= target_offset / radial_norm
         result[:3, 3] = axial + radial
     return result
+
+
+def project_coaxial_pose(
+    relative_pose: np.ndarray,
+    *,
+    reference_axis: np.ndarray | list[float] | str,
+    moving_axis: np.ndarray | list[float] | str,
+    reference_axis_origin_m: np.ndarray | list[float] | None = None,
+    moving_axis_origin_m: np.ndarray | list[float] | None = None,
+    allow_axis_flip: bool = False,
+    target_axis_offset_m: float = 0.0,
+    twist_rad: float = 0.0,
+    axial_delta_m: float = 0.0,
+) -> np.ndarray:
+    """Project a relative pose onto two physical axis lines.
+
+    Unlike :func:`project_pairwise_alignment`, this uses configured points on
+    the two axes instead of assuming that both part origins lie on them.  That
+    distinction is essential for handles, spray heads, and other asymmetric
+    parts whose canonical origin is far from the insertion shaft.
+    """
+
+    original = np.asarray(relative_pose, dtype=np.float64)
+    fixed = axis_vector(reference_axis)
+    moving = axis_vector(moving_axis)
+    fixed_origin = np.asarray(
+        reference_axis_origin_m
+        if reference_axis_origin_m is not None
+        else [0.0, 0.0, 0.0],
+        dtype=np.float64,
+    )
+    moving_origin = np.asarray(
+        moving_axis_origin_m
+        if moving_axis_origin_m is not None
+        else [0.0, 0.0, 0.0],
+        dtype=np.float64,
+    )
+    axial, radial = _axis_origin_coordinates(
+        original, fixed, fixed_origin, moving_origin
+    )
+    result = original.copy()
+    result[:3, :3] = _align_rotation_to_axis(
+        result[:3, :3], fixed, moving, allow_axis_flip=allow_axis_flip
+    )
+    if abs(float(twist_rad)) > 1e-12:
+        result[:3, :3] = (
+            Rotation.from_rotvec(float(twist_rad) * fixed).as_matrix()
+            @ result[:3, :3]
+        )
+    target_offset = max(float(target_axis_offset_m), 0.0)
+    radial_norm = float(np.linalg.norm(radial))
+    if radial_norm > 1e-10 and target_offset > 0.0:
+        radial = radial * (target_offset / radial_norm)
+    else:
+        radial = np.zeros(3, dtype=np.float64)
+    return _set_axis_origin_coordinates(
+        result,
+        fixed,
+        fixed_origin,
+        moving_origin,
+        axial + float(axial_delta_m),
+        radial,
+    )
+
+
+def _align_rotation_to_axis(
+    rotation: np.ndarray,
+    reference_axis: np.ndarray,
+    moving_axis: np.ndarray,
+    *,
+    allow_axis_flip: bool,
+) -> np.ndarray:
+    """Return the nearest rotation whose moving axis matches the reference."""
+
+    result = np.asarray(rotation, dtype=np.float64).copy()
+    current = result @ moving_axis
+    target = _aligned_axis_target(current, reference_axis, allow_axis_flip)
+    dot = float(np.clip(np.dot(current, target), -1.0, 1.0))
+    cross = np.cross(current, target)
+    norm = float(np.linalg.norm(cross))
+    if norm > 1e-10:
+        correction = Rotation.from_rotvec(
+            cross / norm * float(np.arctan2(norm, dot))
+        ).as_matrix()
+        result = correction @ result
+    elif dot < 0.0:
+        seed = np.asarray([1.0, 0.0, 0.0])
+        if abs(float(np.dot(seed, current))) > 0.85:
+            seed = np.asarray([0.0, 1.0, 0.0])
+        perpendicular = _unit(np.cross(current, seed))
+        result = Rotation.from_rotvec(np.pi * perpendicular).as_matrix() @ result
+    return result
+
+
+def _axis_origin_coordinates(
+    pose: np.ndarray,
+    reference_axis: np.ndarray,
+    reference_origin: np.ndarray,
+    moving_origin: np.ndarray,
+) -> tuple[float, np.ndarray]:
+    transformed = (
+        np.asarray(pose, dtype=np.float64)[:3, :3] @ moving_origin
+        + np.asarray(pose, dtype=np.float64)[:3, 3]
+    )
+    offset = transformed - reference_origin
+    axial = float(np.dot(offset, reference_axis))
+    return axial, offset - axial * reference_axis
+
+
+def _set_axis_origin_coordinates(
+    pose: np.ndarray,
+    reference_axis: np.ndarray,
+    reference_origin: np.ndarray,
+    moving_origin: np.ndarray,
+    axial: float,
+    radial: np.ndarray,
+) -> np.ndarray:
+    result = np.asarray(pose, dtype=np.float64).copy()
+    target = reference_origin + float(axial) * reference_axis + radial
+    result[:3, 3] = target - result[:3, :3] @ moving_origin
+    return result
+
+
+def _signed_twist(
+    first_rotation: np.ndarray,
+    second_rotation: np.ndarray,
+    reference_axis: np.ndarray,
+    moving_axis: np.ndarray,
+) -> float:
+    """Measure the modulo twist between two already axis-aligned rotations."""
+
+    seed = np.asarray([1.0, 0.0, 0.0])
+    if abs(float(np.dot(seed, moving_axis))) > 0.85:
+        seed = np.asarray([0.0, 1.0, 0.0])
+    moving_reference = _unit(
+        seed - float(np.dot(seed, moving_axis)) * moving_axis
+    )
+    first = np.asarray(first_rotation, dtype=np.float64) @ moving_reference
+    second = np.asarray(second_rotation, dtype=np.float64) @ moving_reference
+    first = _unit(first - float(np.dot(first, reference_axis)) * reference_axis)
+    second = _unit(
+        second - float(np.dot(second, reference_axis)) * reference_axis
+    )
+    return float(
+        np.arctan2(
+            float(np.dot(reference_axis, np.cross(first, second))),
+            float(np.clip(np.dot(first, second), -1.0, 1.0)),
+        )
+    )
+
+
+def screw_pose_metrics(
+    relative_pose: np.ndarray,
+    *,
+    reference_axis: np.ndarray | list[float] | str,
+    moving_axis: np.ndarray | list[float] | str,
+    reference_axis_origin_m: np.ndarray | list[float] | None = None,
+    moving_axis_origin_m: np.ndarray | list[float] | None = None,
+    allow_axis_flip: bool = False,
+) -> dict[str, float]:
+    """Measure coaxial error using explicit axis origins, not mesh centroids."""
+
+    fixed = axis_vector(reference_axis)
+    moving = axis_vector(moving_axis)
+    fixed_origin = np.asarray(
+        reference_axis_origin_m if reference_axis_origin_m is not None else [0, 0, 0],
+        dtype=np.float64,
+    )
+    moving_origin = np.asarray(
+        moving_axis_origin_m if moving_axis_origin_m is not None else [0, 0, 0],
+        dtype=np.float64,
+    )
+    pose = np.asarray(relative_pose, dtype=np.float64)
+    transformed_axis = pose[:3, :3] @ moving
+    target = _aligned_axis_target(transformed_axis, fixed, allow_axis_flip)
+    angle = float(
+        np.degrees(
+            np.arccos(
+                np.clip(float(np.dot(transformed_axis, target)), -1.0, 1.0)
+            )
+        )
+    )
+    axial, radial = _axis_origin_coordinates(
+        pose, fixed, fixed_origin, moving_origin
+    )
+    return {
+        "axis_angle_deg": angle,
+        "axis_offset_m": float(np.linalg.norm(radial)),
+        "axis_origin_axial_m": axial,
+    }
+
+
+def evaluate_screw_trajectory(
+    poses: dict[int, np.ndarray],
+    config: dict[str, Any],
+    moving_surface: SampledSurface | None = None,
+    reference_surface: SampledSurface | None = None,
+) -> dict[str, Any]:
+    """Evaluate screw kinematics and optional continuous non-penetration."""
+
+    frames = sorted(poses)
+    if not frames:
+        raise ValueError("cannot evaluate an empty screw trajectory")
+    contact = int(config.get("contact_frame", frames[0]))
+    fixed = axis_vector(config.get("reference_axis_part", "z"))
+    moving = axis_vector(config.get("moving_axis_part", "z"))
+    fixed_origin = np.asarray(
+        config.get("reference_axis_origin_part_m", [0.0, 0.0, 0.0]),
+        dtype=np.float64,
+    )
+    moving_origin = np.asarray(
+        config.get("moving_axis_origin_part_m", [0.0, 0.0, 0.0]),
+        dtype=np.float64,
+    )
+    rows = []
+    for frame in frames:
+        item = screw_pose_metrics(
+            poses[frame],
+            reference_axis=fixed,
+            moving_axis=moving,
+            reference_axis_origin_m=fixed_origin,
+            moving_axis_origin_m=moving_origin,
+            allow_axis_flip=bool(config.get("allow_axis_flip", False)),
+        )
+        item["frame"] = int(frame)
+        rows.append(item)
+
+    contact_frames = [frame for frame in frames if frame >= contact]
+    cumulative = 0.0
+    helix_rows = []
+    if contact_frames:
+        first = contact_frames[0]
+        first_axial = next(
+            row["axis_origin_axial_m"] for row in rows if row["frame"] == first
+        )
+        previous = np.asarray(poses[first], dtype=np.float64)[:3, :3]
+        for frame in contact_frames:
+            rotation = np.asarray(poses[frame], dtype=np.float64)[:3, :3]
+            if frame != first:
+                increment = Rotation.from_matrix(rotation @ previous.T).as_rotvec()
+                cumulative += float(np.dot(increment, fixed))
+            axial = next(
+                row["axis_origin_axial_m"]
+                for row in rows
+                if row["frame"] == frame
+            )
+            expected = first_axial + float(
+                config.get("pitch_m_per_turn", 0.0)
+            ) * abs(cumulative) / (2.0 * np.pi)
+            helix_rows.append(
+                {
+                    "frame": int(frame),
+                    "cumulative_rotation_rad": cumulative,
+                    "axis_origin_axial_m": axial,
+                    "expected_axial_m": expected,
+                    "helix_residual_m": float(abs(axial - expected)),
+                }
+            )
+            previous = rotation
+    axial_values = [row["axis_origin_axial_m"] for row in rows]
+    direction = float(config.get("insertion_direction", 1.0))
+    monotonic_violations = sum(
+        1
+        for first, second in zip(axial_values, axial_values[1:])
+        if direction * (second - first) < -1e-7
+    )
+    contact_rows = [row for row in rows if row["frame"] >= contact]
+    result = {
+        "max_penetration_m": 0.0,
+        "rms_penetration_m": 0.0,
+        "violating_samples": 0,
+        "collision_evaluated": False,
+        "max_axis_angle_deg": max(
+            (row["axis_angle_deg"] for row in contact_rows), default=0.0
+        ),
+        "max_axis_offset_m": max(
+            (row["axis_offset_m"] for row in contact_rows), default=0.0
+        ),
+        "max_helix_residual_m": max(
+            (row["helix_residual_m"] for row in helix_rows), default=0.0
+        ),
+        "monotonic_axial_violations": int(monotonic_violations),
+        "samples": rows,
+        "helix_samples": helix_rows,
+    }
+    if (moving_surface is None) != (reference_surface is None):
+        raise ValueError(
+            "moving_surface and reference_surface must be provided together"
+        )
+    if moving_surface is not None and reference_surface is not None:
+        collision_config = dict(config)
+        collision_config["continuous_substeps"] = int(
+            config.get("collision_continuous_substeps", 2)
+        )
+        # Contact distance is not a screw-trajectory acceptance condition;
+        # surfaces may approach or separate before seating.  This pass exists
+        # specifically to reject material interpenetration.
+        collision_config["contact_start_frame"] = max(frames) + 1
+        collision = evaluate_surface_contact_trajectory(
+            poses,
+            moving_surface,
+            reference_surface,
+            collision_config,
+        )
+        penetration_rows = [
+            row
+            for row in collision["samples"]
+            if float(row.get("max_penetration_m", 0.0)) > 0.0
+        ]
+        worst = collision["worst_penetration_sample"]
+        result.update({
+            "max_penetration_m": float(collision["max_penetration_m"]),
+            "rms_penetration_m": float(
+                worst.get("rms_penetration_m", 0.0)
+            ),
+            "violating_samples": int(len(penetration_rows)),
+            "collision_evaluated": True,
+            "collision_substeps_per_frame": int(
+                collision["substeps_per_frame"]
+            ),
+            "collision_sample_count": int(collision["sample_count"]),
+            "worst_penetration_sample": worst,
+        })
+    return result
+
+
+def refine_screw_trajectory(
+    initial_poses: dict[int, np.ndarray],
+    config: dict[str, Any],
+) -> tuple[dict[int, np.ndarray], dict[str, Any]]:
+    """Project a visual trajectory onto insertion then screw-motion DOFs.
+
+    Before contact the axis converges smoothly toward the opening.  From
+    contact to the seated frame the only remaining DOFs are rotation about
+    the reference axis and pitch-coupled axial translation.  A terminal stable
+    anchor supplies the modulo yaw; ``turns`` resolves the otherwise invisible
+    full revolutions.
+    """
+
+    frames = sorted(initial_poses)
+    if not frames:
+        raise ValueError("cannot refine an empty screw trajectory")
+    start = int(config.get("insertion_start_frame", frames[0]))
+    contact = int(config["contact_frame"])
+    seat = int(config.get("seat_frame", frames[-1]))
+    terminal = int(config.get("terminal_anchor_frame", seat))
+    if not (frames[0] <= start <= contact < seat <= frames[-1]):
+        raise ValueError("screw frames must satisfy start <= contact < seat")
+    if terminal not in initial_poses:
+        raise ValueError("terminal_anchor_frame is outside the relation frames")
+
+    fixed = axis_vector(config.get("reference_axis_part", "z"))
+    moving = axis_vector(config.get("moving_axis_part", "z"))
+    fixed_origin = np.asarray(
+        config.get("reference_axis_origin_part_m", [0.0, 0.0, 0.0]),
+        dtype=np.float64,
+    )
+    moving_origin = np.asarray(
+        config.get("moving_axis_origin_part_m", [0.0, 0.0, 0.0]),
+        dtype=np.float64,
+    )
+    allow_flip = bool(config.get("allow_axis_flip", False))
+    target_offset = max(float(config.get("target_axis_offset_m", 0.0)), 0.0)
+
+    aligned: dict[int, np.ndarray] = {}
+    for frame, pose in initial_poses.items():
+        value = np.asarray(pose, dtype=np.float64).copy()
+        value[:3, :3] = _align_rotation_to_axis(
+            value[:3, :3], fixed, moving, allow_axis_flip=allow_flip
+        )
+        aligned[int(frame)] = value
+
+    start_axial, start_radial = _axis_origin_coordinates(
+        initial_poses[start], fixed, fixed_origin, moving_origin
+    )
+    contact_axial, contact_radial = _axis_origin_coordinates(
+        aligned[contact], fixed, fixed_origin, moving_origin
+    )
+    radial_direction = (
+        start_radial / np.linalg.norm(start_radial)
+        if np.linalg.norm(start_radial) > 1e-10
+        else np.zeros(3, dtype=np.float64)
+    )
+    contact_radial_target = target_offset * radial_direction
+    contact_pose = _set_axis_origin_coordinates(
+        aligned[contact],
+        fixed,
+        fixed_origin,
+        moving_origin,
+        contact_axial,
+        contact_radial_target,
+    )
+
+    terminal_rotation = aligned[terminal][:3, :3]
+    modulo_terminal = _signed_twist(
+        contact_pose[:3, :3], terminal_rotation, fixed, moving
+    )
+    handedness = 1.0 if float(config.get("handedness", 1.0)) >= 0.0 else -1.0
+    turns = max(float(config.get("turns", 1.0)), 0.0)
+    total_phase = handedness * 2.0 * np.pi * turns + modulo_terminal
+    if total_phase * handedness < 0.0:
+        total_phase += handedness * 2.0 * np.pi
+    pitch = float(config["pitch_m_per_turn"])
+    observation_weight = float(
+        np.clip(config.get("phase_observation_weight", 0.5), 0.0, 1.0)
+    )
+
+    screw_frames = [frame for frame in frames if contact <= frame <= seat]
+    observed_phase = []
+    expected_phase = []
+    for frame in screw_frames:
+        progress = (frame - contact) / max(seat - contact, 1)
+        expected = total_phase * progress
+        modulo = _signed_twist(
+            contact_pose[:3, :3], aligned[frame][:3, :3], fixed, moving
+        )
+        candidates = [modulo + 2.0 * np.pi * value for value in range(-6, 7)]
+        selected = min(candidates, key=lambda value: abs(value - expected))
+        expected_phase.append(expected)
+        observed_phase.append(selected)
+    phase = (
+        (1.0 - observation_weight) * np.asarray(expected_phase)
+        + observation_weight * np.asarray(observed_phase)
+    )
+    signed_progress = handedness * phase
+    signed_total = handedness * total_phase
+    signed_progress = np.clip(signed_progress, 0.0, signed_total)
+    signed_progress = np.maximum.accumulate(signed_progress)
+    if len(signed_progress):
+        maximum_step = np.deg2rad(
+            float(config.get("maximum_phase_step_deg", 20.0))
+        )
+        minimum_required_step = signed_total / max(
+            len(signed_progress) - 1, 1
+        )
+        maximum_step = max(maximum_step, minimum_required_step)
+        bounded = np.zeros_like(signed_progress)
+        for index in range(1, len(bounded)):
+            remaining = len(bounded) - 1 - index
+            lower = max(
+                bounded[index - 1],
+                signed_total - maximum_step * remaining,
+            )
+            upper = min(
+                signed_total, bounded[index - 1] + maximum_step
+            )
+            bounded[index] = float(
+                np.clip(signed_progress[index], lower, upper)
+            )
+        bounded[-1] = signed_total
+        signed_progress = bounded
+    phase = handedness * signed_progress
+    phase_by_frame = dict(zip(screw_frames, phase.tolist()))
+
+    result = {
+        frame: np.asarray(pose, dtype=np.float64).copy()
+        for frame, pose in initial_poses.items()
+    }
+    for frame in frames:
+        if frame < start:
+            continue
+        if frame <= contact:
+            amount = (frame - start) / max(contact - start, 1)
+            amount = float(np.clip(amount, 0.0, 1.0))
+            amount = amount * amount * (3.0 - 2.0 * amount)
+            interpolated = interpolate_pose(
+                np.asarray(initial_poses[start], dtype=np.float64),
+                contact_pose,
+                amount,
+            )
+            axial = (1.0 - amount) * start_axial + amount * contact_axial
+            radial = (1.0 - amount) * start_radial + amount * contact_radial_target
+            result[frame] = _set_axis_origin_coordinates(
+                interpolated,
+                fixed,
+                fixed_origin,
+                moving_origin,
+                axial,
+                radial,
+            )
+            continue
+        current_phase = phase_by_frame.get(frame, total_phase)
+        rotation = (
+            Rotation.from_rotvec(current_phase * fixed).as_matrix()
+            @ contact_pose[:3, :3]
+        )
+        value = np.eye(4, dtype=np.float64)
+        value[:3, :3] = rotation
+        axial = contact_axial + pitch * abs(current_phase) / (2.0 * np.pi)
+        result[frame] = _set_axis_origin_coordinates(
+            value,
+            fixed,
+            fixed_origin,
+            moving_origin,
+            axial,
+            contact_radial_target,
+        )
+
+    before = evaluate_screw_trajectory(initial_poses, config)
+    after = evaluate_screw_trajectory(result, config)
+    return result, {
+        "evaluations": 0,
+        "before": before,
+        "proposed_after": after,
+        "contact_frame": contact,
+        "seat_frame": seat,
+        "terminal_anchor_frame": terminal,
+        "contact_axial_m": contact_axial,
+        "total_phase_rad": total_phase,
+        "effective_turns": abs(total_phase) / (2.0 * np.pi),
+        "phase_by_frame_rad": {
+            f"{frame:06d}": float(value)
+            for frame, value in phase_by_frame.items()
+        },
+    }
+
+
+def solve_monotonic_axial_path(
+    unary_costs: np.ndarray,
+    axial_grid_m: np.ndarray,
+    *,
+    direction: float,
+    maximum_step_m: float,
+    maximum_backtrack_m: float = 0.0,
+    temporal_weight: float = 0.05,
+    terminal_index: int | None = None,
+) -> tuple[np.ndarray, float]:
+    """Solve a visibility-weighted 1-DoF insertion trajectory.
+
+    ``unary_costs`` contains one multi-view render cost per frame and axial
+    candidate.  The dynamic program keeps the path physically directed while
+    still allowing a small configured backtrack for hand re-positioning.  A
+    terminal index can pin the final dynamic frame to a separately validated
+    stable assembly anchor.
+
+    This is deliberately independent of any object category: the caller
+    supplies the physical axis grid and insertion direction.
+    """
+
+    costs = np.asarray(unary_costs, dtype=np.float64)
+    grid = np.asarray(axial_grid_m, dtype=np.float64).reshape(-1)
+    if costs.ndim != 2 or costs.shape[1] != len(grid):
+        raise ValueError(
+            "unary_costs must have shape (frames, len(axial_grid_m))"
+        )
+    if costs.shape[0] == 0 or len(grid) == 0:
+        raise ValueError("cannot solve an empty axial trajectory")
+    if not np.all(np.isfinite(grid)) or np.any(np.diff(grid) <= 0.0):
+        raise ValueError("axial_grid_m must be finite and strictly increasing")
+    if maximum_step_m <= 0.0:
+        raise ValueError("maximum_step_m must be positive")
+    if maximum_backtrack_m < 0.0:
+        raise ValueError("maximum_backtrack_m cannot be negative")
+    sign = 1.0 if float(direction) >= 0.0 else -1.0
+    frame_count, candidate_count = costs.shape
+    accumulated = np.full_like(costs, np.inf)
+    parents = np.full((frame_count, candidate_count), -1, dtype=np.int64)
+    accumulated[0] = costs[0]
+    step_scale = max(float(maximum_step_m), 1e-9)
+    for frame in range(1, frame_count):
+        for current in range(candidate_count):
+            delta = grid[current] - grid
+            directed = sign * delta
+            valid = (
+                (np.abs(delta) <= float(maximum_step_m) + 1e-12)
+                & (directed >= -float(maximum_backtrack_m) - 1e-12)
+                & np.isfinite(accumulated[frame - 1])
+            )
+            if not np.any(valid):
+                continue
+            transition = float(temporal_weight) * (delta / step_scale) ** 2
+            values = accumulated[frame - 1] + transition
+            values[~valid] = np.inf
+            parent = int(np.argmin(values))
+            accumulated[frame, current] = (
+                float(values[parent]) + float(costs[frame, current])
+            )
+            parents[frame, current] = parent
+    if terminal_index is None:
+        current = int(np.argmin(accumulated[-1]))
+    else:
+        current = int(terminal_index)
+        if not 0 <= current < candidate_count:
+            raise ValueError("terminal_index is outside axial_grid_m")
+    if not np.isfinite(accumulated[-1, current]):
+        raise ValueError(
+            "no feasible axial path reaches the requested terminal candidate"
+        )
+    path = np.empty(frame_count, dtype=np.int64)
+    path[-1] = current
+    for frame in range(frame_count - 1, 0, -1):
+        current = int(parents[frame, current])
+        if current < 0:
+            raise RuntimeError("axial path backtracking encountered no parent")
+        path[frame - 1] = current
+    return path, float(accumulated[-1, path[-1]])
 
 
 def evaluate_surface_contact_trajectory(

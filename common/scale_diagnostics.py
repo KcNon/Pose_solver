@@ -12,6 +12,59 @@ from typing import Any
 import numpy as np
 
 
+def select_anchor_scale(
+    fits: list[dict[str, Any]],
+    *,
+    rmse_floor_m: float = 1e-4,
+) -> tuple[float, dict[str, Any]]:
+    """Select a robust fixed scale from independently fitted anchor frames.
+
+    A plain median gives every anchor equal authority even when an emerging,
+    clipped, or occluded mask fits the mesh very poorly.  The weighted median
+    retains robustness to extreme scales while giving geometrically supported
+    anchors inverse-variance weight from their metric fit residual.
+    """
+
+    candidates = []
+    for index, fit in enumerate(fits):
+        scale = float(fit["scale"])
+        rmse = float(fit["fit_rmse_m"])
+        if scale <= 0.0 or not np.isfinite(scale) or not np.isfinite(rmse):
+            continue
+        weight = 1.0 / max(rmse, float(rmse_floor_m)) ** 2
+        candidates.append((scale, weight, index, rmse))
+    if not candidates:
+        raise ValueError("no finite positive anchor scale candidates")
+    ordered = sorted(candidates, key=lambda value: value[0])
+    total_weight = float(sum(value[1] for value in ordered))
+    threshold = 0.5 * total_weight
+    cumulative = 0.0
+    selected = ordered[-1]
+    for candidate in ordered:
+        cumulative += candidate[1]
+        if cumulative >= threshold:
+            selected = candidate
+            break
+    scale, _weight, selected_index, _rmse = selected
+    normalized_weights = {
+        str(index): float(weight / total_weight)
+        for _scale, weight, index, _candidate_rmse in candidates
+    }
+    unweighted_median = float(np.median([value[0] for value in candidates]))
+    return float(scale), {
+        "method": "inverse_rmse_squared_weighted_median",
+        "selected_fit_index": int(selected_index),
+        "selected_scale": float(scale),
+        "unweighted_median_scale": unweighted_median,
+        "normalized_weights": normalized_weights,
+        "candidate_count": len(candidates),
+        "scale_ratio_max_to_min": float(
+            max(value[0] for value in candidates)
+            / min(value[0] for value in candidates)
+        ),
+    }
+
+
 def pareto_indices(
     rows: list[dict[str, Any]],
     objectives: tuple[str, ...],

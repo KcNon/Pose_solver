@@ -26,11 +26,20 @@ from common.pose_visualization import (
 from common.symmetry import symmetry_spec_from_state
 
 
+def record_visible_in_view(record: dict, view: str) -> bool:
+    """Use the trajectory's camera-level visibility when available."""
+
+    if record.get("pose_valid") is False:
+        return False
+    visible_views = record.get("visible_views")
+    if visible_views is not None:
+        return str(view) in {str(value) for value in visible_views}
+    return int(record.get("observing_views", 0)) > 0
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--config", default=str(ROOT / "configs" / "pose_data_1_8view.json")
-    )
+    parser.add_argument("--config", required=True)
     parser.add_argument("--trajectory", default=None)
     parser.add_argument("--output-root", default=None)
     parser.add_argument("--width", type=int, default=320)
@@ -38,6 +47,13 @@ def main() -> None:
     parser.add_argument("--review-width", type=int, default=640)
     parser.add_argument("--review-height", type=int, default=360)
     parser.add_argument("--keyframes", type=int, nargs="*", default=None)
+    parser.add_argument("--start-frame", type=int, default=None)
+    parser.add_argument("--end-frame", type=int, default=None)
+    parser.add_argument(
+        "--metrics-output",
+        default=None,
+        help="override diagnostics/multiview_metrics.json",
+    )
     parser.add_argument(
         "--metrics-keyframes-only",
         action="store_true",
@@ -70,6 +86,12 @@ def main() -> None:
         configured_keyframes = [available[index] for index in sample_indices]
     keyframes = set(map(int, configured_keyframes))
     trajectory_items = list(trajectory["frames"].items())
+    trajectory_items = [
+        item
+        for item in trajectory_items
+        if (args.start_frame is None or int(item[0]) >= args.start_frame)
+        and (args.end_frame is None or int(item[0]) <= args.end_frame)
+    ]
     if args.metrics_keyframes_only:
         trajectory_items = [
             item for item in trajectory_items if int(item[0]) in keyframes
@@ -93,18 +115,23 @@ def main() -> None:
     review_dir = output / "review" / "keyframes"
     review_dir.mkdir(parents=True, exist_ok=True)
 
-    with SceneRenderer(args.width, args.height) as renderer:
+    with SceneRenderer(
+        args.width, args.height, cache_mesh_resources=True
+    ) as renderer:
         for frame_index, (timestamp, frame_record) in enumerate(trajectory_items):
             frame = int(timestamp)
             recon = load_recon(cfg, timestamp, backend=cfg["recon_backend"])
             transforms = {part: np.asarray(frame_record["parts"][part]["S_world_from_raw_mesh"], float)
                           for part in trajectory["parts"]}
-            visible_parts = [
-                part for part in trajectory["parts"]
-                if int(frame_record["parts"][part].get("observing_views", 0)) > 0
-            ]
             report["frames"][timestamp] = {}
             for view_index, view in enumerate(cfg["views"]):
+                visible_parts = [
+                    part
+                    for part in trajectory["parts"]
+                    if record_visible_in_view(
+                        frame_record["parts"][part], view
+                    )
+                ]
                 K, E = camera_from_recon(
                     recon, view_index, (args.height, args.width)
                 )
@@ -160,26 +187,35 @@ def main() -> None:
             "mean_iou": float(np.mean(all_iou)) if all_iou else None,
             "mean_contour_chamfer_px": float(np.mean(all_chamfer)) if all_chamfer else None,
         }
-    write_json(output / "diagnostics" / "multiview_metrics.json", report)
+    metrics_path = Path(
+        args.metrics_output
+        or output / "diagnostics" / "multiview_metrics.json"
+    ).resolve()
+    write_json(metrics_path, report)
     if args.skip_review_sheets:
-        print(f"wrote {output / 'diagnostics' / 'multiview_metrics.json'}")
+        print(f"wrote {metrics_path}")
         return
 
     # Higher-resolution, multi-camera review sheets for the frames that will be
     # manually adjusted or approved as ground truth.
-    with SceneRenderer(args.review_width, args.review_height) as renderer:
+    with SceneRenderer(
+        args.review_width,
+        args.review_height,
+        cache_mesh_resources=True,
+    ) as renderer:
         for frame in sorted(keyframes):
             timestamp = f"{frame:06d}"
             record = trajectory["frames"][timestamp]
             recon = load_recon(cfg, timestamp, backend=cfg["recon_backend"])
             transforms = {part: np.asarray(record["parts"][part]["S_world_from_raw_mesh"], float)
                           for part in trajectory["parts"]}
-            visible_parts = [
-                part for part in trajectory["parts"]
-                if int(record["parts"][part].get("observing_views", 0)) > 0
-            ]
             panels = []
             for view_index, view in enumerate(cfg["views"]):
+                visible_parts = [
+                    part
+                    for part in trajectory["parts"]
+                    if record_visible_in_view(record["parts"][part], view)
+                ]
                 K, E = camera_from_recon(
                     recon,
                     view_index,
@@ -274,7 +310,7 @@ def main() -> None:
             },
         }
     write_json(output / "review" / "gt_keyframes_template.json", gt_template)
-    print(f"wrote {output / 'diagnostics' / 'multiview_metrics.json'}")
+    print(f"wrote {metrics_path}")
 
 
 if __name__ == "__main__":

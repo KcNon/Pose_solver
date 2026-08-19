@@ -16,7 +16,7 @@ def main() -> None:
     parser.add_argument(
         "--config",
         type=Path,
-        default=PROJECT_ROOT / "configs/simulation_data_1.json",
+        required=True,
     )
     parser.add_argument("--project-root", type=Path, default=PROJECT_ROOT)
     parser.add_argument("--output-dir", type=Path)

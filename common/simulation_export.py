@@ -5,11 +5,13 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import trimesh
 
 from common.simulation_assets import (
     aabb_overlap,
     canonical_from_raw_matrix,
     canonicalize_mesh,
+    carve_observed_overlap_components,
     create_collision_proxy,
     export_collision_obj,
     export_textured_obj,
@@ -23,11 +25,20 @@ from common.simulation_assets import (
 )
 from common.io_utils import load_json, write_json
 from common.pose_transforms import transform_points
+from common.physics_control import dynamic_collision_approximation
 
 
 def resolve_path(project_root: Path, value: str) -> Path:
     path = Path(value)
     return path if path.is_absolute() else project_root / path
+
+
+def manifest_path(path: Path, project_root: Path) -> str:
+    """Use a portable project-relative path when possible, absolute otherwise."""
+    try:
+        return str(path.relative_to(project_root))
+    except ValueError:
+        return str(path)
 
 
 def validate_config(config: dict[str, Any], trajectory: dict[str, Any]) -> None:
@@ -63,6 +74,7 @@ def export_simulation_assets(
 
     part_info: dict[str, dict[str, Any]] = {}
     canonical_meshes = {}
+    collision_components_by_part: dict[str, list[trimesh.Trimesh]] = {}
     transform_checks = {}
     for part, mesh_value in config["meshes"].items():
         source_path = resolve_path(project_root, mesh_value)
@@ -83,6 +95,7 @@ def export_simulation_assets(
             collision_components = [collision_mesh]
         else:
             collision_components = list(collision_mesh.split(only_watertight=False))
+        collision_components_by_part[part] = collision_components
         component_paths = []
         for index, component in enumerate(collision_components):
             component_path = (
@@ -100,7 +113,7 @@ def export_simulation_assets(
         # adjacency without duplicating any geometry.
         connected_components = int(canonical_mesh.body_count)
         part_info[part] = {
-            "source_mesh": str(source_path.relative_to(project_root)),
+            "source_mesh": manifest_path(source_path, project_root),
             "source_sha256": sha256_file(source_path),
             "visual_mesh": str(visual_path.relative_to(output_root)),
             "collision_mesh": str(collision_path.relative_to(output_root)),
@@ -157,6 +170,65 @@ def export_simulation_assets(
         assembled_transforms[part] = transform
         assembly_stats[part] = stats
 
+    simulation = config["simulation"]
+    container_part = str(simulation["container_part"])
+    inserted_part = str(simulation["inserted_part"])
+    carving = dict(simulation.get("observed_overlap_carving", {}))
+    if carving.get("enabled", False):
+        components = collision_components_by_part[inserted_part]
+        kept, carving_report = carve_observed_overlap_components(
+            components,
+            np.asarray(canonical_meshes[container_part].vertices, dtype=np.float64),
+            assembled_transforms[inserted_part],
+            penetration_tolerance_m=float(
+                carving.get("penetration_tolerance_m", 0.001)
+            ),
+            minimum_reference_vertices=int(
+                carving.get("minimum_reference_vertices", 5)
+            ),
+            maximum_removed_fraction=float(
+                carving.get("maximum_removed_fraction", 0.45)
+            ),
+        )
+        part_info[inserted_part]["collision_proxy"][
+            "observed_overlap_carving"
+        ] = carving_report
+        if carving_report["applied"]:
+            collision_components_by_part[inserted_part] = kept
+            collision_mesh = trimesh.util.concatenate(kept)
+            collision_path = (
+                output_root / "meshes/collision" / f"{inserted_part}.obj"
+            )
+            export_collision_obj(collision_mesh, collision_path)
+            component_paths = []
+            for index, component in enumerate(kept):
+                component_path = (
+                    output_root
+                    / "meshes/collision"
+                    / inserted_part
+                    / f"component_{index:03d}.obj"
+                )
+                export_collision_obj(component, component_path)
+                component_paths.append(component_path)
+            info = part_info[inserted_part]
+            info["collision_mesh_sha256"] = sha256_file(collision_path)
+            info["collision_meshes"] = [
+                str(path.relative_to(output_root)) for path in component_paths
+            ]
+            info["collision_mesh_sha256s"] = [
+                sha256_file(path) for path in component_paths
+            ]
+            info["collision_proxy"]["vertices"] = int(len(collision_mesh.vertices))
+            info["collision_proxy"]["faces"] = int(len(collision_mesh.faces))
+            info["collision_proxy"]["connected_components"] = int(len(kept))
+            info["collision_proxy"]["watertight"] = bool(collision_mesh.is_watertight)
+            info["collision_proxy"]["bounds_m"] = np.asarray(
+                collision_mesh.bounds, dtype=float
+            ).tolist()
+            info["collision_proxy"]["extents_m"] = np.asarray(
+                collision_mesh.extents, dtype=float
+            ).tolist()
+
     urdf_dir = output_root / "urdf"
     for part in config["meshes"]:
         write_urdf(
@@ -175,9 +247,6 @@ def export_simulation_assets(
         root_part=reference_part,
     )
 
-    simulation = config["simulation"]
-    container_part = simulation["container_part"]
-    inserted_part = simulation["inserted_part"]
     target = assembled_transforms[inserted_part]
     body_mesh = canonical_meshes[container_part]
     inserted_world_vertices = transform_points(canonical_meshes[inserted_part].vertices, target)
@@ -245,9 +314,9 @@ def export_simulation_assets(
             "quaternion": "xyzw in pose_solver; wxyz in Isaac runtime",
         },
         "inputs": {
-            "config": str(config_path.relative_to(project_root)),
+            "config": manifest_path(config_path, project_root),
             "config_sha256": sha256_file(config_path),
-            "trajectory": str(trajectory_path.relative_to(project_root)),
+            "trajectory": manifest_path(trajectory_path, project_root),
             "trajectory_sha256": sha256_file(trajectory_path),
         },
         "reference_part": reference_part,
@@ -259,7 +328,10 @@ def export_simulation_assets(
             **simulation,
             "collision_policy": {
                 container_part: "static triangle mesh; preserve cavity",
-                inserted_part: "dynamic convex decomposition in Isaac Sim",
+                inserted_part: (
+                    "dynamic "
+                    f"{dynamic_collision_approximation(simulation)} in Isaac Sim"
+                ),
             },
         },
         "outputs": {

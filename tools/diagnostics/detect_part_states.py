@@ -31,6 +31,7 @@ sys.path.insert(0, str(ROOT))
 
 from common.io_utils import load_json, write_json
 from common.cloud_io import read_ply_xyz
+from common.multiview_quality import mask_area_quality
 
 
 def median_filter(values: np.ndarray, width: int = 5) -> np.ndarray:
@@ -44,18 +45,35 @@ def median_filter(values: np.ndarray, width: int = 5) -> np.ndarray:
 
 
 def mask_observations(mask_root: Path, frames: list[str], views: list[str],
-                      part_ids: dict[str, int], min_px: int) -> dict:
+                      part_ids: dict[str, int], min_px: int,
+                      maximum_area_ratio: float) -> dict:
     """Per part: bbox centers (F,V,2), areas (F,V); NaN/0 when below min_px."""
     parts = list(part_ids)
     centers = {p: np.full((len(frames), len(views), 2), np.nan) for p in parts}
     areas = {p: np.zeros((len(frames), len(views))) for p in parts}
     for fi, timestamp in enumerate(frames):
+        labels_by_view = {
+            view: np.asarray(Image.open(mask_root / timestamp / f"{view}.png"))
+            for view in views
+            if (mask_root / timestamp / f"{view}.png").exists()
+        }
+        qualities = {
+            part: mask_area_quality(
+                labels_by_view,
+                pid,
+                minimum_pixels=min_px,
+                maximum_area_ratio=maximum_area_ratio,
+            )
+            for part, pid in part_ids.items()
+        }
         for vi, view in enumerate(views):
-            labels = np.asarray(Image.open(mask_root / timestamp / f"{view}.png"))
+            if view not in labels_by_view:
+                continue
+            labels = labels_by_view[view]
             for part, pid in part_ids.items():
-                y, x = np.where(labels == pid)
-                if len(x) < min_px:
+                if not qualities[part]["views"][view]["valid"]:
                     continue
+                y, x = np.where(labels == pid)
                 areas[part][fi, vi] = len(x)
                 centers[part][fi, vi] = [(x.min() + x.max()) / 2.0, (y.min() + y.max()) / 2.0]
         if fi % 20 == 0:
@@ -76,7 +94,8 @@ def rolling_median(values: np.ndarray, width: int = 11) -> np.ndarray:
 
 
 def motion_score(centers: np.ndarray, areas: np.ndarray,
-                 occlusion_drop: float = 0.7) -> tuple[np.ndarray, np.ndarray]:
+                 occlusion_drop: float = 0.7,
+                 motion_lag: int = 3) -> tuple[np.ndarray, np.ndarray]:
     """Occlusion-gated median-over-views center displacement and area change.
 
     A view whose mask area collapses below ``occlusion_drop`` of its rolling
@@ -89,18 +108,36 @@ def motion_score(centers: np.ndarray, areas: np.ndarray,
     valid = ~np.isnan(centers[:, :, 0]) & (areas >= occlusion_drop * typical) & (areas > 0)
     disp = np.full(n_frames, np.nan)
     dlog = np.full(n_frames, np.nan)
+    lag = max(1, int(motion_lag))
     for f in range(1, n_frames):
-        both = valid[f] & valid[f - 1]
-        if not both.any():
-            continue
-        disp[f] = np.median(np.linalg.norm(centers[f, both] - centers[f - 1, both], axis=1))
-        dlog[f] = np.median(np.abs(np.log(areas[f, both] / areas[f - 1, both])))
+        displacements = []
+        area_changes = []
+        for previous in sorted({f - 1, max(0, f - lag)}):
+            both = valid[f] & valid[previous]
+            if not both.any():
+                continue
+            displacements.append(
+                float(np.median(np.linalg.norm(
+                    centers[f, both] - centers[previous, both], axis=1
+                )))
+            )
+            area_changes.append(
+                float(np.median(np.abs(np.log(
+                    areas[f, both] / areas[previous, both]
+                ))))
+            )
+        if displacements:
+            # A short-baseline vote preserves sudden-motion sensitivity while
+            # the lagged vote catches slow deliberate assembly motion.
+            disp[f] = max(displacements)
+            dlog[f] = max(area_changes)
     disp[0], dlog[0] = disp[1], dlog[1]
     return median_filter(disp), median_filter(dlog)
 
 
 def cloud_motion_mm(cloud_root: Path, frames: list[str], part: str,
-                    max_points: int = 4000, seed: int = 0) -> np.ndarray:
+                    max_points: int = 4000, seed: int = 0,
+                    motion_lag: int = 3) -> np.ndarray:
     """Median NN distance (mm) from each frame's part cloud to the previous one.
 
     Pure visibility change keeps the visible points on the same physical
@@ -125,14 +162,36 @@ def cloud_motion_mm(cloud_root: Path, frames: list[str], part: str,
         return points
 
     out = np.full(len(frames), np.nan)
-    previous = load(frames[0])
+    clouds: list[np.ndarray | None] = []
+    lag = max(1, int(motion_lag))
+    previous_valid: int | None = None
+    for timestamp in frames:
+        clouds.append(load(timestamp))
     for f in range(1, len(frames)):
-        current = load(frames[f])
-        if current is not None and previous is not None:
-            distances, _ = cKDTree(previous).query(current, k=1)
-            out[f] = float(np.median(distances)) * 1000.0
-        if current is not None:
-            previous = current
+        current = clouds[f]
+        if current is None:
+            continue
+        comparisons = []
+        indices = {f - 1, max(0, f - lag)}
+        if previous_valid is not None:
+            indices.add(previous_valid)
+        for previous in sorted(indices):
+            target = clouds[previous]
+            if target is None:
+                continue
+            forward, _ = cKDTree(target).query(current, k=1)
+            reverse, _ = cKDTree(current).query(target, k=1)
+            # Visibility changes move a partial cloud's centroid and make one
+            # directed NN residual large even when the physical part stayed
+            # fixed. Real rigid motion raises both directed residuals. The
+            # smaller median is therefore an occlusion-robust motion veto.
+            surface_shift = min(
+                float(np.median(forward)), float(np.median(reverse))
+            ) * 1000.0
+            comparisons.append(surface_shift)
+        if comparisons:
+            out[f] = max(comparisons)
+        previous_valid = f
     out[0] = out[1]
     return median_filter(out, 3)
 
@@ -142,10 +201,29 @@ def hysteresis_states(disp: np.ndarray, dlog: np.ndarray, d3d: np.ndarray,
     """static/moving with enter/exit dwell; unobserved frames keep the latch."""
     hot_2d = (disp > cfg.disp_hi) | (dlog > cfg.area_hi)
     cold_2d = (disp < cfg.disp_lo) & (dlog < cfg.area_lo)
-    # The 3D surface check vetoes occlusion-induced 2D motion; where no cloud
-    # pair exists the 2D vote stands alone.
-    hot = np.where(np.isnan(d3d), hot_2d, hot_2d & (d3d > cfg.surf_hi_mm))
-    cold = np.where(np.isnan(d3d), cold_2d, cold_2d | (d3d < cfg.surf_lo_mm))
+    strong_2d = (
+        (disp > cfg.disp_force_hi) | (dlog > cfg.area_force_hi)
+    )
+    # Strong multi-view silhouette motion can recover an in-place rotation for
+    # which nearest-neighbour cloud displacement stays below ``surf_hi_mm``.
+    # It must not, however, override a cloud that is still at the static noise
+    # floor: hand occlusion and mask fragmentation can move a bbox by dozens of
+    # pixels while the physical surface remains fixed.  The intermediate
+    # ``surf_force_min_mm`` band preserves rotation sensitivity without
+    # unlocking a previously static pose on contradictory evidence.
+    surf_force_min_mm = float(getattr(
+        cfg, "surf_force_min_mm", 0.5 * float(cfg.surf_lo_mm)
+    ))
+    cloud_available = np.isfinite(d3d)
+    strong_2d_with_support = strong_2d & (
+        ~cloud_available | (d3d > surf_force_min_mm)
+    )
+    hot = strong_2d_with_support | np.where(
+        cloud_available, hot_2d & (d3d > cfg.surf_hi_mm), hot_2d
+    )
+    cold = ~hot & np.where(
+        cloud_available, cold_2d | (d3d < cfg.surf_lo_mm), cold_2d
+    )
     states = []
     moving = False
     run = 0
@@ -224,23 +302,57 @@ def ranges_of(states: list[str], name: str, start: int) -> list[list[int]]:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--config", default=str(ROOT / "configs" / "pose_data_1_8view.json")
-    )
+    parser.add_argument("--config", required=True)
     parser.add_argument("--min-px", type=int, default=800, help="min mask pixels for a view to count as visible")
     parser.add_argument("--disp-hi", type=float, default=6.0, help="px/frame to enter moving")
     parser.add_argument("--disp-lo", type=float, default=2.5, help="px/frame to exit moving")
+    parser.add_argument(
+        "--disp-force-hi", type=float, default=12.0,
+        help="robust multi-view displacement that does not require a 3D vote",
+    )
     parser.add_argument("--area-hi", type=float, default=0.10, help="|dlog area| to enter moving")
     parser.add_argument("--area-lo", type=float, default=0.04, help="|dlog area| to exit moving")
+    parser.add_argument(
+        "--area-force-hi", type=float, default=0.20,
+        help="robust area change that does not require a 3D vote",
+    )
     parser.add_argument("--surf-hi-mm", type=float, default=6.0, help="3D surface shift to enter moving")
     parser.add_argument("--surf-lo-mm", type=float, default=4.0, help="3D surface shift to exit moving")
+    parser.add_argument(
+        "--surf-force-min-mm", type=float, default=2.0,
+        help=(
+            "minimum 3D shift required for strong 2D motion to bypass the "
+            "normal surface-enter threshold"
+        ),
+    )
     parser.add_argument("--dwell-on", type=int, default=2)
     parser.add_argument("--dwell-off", type=int, default=4)
+    parser.add_argument(
+        "--motion-lag", type=int, default=3,
+        help="additional frame baseline used to detect slow assembly motion",
+    )
+    parser.add_argument(
+        "--motion-baseline-seconds", type=float, default=0.4,
+        help="FPS-aware lag when frames.fps is present in the pose config",
+    )
+    parser.add_argument("--dwell-on-seconds", type=float, default=0.25)
+    parser.add_argument("--dwell-off-seconds", type=float, default=0.6)
     parser.add_argument("--occlusion-ratio", type=float, default=0.35)
     parser.add_argument("--assembled-tol-m", type=float, default=0.03)
     args = parser.parse_args()
 
     cfg = load_json(Path(args.config))
+    timeline_fps = float(cfg.get("frames", {}).get("fps", 0.0) or 0.0)
+    if timeline_fps > 0.0:
+        args.motion_lag = max(
+            1, int(round(timeline_fps * args.motion_baseline_seconds))
+        )
+        args.dwell_on = max(
+            1, int(round(timeline_fps * args.dwell_on_seconds))
+        )
+        args.dwell_off = max(
+            1, int(round(timeline_fps * args.dwell_off_seconds))
+        )
     views = cfg["views"]
     start, end = int(cfg["frames"]["start"]), int(cfg["frames"]["end"])
     frames = [f"{f:06d}" for f in range(start, end + 1)]
@@ -250,7 +362,15 @@ def main() -> None:
         "point_cloud_root", Path(cfg["output_root"]) / "parts_ply" / cfg["recon_backend"]))
     body = cfg["reference_part"]
 
-    obs = mask_observations(mask_root, frames, views, part_ids, args.min_px)
+    view_quality = cfg.get("view_quality", {})
+    obs = mask_observations(
+        mask_root,
+        frames,
+        views,
+        part_ids,
+        int(view_quality.get("minimum_full_mask_pixels", args.min_px)),
+        float(view_quality.get("maximum_mask_area_ratio", 4.0)),
+    )
 
     body_centroids = [cloud_centroid(cloud_root, t, body) for t in frames]
     report = {
@@ -264,8 +384,12 @@ def main() -> None:
     for part in cfg["parts"]:
         centers, areas = obs["centers"][part], obs["areas"][part]
         visible = (~np.isnan(centers[:, :, 0])).sum(axis=1)
-        disp, dlog = motion_score(centers, areas)
-        d3d = cloud_motion_mm(cloud_root, frames, part)
+        disp, dlog = motion_score(
+            centers, areas, motion_lag=args.motion_lag
+        )
+        d3d = cloud_motion_mm(
+            cloud_root, frames, part, motion_lag=args.motion_lag
+        )
         states = hysteresis_states(disp, dlog, d3d, visible, args)
         occluded = occlusion_flags(areas, visible, args.occlusion_ratio)
         states = [("occluded" if occluded[f] and states[f] == "static" else states[f])

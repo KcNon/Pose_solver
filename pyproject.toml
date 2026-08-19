@@ -1,6 +1,6 @@
 [project]
 name = "pose-solver"
-version = "0.1.0"
+version = "0.2.0"
 description = "Articulated object part pose via DA3 depth + SAM3 masks + ICP"
 requires-python = ">=3.10"
 dependencies = [
@@ -22,6 +22,9 @@ dependencies = [
     "sam3",
 ]
 
+[project.scripts]
+pose-solver = "pose_solver.cli:main"
+
 [tool.uv.sources]
 sam3 = { path = "../sam3", editable = true }
 
@@ -30,4 +33,4 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["common"]
+packages = ["common", "pose_solver", "scripts", "tools"]

@@ -37,10 +37,23 @@ def view_names(config: dict[str, Any] | None = None) -> list[str]:
     return views
 
 
+# Palette entries for part names PART_COLORS does not know. Only the label id
+# carries meaning downstream -- the colour is for humans reading the PNG -- so an
+# unknown part gets a distinct hue by position instead of raising KeyError and
+# restricting this module to one dataset's part names.
+_FALLBACK_COLORS: list[list[int]] = [
+    [255, 59, 48], [52, 199, 89], [0, 122, 255], [255, 149, 0],
+    [175, 82, 222], [255, 214, 10], [48, 209, 88], [191, 90, 242],
+]
+
+
 def parts_meta(parts: list[str] | None = None) -> dict[str, dict[str, Any]]:
     parts = parts or DEFAULT_PARTS
     return {
-        name: {"id": i + 1, "color": PART_COLORS[name]}
+        name: {
+            "id": i + 1,
+            "color": PART_COLORS.get(name, _FALLBACK_COLORS[i % len(_FALLBACK_COLORS)]),
+        }
         for i, name in enumerate(parts)
     }
 
@@ -137,8 +150,8 @@ def qwen_bboxes_from_json(masks_dir: str, timestamp: str, view: str) -> dict[str
 def build_palette(parts: list[str] | None = None) -> list[int]:
     """Flat RGB list (256*3) for PIL palette mode; index 0 = background."""
     flat = [0, 0, 0]
-    for name in (parts or DEFAULT_PARTS):
-        r, g, b = PART_COLORS[name]
+    for meta in parts_meta(parts).values():
+        r, g, b = meta["color"]
         flat.extend([r, g, b])
     while len(flat) < 256 * 3:
         flat.append(0)

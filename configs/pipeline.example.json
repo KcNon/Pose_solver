@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "dataset": "example_object",
+  "input": {
+    "frames_dir": "/path/to/dataset/frames",
+    "views": ["camera_0", "camera_1", "camera_2", "camera_3"],
+    "frame_range": [0, 300],
+    "videos": {
+      "camera_0": "/path/to/dataset/videos/camera_0.mp4",
+      "camera_1": "/path/to/dataset/videos/camera_1.mp4",
+      "camera_2": "/path/to/dataset/videos/camera_2.mp4",
+      "camera_3": "/path/to/dataset/videos/camera_3.mp4"
+    },
+    "sample_fps": "source",
+    "sync_offsets_s": {}
+  },
+  "parts": {
+    "main": {
+      "id": 1,
+      "mesh": "/path/to/dataset/meshes/main.glb",
+      "prompts": ["main object body"],
+      "appearance_hint": "auto",
+      "reference": true
+    },
+    "part": {
+      "id": 2,
+      "mesh": "/path/to/dataset/meshes/part.glb",
+      "prompts": ["detachable object part"],
+      "appearance_hint": "auto"
+    }
+  },
+  "output": {"root": "/path/to/experiments/example_object"},
+  "runtime": {"devices": [6, 7]},
+  "models": {
+    "qwen_python": "/path/to/qwen/.venv/bin/python",
+    "qwen_model": "/path/to/Qwen3-VL",
+    "sam_python": "/path/to/sam3/.venv/bin/python",
+    "sam_checkpoint": "/path/to/sam3.pt",
+    "da3_python": "/path/to/depth-anything-3/.venv/bin/python"
+  },
+  "mask": {"mode": "run"},
+  "depth": {"mode": "run"},
+  "pose": {"mode": "run"}
+}

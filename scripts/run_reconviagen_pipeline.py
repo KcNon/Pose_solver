@@ -10,7 +10,6 @@ import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CONFIG = ROOT / "configs" / "reconviagen_objects.json"
 STAGES = ROOT / "tools" / "stages" / "reconviagen"
 
 
@@ -28,7 +27,7 @@ def _ready(paths: list[Path], force: bool) -> bool:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default=str(DEFAULT_CONFIG))
+    parser.add_argument("--config", required=True)
     parser.add_argument(
         "--stage",
         choices=("all", "frames", "masks", "rgba", "mesh"),

@@ -192,6 +192,130 @@ def _proxy_cylindrical_container(spec: dict[str, Any]) -> tuple[trimesh.Trimesh,
     }
 
 
+def _greedy_voxel_boxes(
+    voxel_grid: trimesh.voxel.VoxelGrid,
+) -> list[trimesh.Trimesh]:
+    """Merge occupied surface voxels into axis-aligned convex boxes."""
+    occupied = {
+        tuple(int(value) for value in index)
+        for index in np.asarray(voxel_grid.sparse_indices)
+    }
+    boxes: list[trimesh.Trimesh] = []
+    pitch = np.asarray(voxel_grid.pitch, dtype=np.float64)
+    while occupied:
+        x0, y0, z0 = min(occupied)
+        x1 = x0
+        while (x1 + 1, y0, z0) in occupied:
+            x1 += 1
+        y1 = y0
+        while all(
+            (x, y1 + 1, z0) in occupied
+            for x in range(x0, x1 + 1)
+        ):
+            y1 += 1
+        z1 = z0
+        while all(
+            (x, y, z1 + 1) in occupied
+            for x in range(x0, x1 + 1)
+            for y in range(y0, y1 + 1)
+        ):
+            z1 += 1
+        block = [
+            (x, y, z)
+            for x in range(x0, x1 + 1)
+            for y in range(y0, y1 + 1)
+            for z in range(z0, z1 + 1)
+        ]
+        occupied.difference_update(block)
+        endpoints = voxel_grid.indices_to_points(
+            np.asarray([[x0, y0, z0], [x1, y1, z1]], dtype=int)
+        )
+        center = np.mean(endpoints, axis=0)
+        extents = pitch * np.asarray(
+            [x1 - x0 + 1, y1 - y0 + 1, z1 - z0 + 1],
+            dtype=np.float64,
+        )
+        transform = np.eye(4, dtype=np.float64)
+        transform[:3, 3] = center
+        boxes.append(trimesh.creation.box(extents=extents, transform=transform))
+    return boxes
+
+
+def _proxy_voxel_shell(
+    visual_mesh: trimesh.Trimesh,
+    spec: dict[str, Any],
+) -> tuple[trimesh.Trimesh, dict[str, Any]]:
+    """Create a watertight compound shell from a non-manifold recon mesh.
+
+    Surface voxels are retained without filling their interior. This avoids
+    inventing a solid volume for reconstructed covers, cups, and housings,
+    while every exported component is a valid convex watertight box.
+    """
+    resolution = int(spec.get("resolution", 24))
+    if resolution < 8:
+        raise ValueError("voxel_shell resolution must be at least 8")
+    longest_extent = float(np.max(np.asarray(visual_mesh.extents, dtype=float)))
+    pitch = float(spec.get("pitch_m", longest_extent / resolution))
+    if pitch <= 0.0:
+        raise ValueError("voxel_shell pitch_m must be positive")
+    grid = visual_mesh.voxelized(pitch)
+    voxel_count = int(len(grid.sparse_indices))
+    if voxel_count == 0:
+        raise ValueError("voxel_shell produced no occupied surface voxels")
+    boxes = _greedy_voxel_boxes(grid)
+    mesh = trimesh.util.concatenate(boxes)
+    return mesh, {
+        "type": "voxel_shell",
+        "resolution": resolution,
+        "pitch_m": pitch,
+        "surface_voxels": voxel_count,
+        "convex_components": len(boxes),
+        "source_watertight": bool(visual_mesh.is_watertight),
+    }
+
+
+def _proxy_filtered_surface(
+    visual_mesh: trimesh.Trimesh, spec: dict[str, Any]
+) -> tuple[trimesh.Trimesh, dict[str, Any]]:
+    """Discard tiny disconnected reconstruction fragments without filling cavities."""
+
+    mesh = visual_mesh.copy()
+    labels = trimesh.graph.connected_component_labels(
+        mesh.face_adjacency, node_count=len(mesh.faces)
+    )
+    component_faces = np.bincount(labels, minlength=int(labels.max()) + 1)
+    component_areas = np.bincount(
+        labels,
+        weights=np.asarray(mesh.area_faces, dtype=np.float64),
+        minlength=len(component_faces),
+    )
+    minimum_faces = max(1, int(spec.get("minimum_component_faces", 1)))
+    minimum_area = max(
+        0.0, float(spec.get("minimum_component_area_m2", 0.0))
+    )
+    keep_components = (
+        (component_faces >= minimum_faces)
+        & (component_areas >= minimum_area)
+    )
+    if not np.any(keep_components):
+        raise ValueError("filtered_surface removed every mesh component")
+    keep_faces = keep_components[labels]
+    mesh.update_faces(keep_faces)
+    mesh.remove_unreferenced_vertices()
+    return mesh, {
+        "type": "filtered_surface",
+        "input_components": int(len(component_faces)),
+        "kept_components": int(np.count_nonzero(keep_components)),
+        "minimum_component_faces": minimum_faces,
+        "minimum_component_area_m2": minimum_area,
+        "kept_face_fraction": float(np.mean(keep_faces)),
+        "kept_area_fraction": float(
+            component_areas[keep_components].sum()
+            / max(float(component_areas.sum()), 1e-12)
+        ),
+    }
+
+
 def create_collision_proxy(
     visual_mesh: trimesh.Trimesh,
     spec: dict[str, Any] | None,
@@ -214,6 +338,10 @@ def create_collision_proxy(
             mesh, metadata = _proxy_revolved_solid(spec)
         elif proxy_type == "cylindrical_container":
             mesh, metadata = _proxy_cylindrical_container(spec)
+        elif proxy_type == "voxel_shell":
+            mesh, metadata = _proxy_voxel_shell(visual_mesh, spec)
+        elif proxy_type == "filtered_surface":
+            mesh, metadata = _proxy_filtered_surface(visual_mesh, spec)
         elif proxy_type == "compound":
             components = [
                 create_collision_proxy(visual_mesh, component)
@@ -251,6 +379,86 @@ def create_collision_proxy(
         }
     )
     return mesh, metadata
+
+
+def carve_observed_overlap_components(
+    components: list[trimesh.Trimesh],
+    reference_vertices: np.ndarray,
+    reference_from_part: np.ndarray,
+    *,
+    penetration_tolerance_m: float = 0.001,
+    minimum_reference_vertices: int = 5,
+    maximum_removed_fraction: float = 0.45,
+) -> tuple[list[trimesh.Trimesh], dict[str, Any]]:
+    """Remove compound cells crossed by an observed assembled reference mesh.
+
+    The test is deliberately stricter than proximity: reference surface
+    vertices must lie inside a collision cell after shrinking its bounds by a
+    tolerance. Boundary contact is retained, while a reconstructed false cap
+    crossed by the other observed part is carved away.
+    """
+    if not components:
+        raise ValueError("observed-overlap carving requires components")
+    tolerance = float(penetration_tolerance_m)
+    minimum = int(minimum_reference_vertices)
+    maximum_fraction = float(maximum_removed_fraction)
+    if tolerance < 0.0 or minimum < 1:
+        raise ValueError("invalid observed-overlap carving thresholds")
+    if not 0.0 <= maximum_fraction < 1.0:
+        raise ValueError("maximum_removed_fraction must be in [0, 1)")
+    transform = np.linalg.inv(np.asarray(reference_from_part, dtype=np.float64))
+    vertices = np.asarray(reference_vertices, dtype=np.float64)
+    part_vertices = (
+        vertices @ transform[:3, :3].T + transform[:3, 3]
+    )
+    removed_indices: list[int] = []
+    penetration_counts: list[int] = []
+    for index, component in enumerate(components):
+        bounds = np.asarray(component.bounds, dtype=np.float64)
+        lower = bounds[0] + tolerance
+        upper = bounds[1] - tolerance
+        if np.any(upper <= lower):
+            count = 0
+        else:
+            count = int(
+                np.count_nonzero(
+                    np.all(part_vertices > lower[None, :], axis=1)
+                    & np.all(part_vertices < upper[None, :], axis=1)
+                )
+            )
+        penetration_counts.append(count)
+        if count >= minimum:
+            removed_indices.append(index)
+    removed_fraction = len(removed_indices) / len(components)
+    applied = bool(
+        removed_indices
+        and removed_fraction <= maximum_fraction
+        and len(removed_indices) < len(components)
+    )
+    removed = set(removed_indices) if applied else set()
+    kept = [
+        component
+        for index, component in enumerate(components)
+        if index not in removed
+    ]
+    return kept, {
+        "enabled": True,
+        "applied": applied,
+        "input_components": len(components),
+        "kept_components": len(kept),
+        "removed_components": len(removed) if applied else 0,
+        "candidate_removed_components": len(removed_indices),
+        "candidate_removed_fraction": removed_fraction,
+        "penetration_tolerance_m": tolerance,
+        "minimum_reference_vertices": minimum,
+        "maximum_removed_fraction": maximum_fraction,
+        "maximum_vertices_inside_component": max(penetration_counts, default=0),
+        "rejection_reason": (
+            None
+            if applied or not removed_indices
+            else "candidate removal exceeded safety bound"
+        ),
+    }
 
 
 def rotation_error_deg(a: np.ndarray, b: np.ndarray) -> float:

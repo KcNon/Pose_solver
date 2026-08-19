@@ -12,6 +12,7 @@ from typing import Any
 
 
 from common.io_utils import write_json
+from common.physics_control import dynamic_collision_approximation
 
 # This module is imported only after the CLI has constructed SimulationApp.
 # Omniverse requires that ordering. These values are initialized once by
@@ -155,14 +156,29 @@ def choose_rigid_prim(root: Usd.Prim, preferred_name: str) -> Usd.Prim:
     return preferred[0] if preferred else candidates[0]
 
 
-def configure_collision(root: Usd.Prim, approximation: str) -> list[str]:
+def configure_collision(
+    root: Usd.Prim,
+    approximation: str,
+    *,
+    sdf_resolution: int = 192,
+) -> list[str]:
     configured: list[str] = []
     for prim in Usd.PrimRange(root):
         if not prim.HasAPI(UsdPhysics.CollisionAPI):
             continue
         if prim.IsA(UsdGeom.Mesh):
             mesh_collision = UsdPhysics.MeshCollisionAPI.Apply(prim)
-            mesh_collision.CreateApproximationAttr().Set(approximation)
+            if approximation == "sdf":
+                if sdf_resolution <= 0:
+                    raise ValueError("SDF collision resolution must be positive")
+                mesh_collision.CreateApproximationAttr().Set(
+                    PhysxSchema.Tokens.sdf
+                )
+                PhysxSchema.PhysxSDFMeshCollisionAPI.Apply(
+                    prim
+                ).CreateSdfResolutionAttr().Set(int(sdf_resolution))
+            else:
+                mesh_collision.CreateApproximationAttr().Set(approximation)
         configured.append(str(prim.GetPath()))
     if not configured:
         raise RuntimeError(f"No colliders found below {root.GetPath()}")
@@ -626,7 +642,11 @@ def run_insertion(
         body_rigid = choose_rigid_prim(body_root, container)
         inserted_rigid = choose_rigid_prim(inserted_root, inserted)
         body_colliders = configure_collision(body_root, "none")
-        inserted_colliders = configure_collision(inserted_root, "convexDecomposition")
+        inserted_colliders = configure_collision(
+            inserted_root,
+            dynamic_collision_approximation(simulation),
+            sdf_resolution=int(simulation.get("sdf_resolution", 192)),
+        )
         removed_articulations = {
             container: remove_articulation_apis(body_root),
             inserted: remove_articulation_apis(inserted_root),
@@ -655,9 +675,15 @@ def run_insertion(
             MANIFEST["assembled_T_body_from_part"][inserted],
             dtype=np.float64,
         ).copy()
-        inserted_axis_body_before = (
-            target_body[:3, :3] @ np.array([0.0, 1.0, 0.0])
+        inserted_axis_part = np.asarray(
+            simulation.get("inserted_axis_part", [0.0, 1.0, 0.0]),
+            dtype=np.float64,
         )
+        inserted_axis_norm = float(np.linalg.norm(inserted_axis_part))
+        if inserted_axis_norm <= 1e-12:
+            raise ValueError("simulation.inserted_axis_part must be non-zero")
+        inserted_axis_part /= inserted_axis_norm
+        inserted_axis_body_before = target_body[:3, :3] @ inserted_axis_part
         container_up_body = np.asarray(
             simulation["up_axis_body"], dtype=np.float64
         )
@@ -676,9 +702,7 @@ def run_insertion(
                 inserted_axis_body_before, container_up_body
             )
             target_body[:3, :3] = correction @ target_body[:3, :3]
-        inserted_axis_body_after = (
-            target_body[:3, :3] @ np.array([0.0, 1.0, 0.0])
-        )
+        inserted_axis_body_after = target_body[:3, :3] @ inserted_axis_part
         axis_alignment_deg_after = math.degrees(math.acos(float(np.clip(
             np.dot(inserted_axis_body_after, container_up_body),
             -1.0,
@@ -769,6 +793,7 @@ def run_insertion(
                 ),
                 "angle_before_deg": axis_alignment_deg_before,
                 "angle_after_deg": axis_alignment_deg_after,
+                "inserted_axis_part": inserted_axis_part.tolist(),
                 "center_body_m": target_body[:3, 3].tolist(),
             },
             "observed_replay": replay_result,

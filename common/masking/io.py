@@ -51,6 +51,15 @@ def track_path(root: Path, part: str, timestamp: str, view: str) -> Path:
     return root / part / timestamp / f"{view}.png"
 
 
+def validated_seed_path(
+    work_root: Path,
+    part: str,
+    timestamp: str,
+    view: str,
+) -> Path:
+    return work_root / "validated_seeds" / part / timestamp / f"{view}.png"
+
+
 def save_binary_mask(path: Path, mask: np.ndarray) -> None:
     from PIL import Image
 

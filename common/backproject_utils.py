@@ -5,9 +5,10 @@ import os
 
 import cv2
 import numpy as np
+from PIL import Image
 
 from common.geom import backproject_view
-from common.mask_io import PART_COLORS, VIEW_NAMES, part_id_map, view_names
+from common.mask_io import VIEW_NAMES, part_id_map, parts_meta, view_names
 
 
 def load_palette_masks(
@@ -16,27 +17,108 @@ def load_palette_masks(
     parts: list[str],
     depth_hw: tuple[int, int],
     views: list[str] | None = None,
+    part_ids: dict[str, int] | None = None,
+    resize_mode: str = "nearest",
+    coverage_threshold: float = 0.25,
+    coverage_parts: list[str] | None = None,
 ) -> dict[str, list[np.ndarray]]:
-    """Load per-view boolean masks resized to depth resolution."""
+    """Load per-view boolean masks resized to depth resolution.
+
+    ``coverage`` downsamples each part independently with area integration and
+    assigns a target pixel to the part with greatest coverage.  It preserves
+    thin structures that can disappear under categorical nearest-neighbour
+    sampling while keeping the resulting part masks mutually exclusive.
+    """
     h, w = depth_hw
-    ids = part_id_map(parts)
+    if resize_mode not in {"nearest", "coverage", "hybrid"}:
+        raise ValueError(
+            "mask resize_mode must be 'nearest', 'coverage', or 'hybrid'"
+        )
+    if not 0.0 < float(coverage_threshold) <= 1.0:
+        raise ValueError("mask coverage_threshold must be in (0, 1]")
+    selected_coverage_parts = set(coverage_parts or parts)
+    unknown_coverage_parts = selected_coverage_parts.difference(parts)
+    if unknown_coverage_parts:
+        raise ValueError(
+            f"unknown coverage mask parts: {sorted(unknown_coverage_parts)}"
+        )
+    ids = (
+        {part: int(part_ids[part]) for part in parts}
+        if part_ids is not None
+        else part_id_map(parts)
+    )
+    colors = {name: meta["color"] for name, meta in parts_meta(parts).items()}
     out: dict[str, list[np.ndarray]] = {p: [] for p in parts}
     for vname in (views or VIEW_NAMES):
         path = os.path.join(masks_root, timestamp, f"{vname}.png")
         if not os.path.exists(path):
             raise FileNotFoundError(path)
-        image = cv2.imread(path, cv2.IMREAD_UNCHANGED)
-        if image is None:
-            raise RuntimeError(f"cannot read {path}")
+        # PIL preserves the integer indices of mode-P masks.  OpenCV expands
+        # those files to BGR and can alias distinct labels whose display
+        # palette happens to reuse a legacy colour (for example blade/lid).
+        image = np.asarray(Image.open(path))
         if image.ndim == 2:
-            small = cv2.resize(image, (w, h), interpolation=cv2.INTER_NEAREST)
-            for part in parts:
-                out[part].append(small == ids[part])
+            full_masks = [image == ids[part] for part in parts]
         else:
-            small = cv2.resize(image, (w, h), interpolation=cv2.INTER_NEAREST)
+            full_masks = []
             for part in parts:
-                bgr = np.array(PART_COLORS[part][::-1], dtype=np.uint8)
-                out[part].append(np.all(small[:, :, :3] == bgr, axis=2))
+                rgb = np.array(colors[part], dtype=np.uint8)
+                full_masks.append(np.all(image[:, :, :3] == rgb, axis=2))
+        nearest = [
+            cv2.resize(
+                mask.astype(np.uint8),
+                (w, h),
+                interpolation=cv2.INTER_NEAREST,
+            ).astype(bool)
+            for mask in full_masks
+        ]
+        if resize_mode == "nearest":
+            resized = nearest
+        else:
+            interpolation = (
+                cv2.INTER_AREA
+                if h <= image.shape[0] and w <= image.shape[1]
+                else cv2.INTER_LINEAR
+            )
+            coverage = np.stack([
+                cv2.resize(
+                    mask.astype(np.float32),
+                    (w, h),
+                    interpolation=interpolation,
+                )
+                for mask in full_masks
+            ])
+            if resize_mode == "coverage":
+                winner = np.argmax(coverage, axis=0)
+                maximum = np.max(coverage, axis=0)
+                resized = [
+                    (winner == index) & (
+                        maximum >= float(coverage_threshold)
+                    )
+                    for index in range(len(parts))
+                ]
+            else:
+                # Preserve every categorical nearest-neighbour assignment, then
+                # let selected thin parts claim only otherwise-background cells.
+                resized = [mask.copy() for mask in nearest]
+                occupied = np.logical_or.reduce(resized)
+                selected = [
+                    index for index, part in enumerate(parts)
+                    if part in selected_coverage_parts
+                ]
+                if selected:
+                    selected_coverage = coverage[selected]
+                    winner = np.argmax(selected_coverage, axis=0)
+                    maximum = np.max(selected_coverage, axis=0)
+                    eligible = (~occupied) & (
+                        maximum >= float(coverage_threshold)
+                    )
+                    for local_index, part_index in enumerate(selected):
+                        resized[part_index] |= eligible & (
+                            winner == local_index
+                        )
+        for part, mask in zip(parts, resized):
+            out[part].append(mask)
     return out
 
 

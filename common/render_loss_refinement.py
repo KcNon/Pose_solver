@@ -27,6 +27,14 @@ class RenderObservation:
     extrinsics: np.ndarray
     target_mask: np.ndarray
     observed_depth: np.ndarray | None = None
+    # Depth support and silhouette support are deliberately independent.  A
+    # monocular-depth failure must not discard an otherwise accurate mask, but
+    # the same depth image can still be useful for identifying foreground
+    # occluders.  ``depth_loss_enabled`` controls only the metric term.
+    depth_loss_enabled: bool = True
+    # Pixels occupied by another labelled rigid part are known occluders for
+    # this part.  They are unknown, not silhouette background.
+    known_occluder_mask: np.ndarray | None = None
 
 
 def apply_world_pose_delta(
@@ -56,6 +64,36 @@ def world_pose_delta_vector(reference: np.ndarray, pose: np.ndarray) -> np.ndarr
     )
 
 
+def clamp_pose_step(
+    reference: np.ndarray,
+    pose: np.ndarray,
+    *,
+    maximum_translation_m: float,
+    maximum_rotation_deg: float,
+) -> np.ndarray:
+    """Move from ``reference`` toward ``pose`` without exceeding SE(3) limits."""
+
+    reference = np.asarray(reference, dtype=np.float64)
+    pose = np.asarray(pose, dtype=np.float64)
+    delta = world_pose_delta_vector(reference, pose)
+    translation = delta[:3]
+    translation_norm = float(np.linalg.norm(translation))
+    safe_translation = max(0.0, maximum_translation_m - 1e-9)
+    if translation_norm > safe_translation:
+        translation *= safe_translation / translation_norm
+    rotation = delta[3:]
+    rotation_deg = float(np.degrees(np.linalg.norm(rotation)))
+    safe_rotation_deg = max(0.0, maximum_rotation_deg - 1e-7)
+    if rotation_deg > safe_rotation_deg:
+        rotation *= safe_rotation_deg / rotation_deg
+    result = np.eye(4)
+    result[:3, :3] = (
+        Rotation.from_rotvec(rotation).as_matrix() @ reference[:3, :3]
+    )
+    result[:3, 3] = reference[:3, 3] + translation
+    return result
+
+
 def symmetry_aware_rotation_directions(
     pose: np.ndarray,
     symmetry_axis_part: np.ndarray | None,
@@ -79,6 +117,88 @@ def symmetry_aware_rotation_directions(
     second = np.cross(axis, first)
     second /= max(float(np.linalg.norm(second)), 1e-12)
     return [first, second]
+
+
+def coarse_reacquire_pose(
+    objective: "MultiViewRenderObjective",
+    initial_pose: np.ndarray,
+    *,
+    views: list[str],
+    translation_radii_m: list[float],
+    rotation_angles_deg: list[float],
+    symmetry_axis_part: np.ndarray | None,
+    optimize_rotation: bool = True,
+    alternating_passes: int = 2,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Deterministically escape a bad local pose basin using mask evidence.
+
+    The regular frame optimizer is deliberately local.  When tracking leaves
+    the image and later re-enters, however, its initial pose can be outside
+    that basin.  This coarse search alternates a 3-D translation lattice and
+    broad world-axis rotations, scoring every candidate in all supplied mask
+    views.  A bounded local refinement still runs afterwards.
+    """
+
+    best = np.asarray(initial_pose, dtype=np.float64).copy()
+    best_data = objective.evaluate(best, views)
+    initial_data = best_data
+    evaluations = 1
+    directions = (
+        symmetry_aware_rotation_directions(best, symmetry_axis_part)
+        if optimize_rotation
+        else []
+    )
+    for _ in range(max(1, int(alternating_passes))):
+        for radius in translation_radii_m:
+            radius = abs(float(radius))
+            if radius <= 0.0:
+                continue
+            center = best.copy()
+            for dx in (-radius, 0.0, radius):
+                for dy in (-radius, 0.0, radius):
+                    for dz in (-radius, 0.0, radius):
+                        if dx == dy == dz == 0.0:
+                            continue
+                        candidate = center.copy()
+                        candidate[:3, 3] += [dx, dy, dz]
+                        data = objective.evaluate(candidate, views)
+                        evaluations += 1
+                        if float(data["loss"]) < float(best_data["loss"]):
+                            best, best_data = candidate, data
+        if optimize_rotation:
+            # Recompute observable axes after translation/rotation updates.
+            directions = symmetry_aware_rotation_directions(
+                best, symmetry_axis_part
+            )
+            center = best.copy()
+            for angle_deg in rotation_angles_deg:
+                angle = np.deg2rad(abs(float(angle_deg)))
+                if angle <= 0.0:
+                    continue
+                for direction in directions:
+                    for sign in (-1.0, 1.0):
+                        candidate = center.copy()
+                        increment = Rotation.from_rotvec(
+                            sign * angle * direction
+                        ).as_matrix()
+                        candidate[:3, :3] = increment @ candidate[:3, :3]
+                        data = objective.evaluate(candidate, views)
+                        evaluations += 1
+                        if float(data["loss"]) < float(best_data["loss"]):
+                            best, best_data = candidate, data
+    delta = world_pose_delta_vector(initial_pose, best)
+    return best, {
+        "evaluations": evaluations,
+        "baseline": initial_data,
+        "selected": best_data,
+        "loss_improvement": float(
+            initial_data["loss"] - best_data["loss"]
+        ),
+        "translation_delta_norm_m": float(np.linalg.norm(delta[:3])),
+        "rotation_delta_deg": float(
+            np.degrees(np.linalg.norm(delta[3:]))
+        ),
+    }
 
 
 def rasterize_surface_points(
@@ -126,6 +246,40 @@ def rasterize_surface_points(
     return mask, depth_buffer
 
 
+def foreground_occlusion_mask(
+    predicted_depth: np.ndarray,
+    observed_depth: np.ndarray,
+    *,
+    margin_m: float = 0.015,
+    dilation_pixels: int = 1,
+) -> np.ndarray:
+    """Pixels where observed scene geometry is in front of the rendered part.
+
+    SAM supplies a modal (visible-only) mask while mesh rendering is amodal.
+    Treating a hand-covered part pixel as a false positive biases scale toward
+    smaller meshes and can pull pose toward the exposed fragment.  This mask
+    marks those pixels as unknown rather than background.
+    """
+
+    predicted = np.asarray(predicted_depth, dtype=np.float32)
+    observed = np.asarray(observed_depth, dtype=np.float32)
+    occluded = (
+        np.isfinite(predicted)
+        & np.isfinite(observed)
+        & (observed > 1e-4)
+        & (observed + float(margin_m) < predicted)
+    )
+    dilation_pixels = max(0, int(dilation_pixels))
+    if dilation_pixels and occluded.any():
+        size = 2 * dilation_pixels + 1
+        occluded = cv2.dilate(
+            occluded.astype(np.uint8),
+            np.ones((size, size), np.uint8),
+            iterations=1,
+        ).astype(bool)
+    return occluded
+
+
 class MultiViewRenderObjective:
     def __init__(
         self,
@@ -159,7 +313,7 @@ class MultiViewRenderObjective:
         dilation = int(self.config.get("dilation_pixels", 1))
         rows: list[dict[str, Any]] = []
         for observation in selected:
-            predicted, predicted_depth = rasterize_surface_points(
+            full_predicted, predicted_depth = rasterize_surface_points(
                 points_world,
                 observation.intrinsics,
                 observation.extrinsics,
@@ -167,13 +321,43 @@ class MultiViewRenderObjective:
                 dilation_pixels=dilation,
             )
             target = np.asarray(observation.target_mask, dtype=bool)
+            occluded = np.zeros_like(target, dtype=bool)
+            if observation.known_occluder_mask is not None:
+                known = np.asarray(
+                    observation.known_occluder_mask, dtype=bool
+                )
+                if known.shape != target.shape:
+                    raise ValueError(
+                        "known_occluder_mask must match target_mask shape"
+                    )
+                occluded |= known & full_predicted
+            if (
+                self.config.get("occlusion_aware", False)
+                and observation.observed_depth is not None
+            ):
+                occluded |= foreground_occlusion_mask(
+                    predicted_depth,
+                    observation.observed_depth,
+                    margin_m=float(
+                        self.config.get("occlusion_depth_margin_m", 0.015)
+                    ),
+                    dilation_pixels=dilation,
+                )
+            # Never remove an observed target pixel: depth is least reliable
+            # on thin/transparent object surfaces, and the segmentation is the
+            # direct evidence that the part is visible there.
+            occluded &= ~target
+            predicted = full_predicted & ~occluded
             iou, contour, _ = silhouette_metrics(predicted, target)
             intersection = int(np.logical_and(predicted, target).sum())
             coverage = float(intersection / max(int(target.sum()), 1))
             precision = float(intersection / max(int(predicted.sum()), 1))
             depth_loss = None
             depth_pixels = 0
-            if observation.observed_depth is not None:
+            if (
+                observation.depth_loss_enabled
+                and observation.observed_depth is not None
+            ):
                 observed_depth = np.asarray(
                     observation.observed_depth, dtype=np.float32
                 )
@@ -210,6 +394,10 @@ class MultiViewRenderObjective:
                     "depth_pixels": depth_pixels,
                     "target_pixels": int(target.sum()),
                     "rendered_pixels": int(predicted.sum()),
+                    "full_rendered_pixels": int(full_predicted.sum()),
+                    "ignored_occluded_pixels": int(
+                        np.logical_and(full_predicted, occluded).sum()
+                    ),
                 }
             )
         if not rows:
@@ -227,7 +415,9 @@ class MultiViewRenderObjective:
             keep = np.arange(len(losses))
         return {
             "loss": float(np.mean(losses[keep])),
+            "worst_view_loss": float(np.max(losses)),
             "mean_iou": float(np.mean([rows[index]["iou"] for index in keep])),
+            "worst_view_iou": float(min(row["iou"] for row in rows)),
             "mean_contour_chamfer_px": float(
                 np.mean([rows[index]["contour_chamfer_px"] for index in keep])
             ),
@@ -253,9 +443,19 @@ def refine_pose_coordinate_search(
     maximum_rotation_delta_deg: float,
     minimum_improvement: float,
     maximum_holdout_degradation: float,
+    minimum_refined_iou: float = 0.0,
+    minimum_refined_target_coverage: float = 0.0,
+    minimum_holdout_iou: float = 0.0,
+    minimum_per_view_iou: float = 0.0,
+    maximum_worst_view_loss: float = 1.0e9,
+    previous_pose: np.ndarray | None = None,
+    next_pose: np.ndarray | None = None,
+    maximum_step_translation_m: float | None = None,
+    maximum_step_rotation_deg: float | None = None,
     prior_weight: float = 0.03,
     temporal_delta_reference: np.ndarray | None = None,
     temporal_weight: float = 0.02,
+    orientation_constraints: list[dict[str, Any]] | None = None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """Bounded derivative-free refinement with an independent holdout gate."""
     initial = np.asarray(initial_pose, dtype=np.float64)
@@ -273,7 +473,88 @@ def refine_pose_coordinate_search(
     )
     best_pose = initial.copy()
     best_data = baseline_opt
-    best_total = float(baseline_opt["loss"])
+    boundary_poses = [
+        np.asarray(value, dtype=np.float64)
+        for value in (previous_pose, next_pose)
+        if value is not None
+    ]
+    normalized_orientation_constraints = []
+    for raw_constraint in orientation_constraints or []:
+        axis_part = np.asarray(
+            raw_constraint["axis_part"], dtype=np.float64
+        )
+        target_world = np.asarray(
+            raw_constraint["target_world"], dtype=np.float64
+        )
+        axis_norm = float(np.linalg.norm(axis_part))
+        target_norm = float(np.linalg.norm(target_world))
+        if (
+            axis_part.shape != (3,)
+            or target_world.shape != (3,)
+            or axis_norm <= 1e-12
+            or target_norm <= 1e-12
+        ):
+            raise ValueError(
+                "orientation constraint axes must be non-zero 3-vectors"
+            )
+        minimum = float(raw_constraint.get("minimum_alignment", -1.0))
+        maximum = float(raw_constraint.get("maximum_alignment", 1.0))
+        if not -1.0 <= minimum <= maximum <= 1.0:
+            raise ValueError(
+                "orientation constraint must satisfy "
+                "-1 <= minimum_alignment <= maximum_alignment <= 1"
+            )
+        normalized_orientation_constraints.append({
+            "label": str(raw_constraint.get("label", "direction")),
+            "axis_part": axis_part / axis_norm,
+            "target_world": target_world / target_norm,
+            "minimum_alignment": minimum,
+            "maximum_alignment": maximum,
+        })
+
+    def orientation_alignments(pose: np.ndarray) -> list[dict[str, Any]]:
+        return [
+            {
+                "label": constraint["label"],
+                "alignment": float(np.dot(
+                    pose[:3, :3] @ constraint["axis_part"],
+                    constraint["target_world"],
+                )),
+                "minimum_alignment": constraint["minimum_alignment"],
+                "maximum_alignment": constraint["maximum_alignment"],
+            }
+            for constraint in normalized_orientation_constraints
+        ]
+
+    def violates_orientation(pose: np.ndarray) -> bool:
+        return any(
+            row["alignment"] < row["minimum_alignment"] - 1e-9
+            or row["alignment"] > row["maximum_alignment"] + 1e-9
+            for row in orientation_alignments(pose)
+        )
+
+    def violates_boundary(pose: np.ndarray) -> bool:
+        for boundary in boundary_poses:
+            step = world_pose_delta_vector(boundary, pose)
+            if (
+                maximum_step_translation_m is not None
+                and float(np.linalg.norm(step[:3]))
+                > maximum_step_translation_m + 1e-9
+            ):
+                return True
+            if (
+                maximum_step_rotation_deg is not None
+                and float(np.degrees(np.linalg.norm(step[3:])))
+                > maximum_step_rotation_deg + 1e-9
+            ):
+                return True
+        return False
+
+    best_total = (
+        float("inf")
+        if violates_boundary(initial) or violates_orientation(initial)
+        else float(baseline_opt["loss"])
+    )
     evaluations = 1
     temporal_reference = (
         np.zeros(6, dtype=np.float64)
@@ -283,6 +564,8 @@ def refine_pose_coordinate_search(
 
     def total(pose: np.ndarray) -> tuple[float, dict[str, Any]]:
         nonlocal evaluations
+        if violates_boundary(pose) or violates_orientation(pose):
+            return float("inf"), {}
         delta = world_pose_delta_vector(initial, pose)
         translation_norm = float(np.linalg.norm(delta[:3]))
         rotation_deg = float(np.degrees(np.linalg.norm(delta[3:])))
@@ -352,12 +635,38 @@ def refine_pose_coordinate_search(
     holdout_degradation = float(
         refined_holdout["loss"] - baseline_holdout["loss"]
     )
+    absolute_gate_failures = []
+    if float(best_data.get("mean_iou", 0.0)) < minimum_refined_iou:
+        absolute_gate_failures.append("optimize_iou_below_minimum")
+    if (
+        float(best_data.get("mean_target_coverage", 0.0))
+        < minimum_refined_target_coverage
+    ):
+        absolute_gate_failures.append("optimize_coverage_below_minimum")
+    if (
+        effective_holdout
+        and float(refined_holdout.get("mean_iou", 0.0))
+        < minimum_holdout_iou
+    ):
+        absolute_gate_failures.append("holdout_iou_below_minimum")
+    selected_view_rows = list(best_data.get("views", [])) + list(
+        refined_holdout.get("views", [])
+    )
+    if selected_view_rows and min(
+        float(row.get("iou", 0.0)) for row in selected_view_rows
+    ) < float(minimum_per_view_iou):
+        absolute_gate_failures.append("worst_view_iou_below_minimum")
+    if selected_view_rows and max(
+        float(row.get("loss", float("inf"))) for row in selected_view_rows
+    ) > float(maximum_worst_view_loss):
+        absolute_gate_failures.append("worst_view_loss_above_maximum")
     accepted = bool(
         data_improvement >= minimum_improvement
         and (
             not effective_holdout
             or holdout_degradation <= maximum_holdout_degradation
         )
+        and not absolute_gate_failures
     )
     selected = best_pose if accepted else initial.copy()
     delta = world_pose_delta_vector(initial, selected)
@@ -370,6 +679,24 @@ def refine_pose_coordinate_search(
         "refined_holdout": refined_holdout,
         "optimize_loss_improvement": data_improvement,
         "holdout_loss_degradation": holdout_degradation,
+        "absolute_gate_failures": absolute_gate_failures,
+        "absolute_gates": {
+            "minimum_refined_iou": float(minimum_refined_iou),
+            "minimum_refined_target_coverage": float(
+                minimum_refined_target_coverage
+            ),
+            "minimum_holdout_iou": float(minimum_holdout_iou),
+            "minimum_per_view_iou": float(minimum_per_view_iou),
+            "maximum_worst_view_loss": float(maximum_worst_view_loss),
+        },
+        "trajectory_boundary_gate": {
+            "previous_pose": previous_pose is not None,
+            "next_pose": next_pose is not None,
+            "maximum_step_translation_m": maximum_step_translation_m,
+            "maximum_step_rotation_deg": maximum_step_rotation_deg,
+        },
+        "orientation_constraints": orientation_alignments(selected),
+        "best_pose_before_gates": best_pose.tolist(),
         "translation_delta_m": delta[:3].tolist(),
         "translation_delta_norm_m": float(np.linalg.norm(delta[:3])),
         "rotation_delta_world_rad": delta[3:].tolist(),

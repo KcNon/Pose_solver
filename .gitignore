@@ -6,3 +6,8 @@ outputs
 uv.lock
 mesh
 experiments
+data
+configs/*
+!configs/object9_pose.json
+!configs/pipeline.example.json
+exports

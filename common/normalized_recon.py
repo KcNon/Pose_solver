@@ -96,6 +96,50 @@ def load_recon(cfg: dict, timestamp: str, backend: ReconBackend | None = None) -
     K = d["intrinsic"] if "intrinsic" in d.files else d["intrinsics"]
     E = d["extrinsic"] if "extrinsic" in d.files else d["extrinsics"]
     images = d["image"] if "image" in d.files else (d["images"] if "images" in d.files else None)
+    stored_views = (
+        [str(value) for value in d["view_names"].tolist()]
+        if "view_names" in d.files
+        else None
+    )
+    requested_views = [str(value) for value in cfg.get("views", [])]
+    if requested_views:
+        if stored_views is None:
+            if len(requested_views) != int(depth.shape[0]):
+                raise ValueError(
+                    f"reconstruction {path} has {depth.shape[0]} views but no "
+                    "view_names metadata; cannot select configured subset "
+                    f"{requested_views}"
+                )
+            selected = list(range(len(requested_views)))
+            stored_views = requested_views
+        else:
+            duplicates = {
+                value for value in stored_views if stored_views.count(value) > 1
+            }
+            if duplicates:
+                raise ValueError(
+                    f"reconstruction {path} has duplicate view names: "
+                    f"{sorted(duplicates)}"
+                )
+            index_by_view = {
+                value: index for index, value in enumerate(stored_views)
+            }
+            missing = [
+                value for value in requested_views if value not in index_by_view
+            ]
+            if missing:
+                raise ValueError(
+                    f"configured views missing from reconstruction {path}: "
+                    f"{missing}"
+                )
+            selected = [index_by_view[value] for value in requested_views]
+            stored_views = requested_views
+        depth = depth[selected]
+        conf = conf[selected]
+        K = K[selected]
+        E = E[selected]
+        if images is not None:
+            images = images[selected]
     return {
         "path": path,
         "backend": resolve_backend(cfg, backend),
@@ -104,6 +148,7 @@ def load_recon(cfg: dict, timestamp: str, backend: ReconBackend | None = None) -
         "intrinsics": K.astype(np.float64),
         "extrinsics": E.astype(np.float64),
         "images": images,
+        "view_names": stored_views,
         "n_views": int(depth.shape[0]),
         "depth_hw": tuple(depth.shape[1:3]),
     }

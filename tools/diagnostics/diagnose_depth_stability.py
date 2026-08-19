@@ -92,9 +92,7 @@ def analyze_view(depth_stack: np.ndarray, valid_stack: np.ndarray,
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--config", default=str(ROOT / "configs" / "pose_data_1_8view.json")
-    )
+    parser.add_argument("--config", required=True)
     parser.add_argument("--part", default=None, help="never-occluded part; defaults to reference_part")
     parser.add_argument("--erode", type=int, default=2, help="mask erosion iterations at depth resolution")
     parser.add_argument("--min-support-ratio", type=float, default=0.7,
@@ -129,6 +127,7 @@ def main() -> None:
         masks = load_palette_masks(
             cfg["masks_dir"], timestamp, [part], recon["depth_hw"],
             views=cfg.get("views"),
+            part_ids=cfg.get("part_ids"),
         )[part]
         for v in range(depth.shape[0]):
             valid_stack[index, v] = masks[v] & np.isfinite(depth[v]) & (depth[v] > 1e-3)

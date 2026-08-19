@@ -10,6 +10,31 @@ import trimesh
 from common.normalized_recon import scale_intrinsics
 
 
+def tile_image_panels(
+    panels: list[np.ndarray],
+    *,
+    columns: int = 4,
+    fill_value: int = 0,
+) -> np.ndarray:
+    """Tile equally sized images, padding the last row when it is incomplete."""
+    if not panels:
+        raise ValueError("at least one image panel is required")
+    if columns <= 0:
+        raise ValueError("columns must be positive")
+    shape = panels[0].shape
+    if any(panel.shape != shape for panel in panels):
+        raise ValueError("all image panels must have the same shape")
+    padded = list(panels)
+    missing = (-len(padded)) % columns
+    padded.extend([
+        np.full_like(panels[0], fill_value) for _ in range(missing)
+    ])
+    return np.vstack([
+        np.hstack(padded[index : index + columns])
+        for index in range(0, len(padded), columns)
+    ])
+
+
 def part_color(index: int) -> tuple[int, int, int]:
     hue = (0.31 + 0.38196601125 * index) % 1.0
     rgb = colorsys.hsv_to_rgb(hue, 0.68, 0.92)

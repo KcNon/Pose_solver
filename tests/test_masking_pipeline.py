@@ -4,8 +4,11 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
+from PIL import Image
 
 from common.masking.compose import compose_frame, compose_track_tree
 from common.masking.io import load_label_mask, save_binary_mask, track_path
@@ -13,11 +16,13 @@ from common.masking.multiview import project_mask_to_view
 from common.masking.planning import (
     choose_seed_frames,
     detection_evidence,
+    discovery_timestamps,
     infer_presence_start,
     repair_jobs_from_quality,
     resolve_mask_config,
 )
 from common.masking.quality import summarize_area_series, summarize_track_series
+from common.masking.sam import normalized_xyxy_to_xywh
 from common.masking.schema import load_mask_pipeline_config
 from scripts.run_mask_pipeline import (
     _coalesce_sam_jobs,
@@ -25,7 +30,24 @@ from scripts.run_mask_pipeline import (
     _sam_jobs,
     _seed_frames,
 )
-from tools.stages.masking.track_part_masks import _seed_for, _tracking_window
+from tools.stages.masking.track_part_masks import (
+    _anchor_segments,
+    _seed_for,
+    _tracking_window,
+    _trusted_seed_candidates,
+    _validated_seed,
+    _visibility_reference,
+)
+from tools.stages.masking.detect_mask_seeds import (
+    _assign_candidates_from_mesh,
+    _canonicalize_candidate_labels,
+    _request_fingerprint,
+    _unique_candidate_boxes,
+)
+from tools.stages.masking.validate_multiview_seeds import (
+    _ambiguous_duplicate_parts,
+    _box_iou,
+)
 
 
 class MaskSchemaTests(unittest.TestCase):
@@ -33,6 +55,32 @@ class MaskSchemaTests(unittest.TestCase):
         path = root / "mask.json"
         path.write_text(json.dumps(data), encoding="utf-8")
         return path
+
+    def test_discovery_timestamps_can_limit_the_coarse_search_window(self):
+        timestamps = [f"{frame:06d}" for frame in range(0, 28)]
+        self.assertEqual(
+            discovery_timestamps(timestamps, stride=10, maximum_frame=24),
+            ["000000", "000010", "000020", "000024"],
+        )
+
+    def test_visibility_reference_excludes_nearly_occluded_frames(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            masks = root / "whole"
+            for timestamp, pixels in (("000001", 100), ("000002", 80), ("000003", 5)):
+                mask = np.zeros((10, 10), dtype=bool)
+                mask.flat[:pixels] = True
+                save_binary_mask(masks / timestamp / "cam.png", mask)
+            config = SimpleNamespace(raw={"mask_quality": {
+                "visibility_reference_masks": str(masks),
+                "visibility_reference_minimum_pixels": 1,
+                "visibility_reference_minimum_median_fraction": 0.5,
+            }})
+            eligible, report = _visibility_reference(
+                config, "cam", ["000001", "000002", "000003"]
+            )
+            self.assertEqual(eligible, {"000001", "000002"})
+            self.assertEqual(report["threshold_pixels"], 40)
 
     def test_arbitrary_parts_and_stable_ids(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -173,6 +221,503 @@ class MaskSchemaTests(unittest.TestCase):
         self.assertEqual(offset, 5)
         self.assertEqual(window, frames[5:11])
 
+    def test_qwen_box_conversion_for_instance_seed(self):
+        np.testing.assert_allclose(
+            normalized_xyxy_to_xywh([100, 200, 600, 800]),
+            [0.1, 0.2, 0.5, 0.6],
+        )
+
+    def test_explicit_config_can_disable_mesh_seed_requirement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "frames").mkdir()
+            (root / "meshes").mkdir()
+            (root / "meshes" / "part.glb").write_bytes(b"mesh")
+            config = load_mask_pipeline_config(self.write_config(root, {
+                "frames_dir": str(root / "frames"),
+                "views": ["cam"],
+                "parts": {"part": {"start_frame": 10}},
+                "occlusion_order": ["part"],
+                "require_mesh_assignment": False,
+            }))
+            bbox = {"frames": {"000010": {"cam": {
+                "parts": [{"label": "part", "bbox_2d": [1, 2, 3, 4]}],
+                "mesh_assignment": {"status": "disabled"},
+            }}}}
+            self.assertEqual(
+                _validated_seed(
+                    config, bbox, ["000010"], "part", "cam", "000010"
+                ),
+                ("000010", "configured"),
+            )
+
+    def test_qwen_seed_window_expands_from_authoritative_start(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "frames").mkdir()
+            config = load_mask_pipeline_config(self.write_config(root, {
+                "frames_dir": str(root / "frames"),
+                "views": ["cam"],
+                "parts": {"part": {
+                    "start_frame": 10,
+                    "tracking": {"seed_frame": 10},
+                }},
+                "occlusion_order": ["part"],
+                "qwen_seed_window": {"length": 12, "stride": 5},
+            }))
+            self.assertEqual(
+                _seed_frames(config),
+                ["000010", "000015", "000020"],
+            )
+
+    def test_selected_part_includes_later_part_event_windows_for_reanchor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "frames").mkdir()
+            config = load_mask_pipeline_config(self.write_config(root, {
+                "frames_dir": str(root / "frames"),
+                "views": ["cam"],
+                "parts": {
+                    "early": {
+                        "start_frame": 10,
+                        "tracking": {"seed_frame": 10},
+                    },
+                    "later": {
+                        "start_frame": 30,
+                        "tracking": {"seed_frame": 30},
+                    },
+                },
+                "occlusion_order": ["later", "early"],
+                "qwen_seed_window": {"length": 5, "stride": 5},
+                "qwen_reanchor_on_part_events": True,
+            }))
+            self.assertEqual(
+                _seed_frames(config, ["early"]),
+                ["000010", "000015", "000030", "000035"],
+            )
+
+    def test_periodic_qwen_reanchors_extend_to_sequence_end(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            camera = root / "frames" / "cam"
+            camera.mkdir(parents=True)
+            for frame in range(251):
+                (camera / f"{frame:06d}.jpg").touch()
+            config = load_mask_pipeline_config(self.write_config(root, {
+                "frames_dir": str(root / "frames"),
+                "views": ["cam"],
+                "parts": {"part": {
+                    "start_frame": 10,
+                    "tracking": {"seed_frame": 10},
+                }},
+                "occlusion_order": ["part"],
+                "qwen_seed_window": {"length": 5, "stride": 5},
+                "qwen_reanchor_on_part_events": True,
+                "qwen_periodic_stride": 100,
+            }))
+            self.assertEqual(
+                _seed_frames(config, ["part"]),
+                ["000010", "000015", "000110", "000210"],
+            )
+
+    def test_seed_window_ignores_stale_bbox_outside_initialization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "frames").mkdir()
+            config = load_mask_pipeline_config(self.write_config(root, {
+                "frames_dir": str(root / "frames"),
+                "views": ["cam"],
+                "parts": {"part": {
+                    "start_frame": 10,
+                    "tracking": {"seed_frame": 10},
+                }},
+                "occlusion_order": ["part"],
+                "qwen_seed_window": {"length": 10, "stride": 5},
+                "require_mesh_assignment": False,
+            }))
+            frames = [f"{frame:06d}" for frame in range(31)]
+            bbox = {"frames": {
+                timestamp: {"cam": {"parts": [{"label": "part"}]}}
+                for timestamp in ("000010", "000015", "000025")
+            }}
+            self.assertEqual(
+                _trusted_seed_candidates(
+                    config, bbox, frames, frames[10:], "part", "cam", "000010"
+                ),
+                ["000010", "000015"],
+            )
+
+    def test_part_event_reanchor_accepts_later_visual_seed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "frames").mkdir()
+            config = load_mask_pipeline_config(self.write_config(root, {
+                "frames_dir": str(root / "frames"),
+                "views": ["cam"],
+                "parts": {"part": {
+                    "start_frame": 10,
+                    "tracking": {"seed_frame": 10},
+                }},
+                "occlusion_order": ["part"],
+                "qwen_seed_window": {"length": 10, "stride": 5},
+                "qwen_reanchor_on_part_events": True,
+                "require_mesh_assignment": False,
+            }))
+            frames = [f"{frame:06d}" for frame in range(31)]
+            bbox = {"frames": {
+                timestamp: {"cam": {"parts": [{"label": "part"}]}}
+                for timestamp in ("000010", "000015", "000025")
+            }}
+            self.assertEqual(
+                _trusted_seed_candidates(
+                    config, bbox, frames, frames[10:], "part", "cam", "000010"
+                ),
+                ["000010", "000015", "000025"],
+            )
+
+    def test_adaptive_initial_anchor_prefers_multiview_complete_frame(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "frames").mkdir()
+            views = [f"cam{index}" for index in range(4)]
+            config = load_mask_pipeline_config(self.write_config(root, {
+                "frames_dir": str(root / "frames"),
+                "views": views,
+                "parts": {"part": {
+                    "start_frame": 10,
+                    "tracking": {"seed_frame": 10},
+                }},
+                "occlusion_order": ["part"],
+                "qwen_seed_window": {"length": 10, "stride": 5},
+                "qwen_reanchor_on_part_events": True,
+                "qwen_initial_anchor_selection": {
+                    "enabled": True,
+                    "minimum_views": 2,
+                    "minimum_view_fraction": 0.5,
+                    "reject_border_clipped": True,
+                },
+                "require_mesh_assignment": False,
+            }))
+            frames = [f"{frame:06d}" for frame in range(31)]
+            bbox = {"frames": {
+                "000010": {"cam0": {"parts": [
+                    {"label": "part", "bbox_2d": [100, 100, 190, 190]}
+                ]}},
+                "000015": {view: {"parts": [
+                    {"label": "part", "bbox_2d": [100, 100, 220, 220]}
+                ]} for view in views},
+                "000020": {view: {"parts": [
+                    {"label": "part", "bbox_2d": [100, 100, 180, 180]}
+                ]} for view in views},
+                "000025": {"cam0": {"parts": [
+                    {"label": "part", "bbox_2d": [100, 100, 200, 200]}
+                ]}},
+            }}
+            self.assertEqual(
+                _trusted_seed_candidates(
+                    config, bbox, frames, frames[10:], "part", "cam0",
+                    "000010", views,
+                ),
+                ["000015", "000025"],
+            )
+
+    def test_adaptive_initial_anchor_rejects_border_clipped_bbox(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "frames").mkdir()
+            views = ["left", "right"]
+            config = load_mask_pipeline_config(self.write_config(root, {
+                "frames_dir": str(root / "frames"),
+                "views": views,
+                "parts": {"part": {"start_frame": 10}},
+                "occlusion_order": ["part"],
+                "qwen_seed_window": {"length": 5, "stride": 5},
+                "qwen_reanchor_on_part_events": True,
+                "qwen_initial_anchor_selection": {
+                    "enabled": True,
+                    "minimum_views": 2,
+                    "reject_border_clipped": True,
+                },
+                "require_mesh_assignment": False,
+            }))
+            frames = [f"{frame:06d}" for frame in range(20)]
+            bbox = {"frames": {
+                "000010": {view: {"parts": [
+                    {"label": "part", "bbox_2d": [0, 100, 200, 250]}
+                ]} for view in views},
+                "000015": {view: {"parts": [
+                    {"label": "part", "bbox_2d": [100, 100, 300, 250]}
+                ]} for view in views},
+            }}
+            self.assertEqual(
+                _trusted_seed_candidates(
+                    config, bbox, frames, frames[10:], "part", "left",
+                    "000010", views,
+                ),
+                ["000015"],
+            )
+
+    def test_adaptive_initial_anchor_respects_delay_and_sharpness(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            views = ["left", "right"]
+            for view in views:
+                camera = root / "frames" / view
+                camera.mkdir(parents=True)
+                checker = (np.indices((100, 100)).sum(axis=0) % 2 * 255).astype(
+                    np.uint8
+                )
+                Image.fromarray(checker).save(camera / "000010.jpg")
+                Image.fromarray(np.full((100, 100), 128, np.uint8)).save(
+                    camera / "000015.jpg"
+                )
+                Image.fromarray(checker).save(camera / "000020.jpg")
+            config = load_mask_pipeline_config(self.write_config(root, {
+                "frames_dir": str(root / "frames"),
+                "views": views,
+                "parts": {"part": {"start_frame": 10}},
+                "occlusion_order": ["part"],
+                "qwen_seed_window": {"length": 10, "stride": 5},
+                "qwen_reanchor_on_part_events": True,
+                "qwen_initial_anchor_selection": {
+                    "enabled": True,
+                    "minimum_delay": 5,
+                    "minimum_views": 2,
+                    "reject_border_clipped": True,
+                },
+                "require_mesh_assignment": False,
+            }))
+            frames = [f"{frame:06d}" for frame in range(10, 21)]
+            record = lambda: {"parts": [
+                {"label": "part", "bbox_2d": [100, 100, 900, 900]}
+            ]}
+            bbox = {"frames": {
+                timestamp: {view: record() for view in views}
+                for timestamp in ("000010", "000015", "000020")
+            }}
+            self.assertEqual(
+                _trusted_seed_candidates(
+                    config, bbox, frames, frames, "part", "left",
+                    "000010", views,
+                ),
+                ["000020"],
+            )
+
+    def test_qwen_fingerprint_changes_with_mesh_reference(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image = root / "frame.jpg"
+            reference = root / "preview.jpg"
+            image.write_bytes(b"frame")
+            reference.write_bytes(b"first")
+            kwargs = {
+                "image_path": image,
+                "prompt": "find part",
+                "model_path": "model",
+                "max_new_tokens": 10,
+                "max_pixels": 20,
+                "reference_images": {"part": reference},
+            }
+            first = _request_fingerprint(**kwargs)
+            reference.write_bytes(b"second")
+            self.assertNotEqual(first, _request_fingerprint(**kwargs))
+
+    def test_duplicate_qwen_boxes_become_one_mesh_candidate(self):
+        boxes = [
+            {"bbox_2d": [100, 100, 300, 300], "label": "one"},
+            {"bbox_2d": [102, 102, 298, 298], "label": "two"},
+            {"bbox_2d": [500, 500, 700, 700], "label": "two"},
+        ]
+        self.assertEqual(
+            _unique_candidate_boxes(boxes),
+            [[100.0, 100.0, 300.0, 300.0], [500.0, 500.0, 700.0, 700.0]],
+        )
+
+    def test_parser_normalized_label_maps_back_to_mesh_part_name(self):
+        self.assertEqual(
+            _canonicalize_candidate_labels(
+                [{"bbox_2d": [1, 2, 3, 4], "label": "whole_close"}],
+                {"whole-close"},
+                keep_unmatched=False,
+            ),
+            [{"bbox_2d": [1, 2, 3, 4], "label": "whole-close"}],
+        )
+
+    def test_mesh_assignment_preserves_supported_unique_qwen_labels(self):
+        boxes = [
+            {"bbox_2d": [10, 10, 40, 40], "label": "main"},
+            {"bbox_2d": [50, 50, 80, 80], "label": "collector"},
+        ]
+        # Rows: collector reference, main reference, then two candidates.
+        # A purely global assignment would swap these proposals by a small
+        # margin, despite both Qwen names having mesh support above threshold.
+        vectors = np.array([
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [0.2073, 0.2081],
+            [0.4102, 0.4576],
+        ])
+        parts = [SimpleNamespace(name="collector"), SimpleNamespace(name="main")]
+        with (
+            patch(
+                "tools.stages.masking.detect_mask_seeds._preview_views",
+                return_value=[object()],
+            ),
+            patch(
+                "tools.stages.masking.detect_mask_seeds._target_crop",
+                return_value=object(),
+            ),
+            patch(
+                "tools.stages.masking.detect_mask_seeds._dino_embeddings",
+                return_value=vectors,
+            ),
+        ):
+            assigned, report = _assign_candidates_from_mesh(
+                object(), boxes, parts,
+                {"collector": Path("collector"), "main": Path("main")},
+                object(), object(),
+            )
+        self.assertEqual(
+            {row["label"]: row["bbox_2d"] for row in assigned},
+            {
+                "main": [10.0, 10.0, 40.0, 40.0],
+                "collector": [50.0, 50.0, 80.0, 80.0],
+            },
+        )
+        self.assertEqual(
+            set(report["qwen_locked_parts"]), {"collector", "main"}
+        )
+
+    def test_mesh_assignment_can_correct_unsupported_qwen_label(self):
+        boxes = [{"bbox_2d": [10, 10, 40, 40], "label": "collector"}]
+        vectors = np.array([
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [0.18, 0.21],
+        ])
+        parts = [SimpleNamespace(name="collector"), SimpleNamespace(name="main")]
+        with (
+            patch(
+                "tools.stages.masking.detect_mask_seeds._preview_views",
+                return_value=[object()],
+            ),
+            patch(
+                "tools.stages.masking.detect_mask_seeds._target_crop",
+                return_value=object(),
+            ),
+            patch(
+                "tools.stages.masking.detect_mask_seeds._dino_embeddings",
+                return_value=vectors,
+            ),
+        ):
+            assigned, report = _assign_candidates_from_mesh(
+                object(), boxes, parts,
+                {"collector": Path("collector"), "main": Path("main")},
+                object(), object(),
+            )
+        self.assertEqual(assigned[0]["label"], "main")
+        self.assertEqual(report["qwen_locked_parts"], [])
+
+    def test_single_qwen_label_must_also_be_mesh_best(self):
+        boxes = [{"bbox_2d": [10, 10, 40, 40], "label": "collector"}]
+        vectors = np.array([
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [0.21, 0.28],
+        ])
+        parts = [SimpleNamespace(name="collector"), SimpleNamespace(name="main")]
+        with (
+            patch(
+                "tools.stages.masking.detect_mask_seeds._preview_views",
+                return_value=[object()],
+            ),
+            patch(
+                "tools.stages.masking.detect_mask_seeds._target_crop",
+                return_value=object(),
+            ),
+            patch(
+                "tools.stages.masking.detect_mask_seeds._dino_embeddings",
+                return_value=vectors,
+            ),
+        ):
+            assigned, report = _assign_candidates_from_mesh(
+                object(), boxes, parts,
+                {"collector": Path("collector"), "main": Path("main")},
+                object(), object(),
+            )
+        self.assertEqual(assigned[0]["label"], "main")
+        self.assertEqual(report["qwen_locked_parts"], [])
+
+    def test_video_seed_falls_back_to_nearest_mesh_validated_record(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "frames").mkdir()
+            (root / "meshes").mkdir()
+            (root / "meshes" / "part.glb").write_bytes(b"mesh")
+            config = load_mask_pipeline_config(self.write_config(root, {
+                "frames_dir": str(root / "frames"),
+                "views": ["cam"],
+                "parts": {"part": {"start_frame": 0}},
+                "occlusion_order": ["part"],
+            }))
+            bbox = {"frames": {
+                "000010": {"cam": {"parts": []}},
+                "000014": {"cam": {
+                    "parts": [{"label": "part", "bbox_2d": [1, 2, 3, 4]}],
+                    "mesh_assignment": {"status": "ok"},
+                }},
+            }}
+            self.assertEqual(
+                _validated_seed(
+                    config,
+                    bbox,
+                    ["000010", "000014"],
+                    "part",
+                    "cam",
+                    "000010",
+                ),
+                ("000014", "nearest_mesh_validated"),
+            )
+
+    def test_mesh_validated_seeds_create_nearest_anchor_segments(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "frames").mkdir()
+            (root / "meshes").mkdir()
+            (root / "meshes" / "part.glb").write_bytes(b"mesh")
+            config = load_mask_pipeline_config(self.write_config(root, {
+                "frames_dir": str(root / "frames"),
+                "views": ["cam"],
+                "parts": {"part": {"start_frame": 0}},
+                "occlusion_order": ["part"],
+            }))
+            frames = [f"{frame:06d}" for frame in range(10)]
+            bbox = {"frames": {
+                "000002": {"cam": {
+                    "parts": [{"label": "part"}],
+                    "mesh_assignment": {"status": "ok"},
+                }},
+                "000005": {"cam": {
+                    "parts": [{"label": "part"}],
+                    "mesh_assignment": {"status": "unavailable"},
+                }},
+                "000007": {"cam": {
+                    "parts": [{"label": "part"}],
+                    "mesh_assignment": {"status": "ok"},
+                }},
+            }}
+            anchors = _trusted_seed_candidates(
+                config, bbox, frames, frames, "part", "cam", "000005"
+            )
+            self.assertEqual(anchors, ["000002", "000007"])
+            segments = _anchor_segments(frames, frames, anchors)
+            self.assertEqual(
+                [segment["requested"] for segment in segments],
+                [frames[:5], frames[5:]],
+            )
+            self.assertEqual(segments[0]["window_ids"], frames[:5])
+            self.assertEqual(segments[1]["window_ids"], frames[5:])
+
     def test_equal_sam_repair_jobs_share_one_model_process(self):
         common = {
             "part": "piece",
@@ -234,6 +779,14 @@ class MaskSchemaTests(unittest.TestCase):
                 first,
                 _job_bbox_fingerprint(config, job, ["000005"], bbox),
             )
+            later = _job_bbox_fingerprint(config, job, ["000005"], bbox)
+            bbox["frames"]["000009"]["cam"]["parts"].append(
+                {"label": "back", "bbox_2d": [20, 30, 40, 50]}
+            )
+            self.assertNotEqual(
+                later,
+                _job_bbox_fingerprint(config, job, ["000005"], bbox),
+            )
 
     def test_auto_start_is_unresolved_until_planning(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -271,13 +824,23 @@ class MaskSchemaTests(unittest.TestCase):
                             "bbox_2d": [200, 100, 600, 600],
                         }]},
                     },
+                    "000020": {
+                        "left": {"parts": [{
+                            "label": "part",
+                            "bbox_2d": [100, 100, 500, 500],
+                        }]},
+                        "right": {"parts": [{
+                            "label": "part",
+                            "bbox_2d": [200, 100, 600, 600],
+                        }]},
+                    },
                 },
             }
             resolved_path = root / "resolved.json"
             raw, report = resolve_mask_config(
                 config,
                 bbox,
-                ["000000", "000010"],
+                ["000000", "000010", "000020"],
                 output_path=resolved_path,
             )
             self.assertEqual(raw["parts"]["part"]["start_frame"], 10)
@@ -436,6 +999,37 @@ class MaskCompositionTests(unittest.TestCase):
 
 
 class MultiViewMaskTests(unittest.TestCase):
+    def test_cross_part_duplicate_boxes_are_ambiguous(self):
+        bbox_data = {
+            "frames": {
+                "000010": {
+                    "cam": {
+                        "parts": [
+                            {"label": "body", "bbox_2d": [10, 20, 100, 200]},
+                            {"label": "nozzle", "bbox_2d": [10, 20, 100, 200]},
+                        ]
+                    }
+                }
+            }
+        }
+        self.assertEqual(
+            _ambiguous_duplicate_parts(
+                bbox_data,
+                "000010",
+                "cam",
+                ["body", "nozzle"],
+                overrides=None,
+                iou_threshold=0.95,
+            ),
+            {"body", "nozzle"},
+        )
+
+    def test_distinct_touching_part_boxes_remain_valid(self):
+        self.assertLess(
+            _box_iou([10, 20, 100, 200], [80, 20, 170, 200]),
+            0.95,
+        )
+
     def test_identity_cameras_preserve_mask(self):
         depth = np.full((20, 20), 2.0, np.float32)
         mask = np.zeros((20, 20), bool)

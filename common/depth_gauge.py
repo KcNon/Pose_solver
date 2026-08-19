@@ -1,4 +1,4 @@
-"""Per-frame depth gauge anchored on a static reference part.
+"""Per-frame depth gauge anchored on static scene evidence.
 
 The recon depth of each frame carries a per-view global shift of up to ~9 mm
 while the pixel-level residual is sub-millimetre (measured by
@@ -7,9 +7,9 @@ the temporal median depth of the static reference part removes that shift
 before backprojection, so the per-part clouds inherit the residual noise
 floor instead of the frame-to-frame drift.
 
-The gauge only needs the reference part to be static and visible in most
-frames of each view; pixels are compared against their own temporal median,
-so partial occlusion in any single frame is tolerated.
+The preferred reusable mode is ``reference_part="__background__"``.  It uses
+the complement of every configured part mask, so no object taxonomy or
+assumption that one manipulated part stays fixed is required.
 """
 from __future__ import annotations
 
@@ -33,6 +33,33 @@ def reference_part(cfg: dict, configured: str | None = None) -> str:
             "depth gauge requires reference_part or a non-empty parts list"
         )
     return str(names[0])
+
+
+def gauge_masks(
+    cfg: dict,
+    timestamp: str,
+    depth_hw: tuple[int, int],
+    part: str,
+) -> list[np.ndarray]:
+    """Load the static reference mask for every view."""
+
+    if part != "__background__":
+        return load_palette_masks(
+            cfg["masks_dir"], timestamp, [part], depth_hw,
+            views=cfg.get("views"), part_ids=cfg.get("part_ids"),
+        )[part]
+    parts = [str(value) for value in cfg.get("parts", [])]
+    if not parts:
+        raise ValueError("background depth gauge requires configured parts")
+    masks = load_palette_masks(
+        cfg["masks_dir"], timestamp, parts, depth_hw,
+        views=cfg.get("views"), part_ids=cfg.get("part_ids"),
+    )
+    n_views = len(next(iter(masks.values())))
+    return [
+        ~np.logical_or.reduce([masks[name][view] for name in parts])
+        for view in range(n_views)
+    ]
 
 
 def compute_depth_gauge(
@@ -64,10 +91,7 @@ def compute_depth_gauge(
             depth_stack = np.empty((len(timestamps),) + depth.shape, np.float32)
             valid_stack = np.zeros((len(timestamps),) + depth.shape, bool)
         depth_stack[index] = depth
-        masks = load_palette_masks(
-            cfg["masks_dir"], timestamp, [part], recon["depth_hw"],
-            views=cfg.get("views"),
-        )[part]
+        masks = gauge_masks(cfg, timestamp, recon["depth_hw"], part)
         for v in range(depth.shape[0]):
             mask = cv2.erode(masks[v].astype(np.uint8), kernel, iterations=erode).astype(bool)
             valid_stack[index, v] = mask & np.isfinite(depth[v]) & (depth[v] > 1e-3)
@@ -153,10 +177,7 @@ def compute_view_bias(
         depth = recon["depth"]
         if gauge is not None:
             depth = apply_depth_gauge(depth, gauge, timestamp)
-        masks = load_palette_masks(
-            cfg["masks_dir"], timestamp, [part], recon["depth_hw"],
-            views=cfg.get("views"),
-        )[part]
+        masks = gauge_masks(cfg, timestamp, recon["depth_hw"], part)
         clouds, rays = [], []
         for v in range(depth.shape[0]):
             mask = masks[v] & np.isfinite(depth[v]) & (depth[v] > 1e-3)

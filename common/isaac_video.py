@@ -110,7 +110,12 @@ def _set_visibility(prim: Usd.Prim, visible: bool) -> None:
 
 
 def _is_observable(state: str) -> bool:
-    return state not in {"inferred_unobservable", "unobservable", "unknown"}
+    return state not in {
+        "inferred_unobservable",
+        "unobservable",
+        "out_of_frame",
+        "unknown",
+    }
 
 
 def _part_world_transform(
@@ -238,7 +243,7 @@ def _compose_views(
         fill=(255, 255, 255, 255),
     )
     lines = [
-        "All timeline frames are rendered in Isaac Sim; physics insertion was validated separately (9/9).",
+        "All timeline frames are rendered in Isaac Sim; collision dynamics are reported separately.",
         "visible: " + (", ".join(visible_parts) if visible_parts else "none"),
         " | ".join(f"{part}: {state}" for part, state in states.items()),
     ]
