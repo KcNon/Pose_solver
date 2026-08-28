@@ -17,3 +17,4 @@ configs/*
 !configs/object9_rigid_nozzle_depth.json
 !configs/object9_rigid_nozzle_pose.json
 exports
+video-object8/*
