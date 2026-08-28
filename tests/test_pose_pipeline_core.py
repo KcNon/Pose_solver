@@ -13,7 +13,9 @@ import trimesh
 from common.cloud_io import read_ply_xyz, write_ply
 from common.pose_config import validate_pose_config
 from common.pose_tracking import (
+    apply_endpoint_pose_correction,
     bridge_pose_ranges,
+    resolve_endpoint_pose_correction,
     select_temporal_anchor,
     track_anchor_relative_registration,
 )
@@ -30,6 +32,7 @@ from common.pose_validation import (
 from common.trajectory_io import refresh_trajectory_derived_fields
 from tools.stages.pose.render_multiview_pose import (
     depth_visible_foreground,
+    mask_visible_foreground,
     record_visible_in_view,
 )
 from tools.diagnostics.export_multiview_pose_review import (
@@ -65,6 +68,107 @@ def base_config() -> dict:
         "output_root": "/unused",
         "recon_backend": "test",
     }
+
+
+class EndpointPoseCorrectionTests(unittest.TestCase):
+    def test_rejects_unobserved_half_turn_but_keeps_anchor_translation(self):
+        start = np.eye(4)
+        start[:3, 3] = [0.1, -0.2, 1.0]
+        predicted = start.copy()
+        predicted[:3, :3] = Rotation.from_euler(
+            "z", 3.0, degrees=True
+        ).as_matrix()
+        predicted[:3, 3] += [0.08, 0.0, 0.0]
+        target = predicted.copy()
+        target[:3, :3] = Rotation.from_euler(
+            "z", 176.0, degrees=True
+        ).as_matrix() @ predicted[:3, :3]
+        target[:3, 3] += [0.03, -0.01, 0.0]
+
+        effective, report = resolve_endpoint_pose_correction(
+            start,
+            predicted,
+            target,
+            {
+                "endpoint_rotation_consistency": {
+                    "enabled": True,
+                    "maximum_correction_deg": 90.0,
+                }
+            },
+        )
+
+        np.testing.assert_allclose(
+            effective[:3, :3], predicted[:3, :3], atol=1e-9
+        )
+        np.testing.assert_allclose(
+            effective[:3, 3], target[:3, 3], atol=1e-9
+        )
+        self.assertTrue(report["rotation_rejected"])
+        self.assertAlmostEqual(report["requested_rotation_deg"], 176.0)
+        self.assertAlmostEqual(report["applied_rotation_deg"], 0.0)
+
+    def test_keeps_supported_small_endpoint_rotation(self):
+        start = np.eye(4)
+        predicted = np.eye(4)
+        target = np.eye(4)
+        target[:3, :3] = Rotation.from_euler(
+            "x", 12.0, degrees=True
+        ).as_matrix()
+
+        effective, report = resolve_endpoint_pose_correction(
+            start,
+            predicted,
+            target,
+            {
+                "endpoint_rotation_consistency": {
+                    "enabled": True,
+                    "maximum_correction_deg": 90.0,
+                }
+            },
+        )
+
+        np.testing.assert_allclose(effective, target, atol=1e-9)
+        self.assertFalse(report["rotation_rejected"])
+        self.assertAlmostEqual(report["applied_rotation_deg"], 12.0)
+
+    def test_large_rotation_does_not_orbit_world_origin(self):
+        pose = np.eye(4)
+        pose[:3, 3] = [0.05, -0.10, 1.0]
+        predicted_end = pose.copy()
+        target_end = pose.copy()
+        target_end[:3, :3] = Rotation.from_euler(
+            "z", 170.0, degrees=True
+        ).as_matrix()
+        target_end[:3, 3] += [0.03, 0.0, 0.0]
+
+        midpoint = apply_endpoint_pose_correction(
+            pose, predicted_end, target_end, 0.5
+        )
+
+        np.testing.assert_allclose(
+            midpoint[:3, 3], [0.065, -0.10, 1.0], atol=1e-9
+        )
+        self.assertAlmostEqual(
+            Rotation.from_matrix(midpoint[:3, :3]).magnitude(),
+            np.deg2rad(85.0),
+            places=9,
+        )
+
+    def test_endpoint_is_exact(self):
+        pose = np.eye(4)
+        predicted_end = np.eye(4)
+        predicted_end[:3, 3] = [0.1, 0.2, 1.0]
+        target_end = np.eye(4)
+        target_end[:3, :3] = Rotation.from_euler(
+            "xyz", [20.0, -30.0, 40.0], degrees=True
+        ).as_matrix()
+        target_end[:3, 3] = [0.2, 0.1, 0.9]
+
+        corrected = apply_endpoint_pose_correction(
+            predicted_end, predicted_end, target_end, 1.0
+        )
+
+        np.testing.assert_allclose(corrected, target_end, atol=1e-9)
 
 
 class PoseConfigTests(unittest.TestCase):
@@ -121,6 +225,16 @@ class PoseConfigTests(unittest.TestCase):
             "calibration_window_frames": 2,
             "anchor_window_frames": 2,
         }
+        config["multiframe_optimization"] = {
+            "enabled": True,
+            "auto_static_windows": True,
+            "auto_dynamic_windows": True,
+            "windows": [],
+            "auto": {
+                "minimum_static_frames": 1,
+                "minimum_dynamic_frames": 1,
+            },
+        }
         config["states"]["body"]["calibration_frames"] = [0]
         config["states"]["part"]["anchor_frames"] = [1]
         report = {"parts": {}}
@@ -129,7 +243,13 @@ class PoseConfigTests(unittest.TestCase):
             for frame in range(3):
                 moving = part == "part" and frame == 1
                 states[f"{frame:06d}"] = {
-                    "state": "moving" if moving else "static",
+                    "state": (
+                        "moving"
+                        if moving
+                        else "occluded"
+                        if part == "part" and frame >= 3
+                        else "static"
+                    ),
                     "observing_views": 2,
                     "motion_px": 5.0 if moving else 0.0,
                     "surface_shift_mm": 8.0 if moving else 1.0,
@@ -167,6 +287,24 @@ class PoseConfigTests(unittest.TestCase):
             resolved["states"]["body"]["calibration_frames"]
         ), 2)
         self.assertIn("part", audit["parts"])
+        modes = {
+            window["name"]: window["mode"]
+            for window in resolved["multiframe_optimization"]["windows"]
+        }
+        self.assertEqual(modes["auto_dynamic_part_1_1"], "dynamic_window")
+        dynamic_window = next(
+            window
+            for window in resolved["multiframe_optimization"]["windows"]
+            if window["name"] == "auto_dynamic_part_1_1"
+        )
+        self.assertEqual(
+            dynamic_window["maximum_internal_rotation_degradation_deg"], 0.0
+        )
+        self.assertEqual(modes["auto_static_body_0_2"], "static_window")
+        self.assertIn(
+            "auto_dynamic_part_1_1",
+            audit["parts"]["part"]["generated_multiframe_windows"],
+        )
         validate_pose_config(resolved)
 
     def test_reference_selection_penalizes_observed_motion(self):
@@ -306,6 +444,58 @@ class PoseConfigTests(unittest.TestCase):
             RuntimeError, "no trusted stable anchor after"
         ):
             resolve_pose_config(config, report)
+
+    def test_automatic_anchor_falls_back_to_mask_visible_static_frames(self):
+        config = base_config()
+        config["frames"] = {"start": 0, "end": 5}
+        config["part_start_frames"] = {"body": 0, "part": 0}
+        config["automation"] = {
+            "enabled": True,
+            "use_detected_states": True,
+            "infer_anchors": True,
+            "minimum_observing_views": 2,
+            "minimum_dynamic_frames": 1,
+            "anchor_window_frames": 2,
+            "allow_mask_only_anchor_fallback": True,
+        }
+        report = {"parts": {}}
+        for part in ("body", "part"):
+            states = {}
+            for frame in range(6):
+                moving = part == "part" and 1 <= frame <= 2
+                states[f"{frame:06d}"] = {
+                    "state": (
+                        "moving"
+                        if moving
+                        else "occluded"
+                        if part == "part" and frame >= 3
+                        else "static"
+                    ),
+                    "observing_views": 4,
+                    "cloud_quality": {
+                        "status": (
+                            "rejected_quality"
+                            if part == "part" and frame >= 3
+                            else "ok"
+                        )
+                    },
+                }
+            report["parts"][part] = {
+                "states": states,
+                "detected_moving_ranges": (
+                    [[1, 2]] if part == "part" else []
+                ),
+            }
+
+        resolved, audit = resolve_pose_config(config, report)
+
+        self.assertTrue(any(
+            frame >= 3 for frame in resolved["states"]["part"]["anchor_frames"]
+        ))
+        self.assertEqual(
+            audit["parts"]["part"]["anchor_quality_fallback"]["mode"],
+            "static_multiview_mask_visible",
+        )
 
     def test_anchor_inference_rejects_failed_quality_clouds(self):
         rows = {
@@ -448,6 +638,25 @@ class TrajectoryTests(unittest.TestCase):
         np.testing.assert_array_equal(
             visible,
             np.asarray([[False, True], [False, True]]),
+        )
+
+    def test_renderer_hides_mesh_only_behind_selected_mask_label(self):
+        foreground = np.ones((2, 4), dtype=bool)
+        labels = np.asarray(
+            [[0, 1, 2, 3], [0, 3, 0, 0]], dtype=np.uint8
+        )
+
+        visible = mask_visible_foreground(
+            foreground,
+            labels,
+            occluder_labels=[3],
+        )
+
+        np.testing.assert_array_equal(
+            visible,
+            np.asarray(
+                [[True, True, True, False], [True, False, True, True]]
+            ),
         )
 
     def test_local_pose_bridge_preserves_independent_endpoints(self):

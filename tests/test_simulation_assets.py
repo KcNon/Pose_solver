@@ -16,6 +16,7 @@ from common.simulation_assets import (
     rotation_align_vectors,
 )
 from common.simulation_autoconfig import final_state_run
+from common.simulation_export import materialize_collision_components
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -45,6 +46,17 @@ def _synthetic_trajectory() -> dict:
 
 
 class SimulationAssetTests(unittest.TestCase):
+    def test_dense_proxy_component_split_fails_closed(self) -> None:
+        mesh = __import__("trimesh").creation.box()
+        self.assertEqual(
+            materialize_collision_components(mesh, proxy_type="raw"),
+            [mesh],
+        )
+        with self.assertRaisesRegex(RuntimeError, "refusing to materialize"):
+            materialize_collision_components(
+                mesh, proxy_type="filtered_surface", maximum_faces=1
+            )
+
     def test_final_state_run_chooses_last_contiguous_visible_run(self) -> None:
         rows = {
             "000010": {"state": "assembled", "observing_views": 2},

@@ -26,6 +26,7 @@ from common.multiview_quality import (
     temporal_mask_area_references,
 )
 from common.normalized_recon import load_recon
+from common.occlusion_masks import known_occluder_mask
 from common.pose_config import validate_pose_config
 from common.pose_refinement import (
     interpolate_untrusted_pose_frames,
@@ -43,6 +44,7 @@ from common.render_loss_refinement import (
     world_pose_delta_vector,
 )
 from common.symmetry import symmetry_spec_from_state
+from common.static_pose_refinement import align_pose_to_support_plane
 from common.trajectory_io import (
     refresh_trajectory_derived_fields,
     write_trajectory_files,
@@ -71,6 +73,44 @@ def configured_ranges(
 
 def frame_in_ranges(frame: int, values: list[list[int]]) -> bool:
     return any(int(start) <= frame <= int(end) for start, end in values)
+
+
+def other_part_touch_ratio(
+    target_mask: np.ndarray,
+    other_part_mask: np.ndarray,
+    *,
+    dilation_pixels: int = 2,
+) -> float:
+    """Return how much of a modal target boundary touches another part.
+
+    A clean static silhouette can constrain the full mesh without any depth
+    interpretation.  When another labelled part touches a large fraction of
+    its boundary, however, that view is modal/occluded and must not be used by
+    a full-silhouette anchor objective.  Measuring contact at the target
+    boundary avoids comparing raw pixel areas across cameras.
+    """
+
+    target = np.asarray(target_mask, dtype=bool)
+    other = np.asarray(other_part_mask, dtype=bool)
+    if target.shape != other.shape:
+        raise ValueError("target and other-part masks must have matching shapes")
+    boundary = cv2.morphologyEx(
+        target.astype(np.uint8),
+        cv2.MORPH_GRADIENT,
+        np.ones((3, 3), dtype=np.uint8),
+    ).astype(bool)
+    boundary_pixels = int(boundary.sum())
+    if boundary_pixels == 0:
+        return 1.0
+    dilation_pixels = max(0, int(dilation_pixels))
+    if dilation_pixels:
+        size = 2 * dilation_pixels + 1
+        other = cv2.dilate(
+            other.astype(np.uint8),
+            np.ones((size, size), dtype=np.uint8),
+            iterations=1,
+        ).astype(bool)
+    return float(np.logical_and(boundary, other).sum() / boundary_pixels)
 
 
 def canonical_axis_origin(
@@ -212,6 +252,22 @@ def load_observations(
         ).astype(bool)
         if int(target.sum()) < minimum_pixels:
             continue
+        other_parts = cv2.resize(
+            known_occluder_mask(labels, part_id).astype(np.uint8),
+            (width, height),
+            interpolation=cv2.INTER_NEAREST,
+        ).astype(bool)
+        maximum_touch_ratio = refinement.get(
+            "maximum_other_part_touch_ratio"
+        )
+        if maximum_touch_ratio is not None and other_part_touch_ratio(
+            target,
+            other_parts,
+            dilation_pixels=int(
+                refinement.get("other_part_touch_dilation_pixels", 2)
+            ),
+        ) > float(maximum_touch_ratio):
+            continue
         intrinsics, extrinsics = camera_from_recon(
             recon, view_index, (height, width)
         )
@@ -225,14 +281,17 @@ def load_observations(
             "disable_depth_for_mask_only_fallback", True
         ):
             depth_loss_enabled = False
-        known_occluder = cv2.resize(
-            (
-                (labels != 0)
-                & (labels != part_id)
-            ).astype(np.uint8),
-            (width, height),
-            interpolation=cv2.INTER_NEAREST,
-        ).astype(bool)
+        known_occluder = None
+        if refinement.get("known_part_occlusion_aware", True):
+            known_occluder = cv2.resize(
+                known_occluder_mask(
+                    labels,
+                    part_id,
+                    refinement.get("known_occluder_labels"),
+                ).astype(np.uint8),
+                (width, height),
+                interpolation=cv2.INTER_NEAREST,
+            ).astype(bool)
         observations.append(
             RenderObservation(
                 view=view,
@@ -327,6 +386,15 @@ def main() -> None:
             "post-smoothing is disabled"
         ),
     )
+    parser.add_argument(
+        "--static-anchor-search",
+        action="store_true",
+        help=(
+            "diagnose/refine explicitly requested clean static frames with "
+            "full-mask exact-triangle SE(3); disables depth-based occlusion "
+            "exemptions and permits configured tracking anchors"
+        ),
+    )
     args = parser.parse_args()
 
     config_path = Path(args.config).resolve()
@@ -339,6 +407,40 @@ def main() -> None:
     )
     cfg = validate_pose_config(load_json(config_path), check_paths=True)
     refinement = dict(cfg.get("render_loss_refinement", {}))
+    if args.static_anchor_search:
+        if args.frames is None:
+            raise ValueError("--static-anchor-search requires --frames")
+        refinement.update({
+            "resolution": [320, 180],
+            "occlusion_aware": False,
+            # Known rigid-part masks are valid modal occluders.  DA3 depth
+            # occlusion is disabled because it made the old static score look
+            # artificially good by hiding misprojected mesh pixels.
+            "known_part_occlusion_aware": True,
+            "maximum_other_part_touch_ratio": 0.75,
+            "other_part_touch_dilation_pixels": 2,
+            "mask_primary": True,
+            "use_cloud_supported_view_gate": False,
+            "exact_triangle_refinement": True,
+            "translation_steps_m": [0.012, 0.006, 0.003, 0.0015],
+            "rotation_steps_deg": [8.0, 4.0, 2.0, 1.0],
+            "maximum_translation_delta_m": 0.04,
+            "maximum_rotation_delta_deg": 30.0,
+            "exact_translation_steps_m": [0.008, 0.004, 0.002, 0.001],
+            "exact_rotation_steps_deg": [6.0, 3.0, 1.5, 0.75],
+            "exact_maximum_translation_delta_m": 0.03,
+            "exact_maximum_rotation_delta_deg": 24.0,
+            "static_table_alignment": True,
+            "static_table_contact_quantile": 0.005,
+            "static_table_maximum_shift_m": 0.02,
+            "minimum_improvement": 0.0,
+            "prior_weight": 0.005,
+            "temporal_weight": 0.0,
+        })
+        weights = dict(refinement.get("weights", {}))
+        weights["depth"] = 0.0
+        refinement["weights"] = weights
+        cfg["render_loss_refinement"] = refinement
     if not refinement.get("enabled", False):
         raise ValueError("render_loss_refinement.enabled must be true")
     baseline = load_json(trajectory_path)
@@ -403,9 +505,14 @@ def main() -> None:
         protected_anchor_frames = (
             configured_anchor_frames
             if bool(part_refinement.get("protect_tracking_anchors", True))
+            and not args.static_anchor_search
             else set()
         )
-        ranges = configured_ranges(state, part_config)
+        ranges = (
+            [(frame, frame) for frame in sorted(set(args.frames))]
+            if args.frames is not None
+            else configured_ranges(state, part_config)
+        )
         if not ranges:
             continue
         raw_mesh = trimesh.load(
@@ -434,6 +541,12 @@ def main() -> None:
             count=int(part_refinement.get("surface_points", 30000)),
             seed=int(part_refinement.get("seed", 1701)) + part_index,
         )
+        metric_vertices = (
+            np.asarray(raw_mesh.vertices, dtype=np.float64)
+            - np.asarray(
+                baseline["raw_mesh_origins"][part], dtype=np.float64
+            )
+        ) * float(baseline["scales"][part])
         symmetry = symmetry_spec_from_state(state)
         symmetry_axis = (
             symmetry.axis
@@ -543,6 +656,18 @@ def main() -> None:
                 effective_holdout = [
                     view for view in part_holdout_views if view in available
                 ]
+                if (
+                    args.static_anchor_search
+                    and not effective_holdout
+                    and len(effective_optimize) > minimum_optimize_views
+                ):
+                    # Preserve an independent camera gate even when the
+                    # configured holdout view is rejected as inter-part
+                    # occluded.  Selection is deterministic and never leaks
+                    # this view back into the optimize set.
+                    replacement_holdout = effective_optimize[-1]
+                    effective_optimize = effective_optimize[:-1]
+                    effective_holdout = [replacement_holdout]
                 if len(effective_optimize) < minimum_optimize_views:
                     part_report["frames"][timestamp] = {
                         "accepted": False,
@@ -646,8 +771,8 @@ def main() -> None:
                 selected, frame_report = refine_pose_coordinate_search(
                     objective,
                     initial,
-                    optimize_views=part_optimize_views,
-                    holdout_views=part_holdout_views,
+                    optimize_views=effective_optimize,
+                    holdout_views=effective_holdout,
                     translation_steps_m=[
                         float(value)
                         for value in part_config.get(
@@ -747,6 +872,11 @@ def main() -> None:
                 )
                 accepted = bool(frame_report["accepted"])
                 exact_report = None
+                # Coaxial refinement is optional and only configured for a
+                # subset of assembly tasks.  The accepted-pose bookkeeping
+                # below is shared by exact and point-render paths, so its gate
+                # must have an explicit false value for ordinary parts.
+                coaxial_active = False
                 if exact_renderer is not None:
                     exact_objective = ExactMultiViewRenderObjective(
                         raw_mesh,
@@ -994,7 +1124,7 @@ def main() -> None:
                         refine_pose_coordinate_search(
                             exact_objective,
                             exact_seed,
-                            optimize_views=part_optimize_views,
+                            optimize_views=effective_optimize,
                             holdout_views=[],
                             translation_steps_m=[
                                 float(value)
@@ -1081,6 +1211,36 @@ def main() -> None:
                             temporal_weight=0.0,
                         )
                     )
+                    table_support_report = None
+                    if (
+                        args.static_anchor_search
+                        and part_refinement.get(
+                            "static_table_alignment", True
+                        )
+                    ):
+                        support_plane = cfg.get("support_plane", {})
+                        if not support_plane.get("accepted", False):
+                            raise ValueError(
+                                "static anchor search requires an accepted "
+                                "support_plane when table alignment is enabled"
+                            )
+                        exact_selected, table_support_report = (
+                            align_pose_to_support_plane(
+                                exact_selected,
+                                metric_vertices,
+                                support_plane,
+                                contact_quantile=float(
+                                    part_refinement.get(
+                                        "static_table_contact_quantile", 0.005
+                                    )
+                                ),
+                                maximum_shift_m=float(
+                                    part_refinement.get(
+                                        "static_table_maximum_shift_m", 0.02
+                                    )
+                                ),
+                            )
+                        )
                     exact_final = exact_objective.evaluate(
                         exact_selected, effective_optimize
                     )
@@ -1142,6 +1302,10 @@ def main() -> None:
                     else:
                         accepted = bool(
                             exact_search["accepted"]
+                            and (
+                                table_support_report is None
+                                or table_support_report["accepted"]
+                            )
                             and exact_holdout_accepted
                             and exact_improvement
                             >= float(
@@ -1184,6 +1348,7 @@ def main() -> None:
                         "loss_improvement": exact_improvement,
                         "search_evaluations": exact_search["evaluations"],
                         "coaxial_constraint": coaxial_report,
+                        "table_support": table_support_report,
                     }
                 continuity_fallback = False
                 if accepted:
@@ -1364,11 +1529,17 @@ def main() -> None:
                     trusted_frames=trusted_frames,
                 )
             )
+            smoothing_fixed_frames = set(protected_anchor_frames)
+            if part_config.get(
+                "post_smoothing_preserve_trusted",
+                refinement.get("post_smoothing_preserve_trusted", False),
+            ):
+                smoothing_fixed_frames.update(trusted_frames)
             smoothed = smooth_pose_ranges(
                 part_poses,
                 post_ranges,
                 passes=post_smoothing_passes,
-                fixed_frames=protected_anchor_frames,
+                fixed_frames=smoothing_fixed_frames,
             )
             smoothed_frames = {
                 frame
@@ -1392,6 +1563,9 @@ def main() -> None:
                 "interpolated_untrusted_frames": interpolated_frames,
                 "fixed_protected_anchor_frames": sorted(
                     protected_anchor_frames
+                ),
+                "fixed_trusted_frames": sorted(
+                    smoothing_fixed_frames.difference(protected_anchor_frames)
                 ),
             }
 
@@ -1536,4 +1710,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    from common.resource_safety import require_memory_guard
+
+    require_memory_guard("tools/stages/pose/refine_pose_render_loss.py")
     main()

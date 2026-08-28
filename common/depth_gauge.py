@@ -13,8 +13,11 @@ assumption that one manipulated part stays fixed is required.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import cv2
 import numpy as np
+from PIL import Image
 
 from common.backproject_utils import load_palette_masks
 from common.normalized_recon import load_recon
@@ -51,9 +54,35 @@ def gauge_masks(
     parts = [str(value) for value in cfg.get("parts", [])]
     if not parts:
         raise ValueError("background depth gauge requires configured parts")
+    views = [str(value) for value in cfg.get("views", [])]
+    if views:
+        background_masks: list[np.ndarray] = []
+        height, width = depth_hw
+        for view in views:
+            path = (
+                Path(cfg["masks_dir"])
+                / timestamp
+                / f"{view}.png"
+            )
+            if not path.is_file():
+                raise FileNotFoundError(path)
+            labels = np.asarray(Image.open(path))
+            if labels.ndim != 2:
+                # RGB masks have no stable integer background-label contract;
+                # retain the legacy configured-part complement below.
+                background_masks = []
+                break
+            background = cv2.resize(
+                (labels == 0).astype(np.uint8),
+                (width, height),
+                interpolation=cv2.INTER_NEAREST,
+            ).astype(bool)
+            background_masks.append(background)
+        if background_masks:
+            return background_masks
     masks = load_palette_masks(
         cfg["masks_dir"], timestamp, parts, depth_hw,
-        views=cfg.get("views"), part_ids=cfg.get("part_ids"),
+        views=views or None, part_ids=cfg.get("part_ids"),
     )
     n_views = len(next(iter(masks.values())))
     return [

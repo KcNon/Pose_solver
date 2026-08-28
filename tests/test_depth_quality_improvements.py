@@ -10,7 +10,7 @@ from PIL import Image
 from common.backproject_utils import load_palette_masks
 from common.depth_artifact import prediction_compatibility, prediction_metadata
 from common.quality_cloud import ViewCloud, fuse_supported_clouds
-from scripts.run_depth_pipeline import build_da3_command
+from scripts.run_depth_pipeline import build_da3_command, validate_reused_da3
 from tools.diagnostics.render_multiview_point_cloud import (
     projection_bases,
     render_projection,
@@ -130,6 +130,15 @@ class DepthArtifactTests(unittest.TestCase):
         self.assertIn("--camera-npz", command)
         self.assertNotIn("--camera-frame", command)
         self.assertNotIn("--camera-frames", command)
+
+    def test_reused_da3_requires_every_requested_frame(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "000100").mkdir()
+            (root / "000100" / "predictions.npz").touch()
+            validate_reused_da3(root, ["000100"])
+            with self.assertRaisesRegex(FileNotFoundError, "000101"):
+                validate_reused_da3(root, ["000100", "000101"])
 
 
 class PointCloudResolutionTests(unittest.TestCase):

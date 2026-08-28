@@ -28,6 +28,35 @@ from common.pose_transforms import transform_points
 from common.physics_control import dynamic_collision_approximation
 
 
+MAX_MATERIALIZED_COMPONENT_FACES = 100_000
+
+
+def materialize_collision_components(
+    mesh: trimesh.Trimesh,
+    *,
+    proxy_type: str,
+    maximum_faces: int = MAX_MATERIALIZED_COMPONENT_FACES,
+) -> list[trimesh.Trimesh]:
+    """Split only deliberately small physics proxies.
+
+    ``trimesh.split`` duplicates component geometry and can consume hundreds
+    of gigabytes on dense reconstruction meshes.  Raw visual meshes are kept
+    as one collision asset; a configured proxy that is still dense is a
+    configuration error and must be simplified before Isaac export.
+    """
+
+    if str(proxy_type) == "raw":
+        return [mesh]
+    face_count = int(len(mesh.faces))
+    if face_count > int(maximum_faces):
+        raise RuntimeError(
+            "refusing to materialize connected components for dense collision "
+            f"proxy ({face_count} faces > {int(maximum_faces)}); configure a "
+            "low-poly compound, revolved_solid, cylinder, or voxel_shell proxy"
+        )
+    return list(mesh.split(only_watertight=False))
+
+
 def resolve_path(project_root: Path, value: str) -> Path:
     path = Path(value)
     return path if path.is_absolute() else project_root / path
@@ -91,10 +120,16 @@ def export_simulation_assets(
             config.get("collision_proxies", {}).get(part),
         )
         export_collision_obj(collision_mesh, collision_path)
-        if collision_proxy["type"] == "raw":
-            collision_components = [collision_mesh]
-        else:
-            collision_components = list(collision_mesh.split(only_watertight=False))
+        collision_components = materialize_collision_components(
+            collision_mesh,
+            proxy_type=str(collision_proxy["type"]),
+            maximum_faces=int(
+                config.get(
+                    "maximum_materialized_collision_component_faces",
+                    MAX_MATERIALIZED_COMPONENT_FACES,
+                )
+            ),
+        )
         collision_components_by_part[part] = collision_components
         component_paths = []
         for index, component in enumerate(collision_components):

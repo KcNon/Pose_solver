@@ -102,13 +102,18 @@ def _appearance_evidence_frames(
     *,
     count: int,
     minimum_separation: int,
+    require_cloud_quality: bool = True,
 ) -> list[int]:
     """Choose several high-quality, temporally distinct stable observations."""
 
     candidates = [
         int(frame)
         for frame in window
-        if int(frame) in rows and _anchor_frame_usable(rows[int(frame)])
+        if int(frame) in rows
+        and _anchor_frame_usable(
+            rows[int(frame)],
+            require_cloud_quality=require_cloud_quality,
+        )
     ]
     ranked = sorted(candidates, key=lambda frame: _frame_score(rows[frame]), reverse=True)
     chosen: list[int] = []
@@ -143,9 +148,17 @@ def _cloud_quality_rows(
     return result
 
 
-def _anchor_frame_usable(row: dict[str, Any]) -> bool:
+def _anchor_frame_usable(
+    row: dict[str, Any],
+    *,
+    require_cloud_quality: bool = True,
+) -> bool:
     quality = row.get("cloud_quality")
-    return quality is None or quality.get("status") == "ok"
+    return (
+        not require_cloud_quality
+        or quality is None
+        or quality.get("status") == "ok"
+    )
 
 
 def choose_reference_part(
@@ -244,14 +257,25 @@ def _stable_frames(
     start: int,
     end: int,
     minimum_views: int,
+    require_cloud_quality: bool = True,
+    allow_occluded: bool = False,
 ) -> list[int]:
+    stable_states = {"static", "assembled"}
+    if allow_occluded:
+        # The state detector assigns ``occluded`` only after its kinematic
+        # hysteresis classified the frame as static.  Such a frame is valid as
+        # a render-validated fallback, never as an ordinary complete anchor.
+        stable_states.add("occluded")
     return [
         frame
         for frame in range(start, end + 1)
         if frame in rows
-        and rows[frame].get("state") in {"static", "assembled"}
+        and rows[frame].get("state") in stable_states
         and int(rows[frame].get("observing_views", 0)) >= minimum_views
-        and _anchor_frame_usable(rows[frame])
+        and _anchor_frame_usable(
+            rows[frame],
+            require_cloud_quality=require_cloud_quality,
+        )
     ]
 
 
@@ -262,12 +286,16 @@ def choose_calibration_window(
     end: int,
     minimum_views: int,
     window_size: int,
+    require_cloud_quality: bool = True,
+    allow_occluded: bool = False,
 ) -> list[int]:
     stable = set(_stable_frames(
         rows,
         start=start,
         end=end,
         minimum_views=minimum_views,
+        require_cloud_quality=require_cloud_quality,
+        allow_occluded=allow_occluded,
     ))
     candidates: list[tuple[float, list[int]]] = []
     for first in range(start, end + 1):
@@ -312,6 +340,8 @@ def choose_calibration_windows(
     window_size: int,
     maximum_windows: int,
     minimum_separation: int,
+    require_cloud_quality: bool = True,
+    allow_occluded: bool = False,
 ) -> list[list[int]]:
     """Return several high-quality, time-separated calibration windows."""
 
@@ -325,6 +355,8 @@ def choose_calibration_windows(
                 end=end,
                 minimum_views=minimum_views,
                 window_size=window_size,
+                require_cloud_quality=require_cloud_quality,
+                allow_occluded=allow_occluded,
             )
         except RuntimeError:
             break
@@ -378,6 +410,8 @@ def infer_anchors(
     search_frames: int | None = None,
     candidates_per_interval: int = 1,
     candidate_minimum_separation: int = 8,
+    require_cloud_quality: bool = True,
+    allow_occluded: bool = False,
 ) -> tuple[list[int], dict[str, list[int]]]:
     """Choose registration anchors from the static intervals around motion.
 
@@ -391,6 +425,9 @@ def infer_anchors(
     anchors: list[int] = []
     windows: dict[str, list[int]] = {}
     merged_dynamic = _merge_ranges(dynamic_ranges)
+    stable_states = {"static", "assembled"}
+    if allow_occluded:
+        stable_states.add("occluded")
 
     def add_static_interval(
         interval_start: int,
@@ -417,6 +454,8 @@ def infer_anchors(
             window_size=window_size,
             maximum_windows=candidates_per_interval,
             minimum_separation=candidate_minimum_separation,
+            require_cloud_quality=require_cloud_quality,
+            allow_occluded=allow_occluded,
         )
         for window in candidate_windows:
             anchor = max(window, key=lambda frame: _frame_score(rows[frame]))
@@ -464,9 +503,12 @@ def infer_anchors(
             frame
             for frame in range(part_start, dynamic_start)
             if frame in rows
-            and rows[frame].get("state") in {"static", "assembled"}
+            and rows[frame].get("state") in stable_states
             and int(rows[frame].get("observing_views", 0)) >= minimum_views
-            and _anchor_frame_usable(rows[frame])
+            and _anchor_frame_usable(
+                rows[frame],
+                require_cloud_quality=require_cloud_quality,
+            )
         ]
         if stable_before and not any(anchor < dynamic_start for anchor in anchors):
             raise RuntimeError(
@@ -477,8 +519,12 @@ def infer_anchors(
         visible = [
             frame for frame, row in rows.items()
             if frame >= part_start
+            and row.get("state") in stable_states
             and int(row.get("observing_views", 0)) >= minimum_views
-            and _anchor_frame_usable(row)
+            and _anchor_frame_usable(
+                row,
+                require_cloud_quality=require_cloud_quality,
+            )
         ]
         if not visible:
             raise RuntimeError("no sufficiently visible anchor frame")
@@ -507,6 +553,13 @@ def resolve_pose_config(
     settings.setdefault("reference_policy", "first_settled_window")
     settings.setdefault("stable_settling_frames", 5)
     settings.setdefault("require_stable_cloud_quality", True)
+    # Small or distant parts can have excellent multi-view masks while a
+    # strict fused-cloud gate rejects every frame in a short stable interval.
+    # Keep cloud-qualified anchors as the first choice, then permit an
+    # auditable mask-visible fallback that downstream render objectives must
+    # verify instead of making the whole sequence unsolvable.
+    settings.setdefault("allow_mask_only_anchor_fallback", True)
+    settings.setdefault("scale_consensus_first_static_interval", True)
     settings.setdefault("validate_table_support", True)
     settings.setdefault("require_table_support", True)
     settings.setdefault("align_reference_to_table", True)
@@ -521,6 +574,10 @@ def resolve_pose_config(
         ],
     )
     scale_settings.setdefault("maximum_anchor_frames", 3)
+    # A single rigid part has one physical scale.  Re-estimating it from later
+    # static intervals (often cropped, occluded, or already assembled) lets a
+    # pose/visibility error masquerade as a metric size correction.
+    scale_settings.setdefault("first_static_interval_only", True)
     scale_settings.setdefault("exact_mesh_render", True)
     scale_settings.setdefault("resolution", [320, 180])
     scale_settings.setdefault("minimum_improvement", 0.005)
@@ -700,6 +757,13 @@ def resolve_pose_config(
         "settings": settings,
         "parts": {},
     }
+    multiframe = resolved.get("multiframe_optimization", {})
+    multiframe_enabled = bool(multiframe.get("enabled", False))
+    multiframe_auto = dict(multiframe.get("auto", {}))
+    multiframe_windows = multiframe.setdefault("windows", [])
+    multiframe_window_names = {
+        str(window.get("name", "")) for window in multiframe_windows
+    }
     for part in resolved["parts"]:
         rows = _state_rows(state_report, part)
         if not rows:
@@ -786,6 +850,26 @@ def resolve_pose_config(
                 appearance.setdefault("photometric_erosion_pixels", 2)
                 appearance.setdefault("photometric_blur_sigma", 1.5)
                 appearance.setdefault("photometric_minimum_pixels", 60)
+                # For the world-reference body, PCA fixes the upright basin
+                # but does not densely test rotation around gravity.  Search
+                # that remaining observable degree of freedom on the first
+                # clean tabletop interval.  Thin cables and other articulated
+                # appendages are removed from this auxiliary yaw score only;
+                # the original masks remain authoritative for pose/scale QA.
+                appearance.setdefault(
+                    "table_yaw_search",
+                    part == resolved.get("reference_part"),
+                )
+                appearance.setdefault("table_yaw_step_deg", 30.0)
+                appearance.setdefault(
+                    "table_yaw_first_static_interval_only", True
+                )
+                appearance.setdefault("rigid_core_opening_pixels", 2)
+                appearance.setdefault("rigid_core_keep_largest", True)
+                appearance.setdefault(
+                    "rigid_core_silhouette_weight",
+                    0.75 if part == resolved.get("reference_part") else 0.0,
+                )
                 appearance.setdefault("table_support_weight", 0.3)
                 appearance.setdefault(
                     "table_support_maximum_observed_bottom_gap_m", 0.05
@@ -795,9 +879,34 @@ def resolve_pose_config(
                 appearance.setdefault(
                     "table_support_penetration_tolerance_m", 0.005
                 )
+                # Compare orientation basins only after removing their
+                # table-normal translation nuisance.  Otherwise a wrong
+                # top/bottom basin can win solely because its registration
+                # happened to place one face closer to the support plane.
+                appearance.setdefault(
+                    "normalize_table_height_before_scoring", True
+                )
+                appearance.setdefault(
+                    "table_height_maximum_shift_m", 0.05
+                )
+                # Texture may resolve a near-symmetric rotation, but it must
+                # not override a materially worse multi-view silhouette.
+                appearance.setdefault("maximum_candidate_iou_drop", 0.04)
+                appearance.setdefault("relative_iou_gate_penalty", 1.0)
                 appearance.setdefault("worst_view_weight", 0.25)
                 appearance.setdefault("transition_weight", 0.5)
-                appearance.setdefault("max_rotation_deg_per_frame", 10.0)
+                # Candidate-chain continuity and final trajectory validation
+                # must use the same physical rate envelope.  A stricter hidden
+                # appearance default can make every orientation candidate
+                # unreachable even though that motion is valid downstream.
+                appearance.setdefault(
+                    "max_rotation_deg_per_frame",
+                    float(
+                        state.get("validation", {}).get(
+                            "max_rotation_step_deg", 25.0
+                        )
+                    ),
+                )
                 appearance.setdefault("hard_rotation_rate", True)
                 appearance.setdefault("max_translation_m_per_frame", 0.05)
         else:
@@ -850,6 +959,98 @@ def resolve_pose_config(
                 [int(pair[0]), int(pair[1])] for pair in static
             ]
 
+        generated_multiframe_windows = []
+        if multiframe_enabled and multiframe.get(
+            "auto_static_windows", False
+        ):
+            minimum_static_frames = int(
+                multiframe_auto.get("minimum_static_frames", 5)
+            )
+            for range_start, range_end in static:
+                if range_end - range_start + 1 < minimum_static_frames:
+                    continue
+                name = f"auto_static_{part}_{range_start}_{range_end}"
+                if name in multiframe_window_names:
+                    continue
+                window = {
+                    "name": name,
+                    "mode": "static_window",
+                    "part": part,
+                    "frame_range": [int(range_start), int(range_end)],
+                    "maximum_evidence_frames": int(
+                        multiframe_auto.get("maximum_evidence_frames", 5)
+                    ),
+                    "maximum_candidate_frames": int(
+                        multiframe_auto.get("maximum_candidate_frames", 9)
+                    ),
+                    "minimum_observing_views": int(
+                        multiframe_auto.get("minimum_observing_views", 2)
+                    ),
+                    "maximum_visual_loss_degradation": float(
+                        multiframe_auto.get(
+                            "static_maximum_visual_loss_degradation", 0.08
+                        )
+                    ),
+                }
+                multiframe_windows.append(window)
+                multiframe_window_names.add(name)
+                generated_multiframe_windows.append(name)
+        if multiframe_enabled and multiframe.get(
+            "auto_dynamic_windows", False
+        ):
+            minimum_dynamic_frames = int(
+                multiframe_auto.get("minimum_dynamic_frames", 3)
+            )
+            for range_start, range_end in dynamic:
+                if range_end - range_start + 1 < minimum_dynamic_frames:
+                    continue
+                name = f"auto_dynamic_{part}_{range_start}_{range_end}"
+                if name in multiframe_window_names:
+                    continue
+                window = {
+                    "name": name,
+                    "mode": "dynamic_window",
+                    "part": part,
+                    "frame_range": [int(range_start), int(range_end)],
+                    "candidate_radius_frames": int(
+                        multiframe_auto.get("candidate_radius_frames", 2)
+                    ),
+                    "maximum_translation_step_m": float(
+                        multiframe_auto.get(
+                            "maximum_translation_step_m", 0.04
+                        )
+                    ),
+                    "maximum_rotation_step_deg": float(
+                        multiframe_auto.get(
+                            "maximum_rotation_step_deg", 20.0
+                        )
+                    ),
+                    "maximum_internal_translation_degradation_m": float(
+                        multiframe_auto.get(
+                            "maximum_internal_translation_degradation_m", 0.0
+                        )
+                    ),
+                    "maximum_internal_rotation_degradation_deg": float(
+                        multiframe_auto.get(
+                            "maximum_internal_rotation_degradation_deg", 0.0
+                        )
+                    ),
+                    "temporal_weight": float(
+                        multiframe_auto.get("temporal_weight", 0.20)
+                    ),
+                    "baseline_weight": float(
+                        multiframe_auto.get("baseline_weight", 0.03)
+                    ),
+                    "maximum_visual_loss_degradation": float(
+                        multiframe_auto.get(
+                            "maximum_visual_loss_degradation", 0.03
+                        )
+                    ),
+                }
+                multiframe_windows.append(window)
+                multiframe_window_names.add(name)
+                generated_multiframe_windows.append(name)
+
         part_audit: dict[str, Any] = {
             "detected_dynamic_ranges": detected,
             "resolved_dynamic_ranges": dynamic,
@@ -860,6 +1061,7 @@ def resolve_pose_config(
                 and settings.get("lock_detected_static_pose", True)
                 else []
             ),
+            "generated_multiframe_windows": generated_multiframe_windows,
         }
         if part == reference and allow_moving_reference and dynamic:
             validation = state.setdefault("validation", {})
@@ -916,18 +1118,49 @@ def resolve_pose_config(
         if settings.get("infer_anchors", False) and (
             part != reference or allow_moving_reference
         ):
-            anchors, windows = infer_anchors(
-                rows,
-                dynamic,
-                sequence_start=start,
-                sequence_end=end,
-                part_start=part_start,
-                minimum_views=minimum_views,
-                window_size=anchor_window,
-                search_frames=anchor_search,
-                candidates_per_interval=candidates_per_interval,
-                candidate_minimum_separation=candidate_minimum_separation,
-            )
+            anchor_requires_cloud_quality = True
+            try:
+                anchors, windows = infer_anchors(
+                    rows,
+                    dynamic,
+                    sequence_start=start,
+                    sequence_end=end,
+                    part_start=part_start,
+                    minimum_views=minimum_views,
+                    window_size=anchor_window,
+                    search_frames=anchor_search,
+                    candidates_per_interval=candidates_per_interval,
+                    candidate_minimum_separation=(
+                        candidate_minimum_separation
+                    ),
+                    require_cloud_quality=True,
+                    allow_occluded=False,
+                )
+            except RuntimeError as error:
+                if not settings["allow_mask_only_anchor_fallback"]:
+                    raise
+                anchors, windows = infer_anchors(
+                    rows,
+                    dynamic,
+                    sequence_start=start,
+                    sequence_end=end,
+                    part_start=part_start,
+                    minimum_views=minimum_views,
+                    window_size=anchor_window,
+                    search_frames=anchor_search,
+                    candidates_per_interval=candidates_per_interval,
+                    candidate_minimum_separation=(
+                        candidate_minimum_separation
+                    ),
+                    require_cloud_quality=False,
+                    allow_occluded=True,
+                )
+                anchor_requires_cloud_quality = False
+                part_audit["anchor_quality_fallback"] = {
+                    "mode": "static_multiview_mask_visible",
+                    "strict_failure": str(error),
+                    "requires_downstream_render_validation": True,
+                }
             state["anchor_frames"] = anchors
             state["anchor_windows"] = windows
             if (
@@ -967,6 +1200,9 @@ def resolve_pose_config(
                         rows,
                         count=evidence_count,
                         minimum_separation=evidence_separation,
+                        require_cloud_quality=(
+                            anchor_requires_cloud_quality
+                        ),
                     )
                     for anchor in anchors
                 }

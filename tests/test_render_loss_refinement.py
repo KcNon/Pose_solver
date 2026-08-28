@@ -6,6 +6,7 @@ import numpy as np
 import trimesh
 from scipy.spatial.transform import Rotation
 
+from common.occlusion_masks import known_occluder_mask
 from common.render_loss_refinement import (
     MultiViewRenderObjective,
     RenderObservation,
@@ -20,6 +21,20 @@ from common.render_loss_refinement import (
 
 
 class RenderLossRefinementTests(unittest.TestCase):
+    def test_known_occluder_labels_can_isolate_hand_ablation(self) -> None:
+        labels = np.asarray([[0, 1, 2, 3]], dtype=np.uint8)
+        rigid_only = known_occluder_mask(labels, 1, [1, 2])
+        with_hand = known_occluder_mask(labels, 1, [1, 2, 3])
+        legacy = known_occluder_mask(labels, 1)
+
+        np.testing.assert_array_equal(
+            rigid_only, np.asarray([[False, False, True, False]])
+        )
+        np.testing.assert_array_equal(
+            with_hand, np.asarray([[False, False, True, True]])
+        )
+        np.testing.assert_array_equal(with_hand, legacy)
+
     def setUp(self) -> None:
         mesh = trimesh.creation.icosphere(subdivisions=3, radius=0.3)
         self.points = np.asarray(mesh.vertices, dtype=np.float64)

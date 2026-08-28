@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from common.connector_geometry import validate_connector_config
+from common.multiframe_pose import validate_multiframe_settings
 from common.symmetry import symmetry_spec_from_state
 
 
@@ -117,6 +119,23 @@ def validate_pose_config(
             "registration voxel_sizes_m and max_correspondence_m must have "
             "the same non-zero length"
         )
+    endpoint_consistency = registration.get(
+        "endpoint_rotation_consistency", {}
+    )
+    if not isinstance(endpoint_consistency, dict):
+        raise ValueError(
+            "registration.endpoint_rotation_consistency must be an object"
+        )
+    if (
+        endpoint_consistency.get("enabled", False)
+        and float(
+            endpoint_consistency.get("maximum_correction_deg", 90.0)
+        ) <= 0.0
+    ):
+        raise ValueError(
+            "registration.endpoint_rotation_consistency."
+            "maximum_correction_deg must be positive"
+        )
     support_ranges = config.get("automation", {}).get(
         "table_support_ranges", {}
     )
@@ -138,6 +157,18 @@ def validate_pose_config(
                     f"{part}: table support range {range_start}..{range_end} "
                     f"must lie in configured frames {start}..{end}"
                 )
+    validate_multiframe_settings(
+        config,
+        parts=parts,
+        frame_start=start,
+        frame_end=end,
+    )
+    validate_connector_config(
+        config.get("connectors"),
+        parts=parts,
+        frame_start=start,
+        frame_end=end,
+    )
     constraints = config.get("trajectory_constraints", {})
     if constraints.get("enabled", False):
         proxy_config = constraints.get(

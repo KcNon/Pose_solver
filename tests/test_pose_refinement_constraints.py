@@ -10,10 +10,34 @@ from common.pose_refinement import (
     smooth_pose_ranges,
 )
 from tools.stages.pose.stabilize_static_pose import interpolate_pose
-from tools.stages.pose.refine_pose_render_loss import exact_holdout_gate
+from tools.stages.pose.refine_pose_render_loss import (
+    exact_holdout_gate,
+    other_part_touch_ratio,
+)
+from tools.stages.pose.render_multiview_pose import resolved_render_settings
 
 
 class PoseConstraintTests(unittest.TestCase):
+    def test_other_part_touch_ratio_is_a_boundary_fraction(self):
+        target = np.zeros((15, 15), dtype=bool)
+        target[4:11, 4:11] = True
+        other = np.zeros_like(target)
+        other[3:12, 11:13] = True
+        ratio = other_part_touch_ratio(
+            target, other, dilation_pixels=1
+        )
+        self.assertGreater(ratio, 0.0)
+        self.assertLessEqual(ratio, 1.0)
+
+    def test_minimal_pose_config_has_render_defaults(self):
+        settings = resolved_render_settings({
+            "views": ["camera_0"],
+            "frames": {"start": 1, "end": 2},
+        })
+        self.assertEqual(settings["primary_view"], "camera_0")
+        self.assertEqual(settings["fps"], 5.0)
+        self.assertGreater(settings["axis_length_m"], 0.0)
+
     def test_exact_triangle_stage_cannot_bypass_holdout_gate(self):
         accepted, report = exact_holdout_gate(
             {"loss": 0.30, "mean_iou": 0.70},

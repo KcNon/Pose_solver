@@ -107,13 +107,24 @@ class SceneRenderer:
         """Textured color (H,W,3 uint8) + depth (H,W float, 0 = background)."""
         scene = pyrender.Scene(bg_color=[0.0, 0.0, 0.0, 0.0],
                                ambient_light=[0.45, 0.45, 0.45])
-        for mesh, T in parts:
-            self._scene_mesh(scene, mesh, T)
-        cam_pose = self._camera_node(scene, K, E)
-        scene.add(pyrender.DirectionalLight(color=[1.0, 1.0, 1.0], intensity=4.0),
-                  pose=cam_pose)
-        color, depth = self._r.render(scene)
-        return color[..., :3].copy(), depth
+        try:
+            for mesh, T in parts:
+                self._scene_mesh(scene, mesh, T)
+            cam_pose = self._camera_node(scene, K, E)
+            scene.add(
+                pyrender.DirectionalLight(
+                    color=[1.0, 1.0, 1.0], intensity=4.0
+                ),
+                pose=cam_pose,
+            )
+            color, depth = self._r.render(scene)
+            return color[..., :3].copy(), depth.copy()
+        finally:
+            # A relation search can create tens of thousands of short-lived
+            # scenes.  Explicitly detach their nodes instead of relying on a
+            # later cyclic-GC pass; cached pyrender.Mesh resources remain
+            # owned by this renderer and are reused by the next scene.
+            scene.clear()
 
     def render_seg(
         self,
@@ -127,34 +138,47 @@ class SceneRenderer:
         """
         scene = pyrender.Scene(bg_color=[0.0, 0.0, 0.0, 0.0], ambient_light=[1, 1, 1])
         node_color = {}
-        for i, (name, mesh, T) in enumerate(parts):
-            if self._cache_mesh_resources:
-                key = id(mesh)
-                resource = self._mesh_cache.get(key)
-                if resource is None:
-                    resource = pyrender.Mesh.from_trimesh(mesh, smooth=False)
-                    self._mesh_cache[key] = resource
-                node = scene.add(
-                    resource, pose=np.asarray(T, dtype=np.float64)
-                )
-            else:
-                node = scene.add(
-                    pyrender.Mesh.from_trimesh(
-                        _baked_mesh(mesh, T), smooth=False
+        try:
+            for i, (name, mesh, T) in enumerate(parts):
+                if self._cache_mesh_resources:
+                    key = id(mesh)
+                    resource = self._mesh_cache.get(key)
+                    if resource is None:
+                        resource = pyrender.Mesh.from_trimesh(
+                            mesh, smooth=False
+                        )
+                        self._mesh_cache[key] = resource
+                    node = scene.add(
+                        resource, pose=np.asarray(T, dtype=np.float64)
                     )
+                else:
+                    node = scene.add(
+                        pyrender.Mesh.from_trimesh(
+                            _baked_mesh(mesh, T), smooth=False
+                        )
+                    )
+                # distinct, well-separated colors
+                node_color[node] = np.array(
+                    [
+                        (i * 67 + 40) % 256,
+                        (i * 113 + 90) % 256,
+                        (i * 191 + 150) % 256,
+                    ],
+                    dtype=np.uint8,
                 )
-            # distinct, well-separated colors
-            node_color[node] = np.array([(i * 67 + 40) % 256,
-                                         (i * 113 + 90) % 256,
-                                         (i * 191 + 150) % 256], dtype=np.uint8)
-        self._camera_node(scene, K, E)
-        seg, _ = self._r.render(scene, flags=pyrender.RenderFlags.SEG,
-                                seg_node_map=node_color)
-        out = {}
-        for (name, _, _), node in zip(parts, node_color):
-            c = node_color[node]
-            out[name] = np.all(seg == c[None, None, :], axis=2)
-        return out
+            self._camera_node(scene, K, E)
+            seg, _ = self._r.render(
+                scene,
+                flags=pyrender.RenderFlags.SEG,
+                seg_node_map=node_color,
+            )
+            out = {}
+            for (name, _, _), node in zip(parts, node_color):
+                c = node_color[node]
+                out[name] = np.all(seg == c[None, None, :], axis=2)
+            return out
+        finally:
+            scene.clear()
 
 
 def normals_from_depth(depth: np.ndarray, K: np.ndarray) -> np.ndarray:

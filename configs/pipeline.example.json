@@ -30,7 +30,17 @@
     }
   },
   "output": {"root": "/path/to/experiments/example_object"},
-  "runtime": {"devices": [6, 7]},
+  "runtime": {
+    "devices": [6, 7],
+    "memory_guard": {
+      "enabled": true,
+      "minimum_available_gib": 128,
+      "maximum_process_rss_gib": 32,
+      "poll_seconds": 1,
+      "report_seconds": 10,
+      "stop_grace_seconds": 2
+    }
+  },
   "models": {
     "qwen_python": "/path/to/qwen/.venv/bin/python",
     "qwen_model": "/path/to/Qwen3-VL",

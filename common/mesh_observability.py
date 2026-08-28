@@ -61,6 +61,7 @@ def infer_mesh_observability(
     maximum_points: int = 12000,
     continuous_tolerance: float = 0.025,
     cyclic_tolerance: float = 0.018,
+    thin_axial_variance_ratio: float = 0.08,
 ) -> dict[str, Any]:
     """Infer conservative geometric symmetry candidates from raw coordinates.
 
@@ -94,7 +95,13 @@ def infer_mesh_observability(
             "errors": errors,
             "continuous_score": max(errors["30"], errors["45"]),
         })
-    best = min(candidates, key=lambda row: row["continuous_score"])
+    best_index, best = min(
+        enumerate(candidates),
+        key=lambda item: item[1]["continuous_score"],
+    )
+    axial_variance_ratio = float(
+        eigenvalues[best_index] / max(float(eigenvalues[0]), 1e-12)
+    )
     symmetry: dict[str, Any] = {"equivalence": "none"}
     confidence = "low"
     if float(best["continuous_score"]) <= continuous_tolerance:
@@ -103,6 +110,13 @@ def infer_mesh_observability(
             "axis_raw": best["axis_raw"],
             "candidate_step_deg": 15.0,
         }
+        if axial_variance_ratio <= float(thin_axial_variance_ratio):
+            # A thin disk has two non-equivalent faces even though rotations
+            # around its normal are geometrically near-symmetric.  Masks and
+            # texture must therefore compare both normal directions.  Mark
+            # this as an observation ambiguity (candidate branch), never as a
+            # pose equivalence that could hide a real 180-degree error.
+            symmetry["observation_ambiguities"] = ["axis_flip"]
         confidence = (
             "high"
             if float(best["continuous_score"]) <= 0.5 * continuous_tolerance
@@ -131,6 +145,8 @@ def infer_mesh_observability(
         "confidence": confidence,
         "has_texture": mesh_has_texture(mesh),
         "principal_variance_ratios": ratios,
+        "symmetry_axis_variance_ratio": axial_variance_ratio,
+        "thin_axial_variance_ratio": float(thin_axial_variance_ratio),
         "axis_candidates": candidates,
         "method": "pca_axes_rotated_surface_p75_nn_v1",
     }

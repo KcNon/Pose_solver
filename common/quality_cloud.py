@@ -163,15 +163,24 @@ def prepare_view_clouds(
     return result
 
 
-def assign_cross_view_support(clouds: list[ViewCloud], radius_m: float) -> None:
+def assign_cross_view_support(
+    clouds: list[ViewCloud],
+    radius_m: float,
+    *,
+    workers: int = 4,
+) -> None:
     """Count other views with a point within ``radius_m`` of each sample."""
+    if not 1 <= int(workers) <= 32:
+        raise ValueError("nearest-neighbour workers must be in [1, 32]")
     trees = [cKDTree(cloud.points) if len(cloud.points) else None for cloud in clouds]
     for source_index, source in enumerate(clouds):
         support = np.zeros(len(source.points), np.int16)
         for target_index, tree in enumerate(trees):
             if target_index == source_index or tree is None or not len(source.points):
                 continue
-            distance, _ = tree.query(source.points, k=1, workers=-1)
+            distance, _ = tree.query(
+                source.points, k=1, workers=int(workers)
+            )
             support += distance <= float(radius_m)
         source.support = support
 
@@ -396,8 +405,15 @@ def quality_gate(
     }
 
 
-def cross_view_consistency(clouds: list[ViewCloud], radius_m: float) -> dict:
+def cross_view_consistency(
+    clouds: list[ViewCloud],
+    radius_m: float,
+    *,
+    workers: int = 4,
+) -> dict:
     """Symmetric nearest-neighbour consistency over overlapping view pairs."""
+    if not 1 <= int(workers) <= 32:
+        raise ValueError("nearest-neighbour workers must be in [1, 32]")
     pair_reports = []
     for first in range(len(clouds)):
         if not len(clouds[first].points):
@@ -406,8 +422,8 @@ def cross_view_consistency(clouds: list[ViewCloud], radius_m: float) -> dict:
             if not len(clouds[second].points):
                 continue
             a, b = clouds[first].points, clouds[second].points
-            d_ab, _ = cKDTree(b).query(a, k=1, workers=-1)
-            d_ba, _ = cKDTree(a).query(b, k=1, workers=-1)
+            d_ab, _ = cKDTree(b).query(a, k=1, workers=int(workers))
+            d_ba, _ = cKDTree(a).query(b, k=1, workers=int(workers))
             distances = np.concatenate((d_ab, d_ba))
             pair_reports.append({
                 "views": [first, second],

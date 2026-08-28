@@ -12,6 +12,48 @@ from typing import Any
 import numpy as np
 
 
+def earliest_static_interval_scale_fits(
+    fits: list[dict[str, Any]],
+    static_ranges: list[list[int]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Keep scale evidence from the earliest static interval with anchors.
+
+    Scale is an intrinsic property of a part.  Later relocation anchors often
+    contain only a clipped or occluded surface, so allowing them to re-estimate
+    7DoF scale can overwhelm the complete initial placement.  They remain
+    useful for fixed-scale SE(3), but not for metric-size consensus.
+    """
+
+    ordered_ranges = sorted(
+        ([int(value[0]), int(value[1])] for value in static_ranges),
+        key=lambda value: (value[0], value[1]),
+    )
+    for start, end in ordered_ranges:
+        selected = [
+            fit for fit in fits
+            if start <= int(fit["frame"]) <= end
+        ]
+        if selected:
+            return selected, {
+                "method": "earliest_static_interval_with_scale_anchors",
+                "static_range": [start, end],
+                "selected_frames": [int(fit["frame"]) for fit in selected],
+                "excluded_frames": [
+                    int(fit["frame"])
+                    for fit in fits
+                    if not start <= int(fit["frame"]) <= end
+                ],
+                "fallback_to_all_fits": False,
+            }
+    return list(fits), {
+        "method": "all_available_scale_anchors",
+        "static_range": None,
+        "selected_frames": [int(fit["frame"]) for fit in fits],
+        "excluded_frames": [],
+        "fallback_to_all_fits": True,
+    }
+
+
 def select_anchor_scale(
     fits: list[dict[str, Any]],
     *,

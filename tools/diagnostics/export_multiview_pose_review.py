@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from common.io_utils import load_json, write_json
+from common.geom import project_points
 from common.mesh_render import SceneRenderer
 from common.normalized_recon import load_recon
 from common.pose_visualization import (
@@ -37,6 +38,57 @@ def record_visible_in_view(record: dict, view: str) -> bool:
     return int(record.get("observing_views", 0)) > 0
 
 
+def draw_pose_axes(
+    image: np.ndarray,
+    pose: np.ndarray,
+    intrinsics: np.ndarray,
+    extrinsics: np.ndarray,
+    length_m: float,
+) -> None:
+    """Draw the part-frame XYZ axes in red, green, and blue."""
+
+    points = np.vstack([
+        pose[:3, 3],
+        pose[:3, 3] + pose[:3, 0] * length_m,
+        pose[:3, 3] + pose[:3, 1] * length_m,
+        pose[:3, 3] + pose[:3, 2] * length_m,
+    ])
+    uv, depth = project_points(points, intrinsics, extrinsics)
+    if not np.all(np.isfinite(uv)) or np.any(depth <= 0.0):
+        return
+    origin = tuple(np.rint(uv[0]).astype(int))
+    for index, color in enumerate(
+        ((0, 0, 255), (0, 255, 0), (255, 0, 0)), 1
+    ):
+        endpoint = tuple(np.rint(uv[index]).astype(int))
+        cv2.arrowedLine(
+            image, origin, endpoint, color, 3, cv2.LINE_AA, tipLength=0.18
+        )
+
+
+def draw_mask_guides(
+    image: np.ndarray,
+    labels: np.ndarray,
+    part_id: int,
+) -> None:
+    """Draw the observed mask contour and its image-space bounding box."""
+
+    mask = labels == int(part_id)
+    contours, _ = cv2.findContours(
+        mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    cv2.drawContours(image, contours, -1, (255, 255, 255), 2, cv2.LINE_AA)
+    ys, xs = np.nonzero(mask)
+    if len(xs):
+        cv2.rectangle(
+            image,
+            (int(xs.min()), int(ys.min())),
+            (int(xs.max()), int(ys.max())),
+            (0, 255, 255),
+            2,
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
@@ -46,6 +98,17 @@ def main() -> None:
     parser.add_argument("--height", type=int, default=180)
     parser.add_argument("--review-width", type=int, default=640)
     parser.add_argument("--review-height", type=int, default=360)
+    parser.add_argument("--focus-part", default=None)
+    parser.add_argument(
+        "--focus-only",
+        action="store_true",
+        help="render only --focus-part in review sheets",
+    )
+    parser.add_argument(
+        "--draw-pose-guides",
+        action="store_true",
+        help="draw the focus mask contour, bbox, and XYZ pose axes",
+    )
     parser.add_argument("--keyframes", type=int, nargs="*", default=None)
     parser.add_argument("--start-frame", type=int, default=None)
     parser.add_argument("--end-frame", type=int, default=None)
@@ -71,7 +134,8 @@ def main() -> None:
     trajectory_path = Path(args.trajectory or output / "pose" / "trajectory.json").resolve()
     trajectory = load_json(trajectory_path)
     focus_part = str(
-        cfg.get("review", {}).get(
+        args.focus_part
+        or cfg.get("review", {}).get(
             "focus_part", trajectory["parts"][-1]
         )
     )
@@ -221,10 +285,15 @@ def main() -> None:
                     view_index,
                     (args.review_height, args.review_width),
                 )
+                review_parts = (
+                    [focus_part]
+                    if args.focus_only and focus_part in visible_parts
+                    else ([] if args.focus_only else visible_parts)
+                )
                 rgb, depth = renderer.render(
                     [
                         (color_meshes[part], transforms[part])
-                        for part in visible_parts
+                        for part in review_parts
                     ],
                     K,
                     E,
@@ -236,6 +305,31 @@ def main() -> None:
                 visible = depth > 0
                 source[visible] = np.clip(
                     0.42 * source[visible] + 0.58 * rendered[visible], 0, 255).astype(np.uint8)
+                if args.draw_pose_guides:
+                    labels = np.asarray(
+                        Image.open(
+                            Path(cfg["masks_dir"]) / timestamp / f"{view}.png"
+                        )
+                    )
+                    labels = cv2.resize(
+                        labels.astype(np.uint8),
+                        (args.review_width, args.review_height),
+                        interpolation=cv2.INTER_NEAREST,
+                    )
+                    draw_mask_guides(
+                        source, labels, int(cfg["part_ids"][focus_part])
+                    )
+                    pose = np.asarray(
+                        record["parts"][focus_part]["T_world_from_part"],
+                        dtype=np.float64,
+                    )
+                    axis_length = max(
+                        0.025,
+                        float(np.max(raw_meshes[focus_part].extents))
+                        * float(trajectory["scales"][focus_part])
+                        * 0.45,
+                    )
+                    draw_pose_axes(source, pose, K, E, axis_length)
                 focus_metric = report["frames"][timestamp][view][focus_part]
                 label = (
                     f"{timestamp} {view} {focus_part} IoU "
@@ -314,4 +408,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    from common.resource_safety import require_memory_guard
+
+    require_memory_guard("tools/diagnostics/export_multiview_pose_review.py")
     main()

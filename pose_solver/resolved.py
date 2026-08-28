@@ -10,6 +10,22 @@ from pose_solver.artifacts import ArtifactLayout
 from pose_solver.config import PipelineConfig, StageConfig, deep_merge
 
 
+_MASK_CONTRACT_KEYS = (
+    "frames_dir", "work_root", "output_root", "views", "runtime",
+)
+_DEPTH_CONTRACT_KEYS = (
+    "frames_dir", "masks_dir", "mesh_dir", "output_root",
+    "point_cloud_output_root", "views", "parts", "part_ids",
+    "part_start_frames", "frames",
+)
+_POSE_CONTRACT_KEYS = (
+    "frames_dir", "masks_dir", "mesh_dir", "output_root",
+    "point_cloud_output_root", "point_cloud_root", "point_cloud_variant",
+    "recon_backend", "views", "parts", "part_ids", "part_start_frames",
+    "reference_part", "frames", "connectors", "da3_self_cond_dir",
+)
+
+
 def _compatibility_base(stage: StageConfig) -> dict[str, Any]:
     return (
         deepcopy(load_json(stage.compatibility_config))
@@ -25,6 +41,18 @@ def _model(config: PipelineConfig, name: str) -> Any:
             "the stage to mode='reuse' with an artifact path"
         )
     return config.models[name]
+
+
+def _restore_contract(
+    result: dict[str, Any],
+    raw: dict[str, Any],
+    keys: tuple[str, ...],
+) -> None:
+    """Restore source-owned identity fields after applying policy overrides."""
+
+    for key in keys:
+        if key in raw:
+            result[key] = deepcopy(raw[key])
 
 
 def frame_config(config: PipelineConfig) -> dict[str, Any]:
@@ -97,8 +125,7 @@ def mask_config(config: PipelineConfig, layout: ArtifactLayout) -> dict[str, Any
     )
     # Data identity is owned by the source contract, never by an algorithm
     # override or a compatibility preset.
-    for key in ("frames_dir", "work_root", "output_root", "views", "runtime"):
-        result[key] = deepcopy(raw[key])
+    _restore_contract(result, raw, _MASK_CONTRACT_KEYS)
     for name, values in raw["parts"].items():
         result.setdefault("parts", {}).setdefault(name, {}).update(values)
     if set(result["parts"]) != set(raw["parts"]):
@@ -131,6 +158,11 @@ def resolved_part_starts(
 
 
 def masks_dir(config: PipelineConfig, layout: ArtifactLayout) -> Path:
+    source_layout = str(
+        config.mask.overrides.get("source_layout", "frame_first")
+    )
+    if config.mask.mode == "reuse" and source_layout == "view_first":
+        return layout.mask_output / "masks"
     return (
         config.mask.artifact
         if config.mask.mode == "reuse"
@@ -178,7 +210,11 @@ def depth_config(
         "part_start_frames": starts,
         "frames": {"start": config.frame_start, "end": config.frame_end},
         "depth_pipeline": {
-            "da3_python": str(_model(config, "da3_python")),
+            "da3_python": (
+                str(config.models.get("da3_python", ""))
+                if depth_dir
+                else str(_model(config, "da3_python"))
+            ),
             "camera_frames": [
                 config.frame_start,
                 (config.frame_start + config.frame_end) // 2,
@@ -203,12 +239,11 @@ def depth_config(
         deep_merge(_compatibility_base(config.depth), raw),
         config.depth.overrides,
     )
-    for key in (
-        "frames_dir", "masks_dir", "mesh_dir", "output_root",
-        "point_cloud_output_root", "views", "parts", "part_ids",
-        "part_start_frames", "frames",
-    ):
-        result[key] = deepcopy(raw[key])
+    if depth_dir:
+        # ``input.depth_dir`` is an explicit reusable DA3 artifact.  The depth
+        # stage must only validate and post-process it, never launch DA3 again.
+        result.setdefault("depth_pipeline", {})["reuse_existing_da3"] = True
+    _restore_contract(result, raw, _DEPTH_CONTRACT_KEYS)
     quality = result.get("quality_cloud", {})
     if quality.get("enabled", False):
         variant = str(quality.get("variant", "da3_self_cond_quality"))
@@ -224,14 +259,15 @@ def pose_config(
     starts: dict[str, int],
 ) -> dict[str, Any]:
     depth_dir = config.input_options.get("depth_dir")
+    cloud_root = point_cloud_root(config, layout)
     raw = {
         "frames_dir": str(config.frames_dir),
         "masks_dir": str(masks_dir(config, layout)),
         "mesh_dir": str(config.mesh_dir),
         "output_root": str(layout.pose_output),
         "point_cloud_output_root": str(layout.depth_output),
-        "point_cloud_root": str(point_cloud_root(config, layout)),
-        "point_cloud_variant": point_cloud_root(config, layout).name,
+        "point_cloud_root": str(cloud_root),
+        "point_cloud_variant": cloud_root.name,
         "recon_backend": "da3_self_cond",
         "views": list(config.views),
         "parts": config.part_names,
@@ -278,33 +314,57 @@ def pose_config(
             "minimum_fitness": 0.20,
             "maximum_median_nn_m": 0.020,
             "symmetry_lock": True,
+            "endpoint_rotation_consistency": {
+                "enabled": True,
+                "maximum_correction_deg": 90.0,
+                "propagate_to_anchor": True,
+            },
+        },
+        "multiframe_optimization": {
+            "enabled": True,
+            "auto_static_windows": True,
+            "auto_dynamic_windows": True,
+            "windows": [],
+            "auto": {
+                "minimum_static_frames": 5,
+                "minimum_dynamic_frames": 3,
+                "maximum_evidence_frames": 5,
+                "maximum_candidate_frames": 9,
+                "candidate_radius_frames": 2,
+                "minimum_observing_views": min(2, len(config.views)),
+                "maximum_translation_step_m": 0.04,
+                "maximum_rotation_step_deg": 20.0,
+                "temporal_weight": 0.20,
+                "maximum_visual_loss_degradation": 0.03,
+            },
         },
     }
     if depth_dir:
         raw["da3_self_cond_dir"] = str(Path(depth_dir).expanduser().resolve())
+    elif config.depth.mode == "run":
+        # A depth stage produced by this same unified pipeline is just as much
+        # a pose input as an explicitly reused ``input.depth_dir``.  Support
+        # plane validation and render refinement load the normalized DA3
+        # reconstruction directly, so route them to the generated artifact.
+        raw["da3_self_cond_dir"] = str(
+            layout.depth_output / "da3-self-cond"
+        )
+    if config.raw.get("connectors") is not None:
+        raw["connectors"] = deepcopy(config.raw["connectors"])
     compatibility = _compatibility_base(config.pose)
     if compatibility:
         # Compatibility presets carry only the proven algorithm policy. The
         # source config below still owns data identity and artifact routing.
-        contract_keys = (
-            "frames_dir", "masks_dir", "mesh_dir", "output_root",
-            "point_cloud_output_root", "point_cloud_root",
-            "point_cloud_variant", "recon_backend", "views", "parts",
-            "part_ids", "part_start_frames", "reference_part", "frames",
-        )
-        contract = {key: deepcopy(raw[key]) for key in contract_keys}
-        if "da3_self_cond_dir" in raw:
-            contract["da3_self_cond_dir"] = raw["da3_self_cond_dir"]
+        contract = {
+            key: deepcopy(raw[key])
+            for key in _POSE_CONTRACT_KEYS
+            if key in raw
+        }
         result = deep_merge(compatibility, contract)
     else:
         result = deepcopy(raw)
     result = deep_merge(result, config.pose.overrides)
-    for key in (
-        "frames_dir", "masks_dir", "mesh_dir", "output_root",
-        "point_cloud_output_root", "point_cloud_root", "point_cloud_variant",
-        "views", "parts", "part_ids", "part_start_frames", "frames",
-    ):
-        result[key] = deepcopy(raw[key])
+    _restore_contract(result, raw, _POSE_CONTRACT_KEYS)
     # A declared physical reference is part of the source contract. With no
     # declaration, automation may replace this provisional value.
     result["reference_part"] = raw["reference_part"]

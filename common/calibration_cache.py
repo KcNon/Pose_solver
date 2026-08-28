@@ -9,7 +9,7 @@ from common.mask_io import frame_path
 from common.normalized_recon import recon_npz_path
 
 CALIBRATION_ALGORITHM_REVISION = (
-    "reference-anchor-table-tangent-refine-v12"
+    "reference-anchor-table-tangent-refine-v13"
 )
 
 

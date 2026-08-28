@@ -425,6 +425,60 @@ def build_render_observations(
     return result
 
 
+def select_scale_anchor_frames(
+    anchor_frames: list[int],
+    static_ranges: list[list[int]] | list[tuple[int, int]],
+    *,
+    first_static_interval_only: bool,
+) -> tuple[list[int], dict[str, Any]]:
+    """Select geometrically comparable frames for one physical scale.
+
+    Later static intervals are often only *kinematically* static: the object
+    can be partly outside the rig, held by a hand, or assembled with another
+    part.  Such masks are useful for tracking but are not independent metric
+    scale evidence.  Prefer the earliest settled interval that contains a
+    scale anchor and keep the decision auditable in the calibration report.
+    """
+
+    available = sorted({int(frame) for frame in anchor_frames})
+    report: dict[str, Any] = {
+        "policy": (
+            "earliest_static_interval"
+            if first_static_interval_only
+            else "all_available_anchors"
+        ),
+        "available_anchor_frames": available,
+        "selected_static_range": None,
+        "excluded_anchor_frames": [],
+    }
+    if not first_static_interval_only or not available:
+        report["selected_anchor_frames"] = available
+        return available, report
+
+    for start, end in sorted(
+        (int(pair[0]), int(pair[1])) for pair in static_ranges
+    ):
+        selected = [
+            frame for frame in available if start <= frame <= end
+        ]
+        if selected:
+            report.update({
+                "selected_static_range": [start, end],
+                "selected_anchor_frames": selected,
+                "excluded_anchor_frames": sorted(set(available) - set(selected)),
+            })
+            return selected, report
+
+    # Explicit/manual anchors can sit one frame outside a detected interval.
+    # Falling back is safer than silently disabling scale calibration.
+    report.update({
+        "policy": "all_available_anchors_fallback",
+        "reason": "no_anchor_inside_static_ranges",
+        "selected_anchor_frames": available,
+    })
+    return available, report
+
+
 def calibrate_part_scale(
     *,
     cfg: dict[str, Any],
@@ -453,9 +507,17 @@ def calibrate_part_scale(
     if requested_frames is not None:
         requested = {int(value) for value in requested_frames}
         frame_ids = [frame for frame in frame_ids if frame in requested]
+    frame_ids, anchor_selection = select_scale_anchor_frames(
+        frame_ids,
+        cfg.get("states", {}).get(part, {}).get("static_ranges", []),
+        first_static_interval_only=bool(
+            settings.get("first_static_interval_only", True)
+        ),
+    )
     if len(frame_ids) > maximum_frames:
         indices = np.linspace(0, len(frame_ids) - 1, maximum_frames)
         frame_ids = sorted({frame_ids[int(round(value))] for value in indices})
+    anchor_selection["sampled_anchor_frames"] = frame_ids
     observations = {
         frame: build_render_observations(cfg, part, frame, settings)
         for frame in frame_ids
@@ -489,6 +551,7 @@ def calibrate_part_scale(
         ),
         "base_scale": float(base_scale),
         "anchor_frames": frame_ids,
+        "anchor_selection": anchor_selection,
         "usable_anchor_frames": usable,
         "scale_factors": factors,
         "optimize_views": optimize_views,

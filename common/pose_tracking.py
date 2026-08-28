@@ -78,6 +78,103 @@ def interpolate_transform(delta: np.ndarray, fraction: float) -> np.ndarray:
     return result
 
 
+def apply_endpoint_pose_correction(
+    pose: np.ndarray,
+    predicted_end: np.ndarray,
+    target_end: np.ndarray,
+    fraction: float,
+) -> np.ndarray:
+    """Distribute an endpoint correction about the tracked part origin.
+
+    A world-frame left delta contains a translation induced by rotating about
+    the world origin.  Interpolating that transform and premultiplying a pose
+    therefore makes a distant object orbit the world origin.  Endpoint
+    correction instead needs two independent operations: interpolate the
+    orientation delta, and linearly close the tracked part-center offset.
+    """
+
+    amount = float(fraction)
+    pose = np.asarray(pose, dtype=np.float64)
+    predicted_end = np.asarray(predicted_end, dtype=np.float64)
+    target_end = np.asarray(target_end, dtype=np.float64)
+    rotation_delta = target_end[:3, :3] @ predicted_end[:3, :3].T
+    rotation_fraction = Rotation.from_rotvec(
+        Rotation.from_matrix(rotation_delta).as_rotvec() * amount
+    ).as_matrix()
+    result = np.eye(4, dtype=np.float64)
+    result[:3, :3] = rotation_fraction @ pose[:3, :3]
+    result[:3, 3] = pose[:3, 3] + amount * (
+        target_end[:3, 3] - predicted_end[:3, 3]
+    )
+    return result
+
+
+def resolve_endpoint_pose_correction(
+    start_pose: np.ndarray,
+    predicted_end: np.ndarray,
+    target_end: np.ndarray,
+    registration_config: dict,
+) -> tuple[np.ndarray, dict]:
+    """Reject an endpoint orientation jump unsupported by pairwise tracking.
+
+    Absolute mesh registration can choose a different PCA or approximate-
+    symmetry basin at the far anchor.  Such a branch jump must not be spread
+    backwards over an otherwise smooth observed trajectory.  Translation is
+    still closed against the absolute anchor; only the unobserved orientation
+    correction is removed.  The caller may then propagate the resolved
+    orientation to the anchor so the following static interval stays on the
+    same temporal branch.
+    """
+
+    start_pose = np.asarray(start_pose, dtype=np.float64)
+    predicted_end = np.asarray(predicted_end, dtype=np.float64)
+    target_end = np.asarray(target_end, dtype=np.float64)
+    settings = registration_config.get(
+        "endpoint_rotation_consistency", {}
+    )
+    enabled = bool(settings.get("enabled", False))
+    maximum_correction_deg = float(
+        settings.get("maximum_correction_deg", 90.0)
+    )
+    requested_delta = np.eye(4, dtype=np.float64)
+    requested_delta[:3, :3] = (
+        target_end[:3, :3] @ predicted_end[:3, :3].T
+    )
+    requested_rotation_deg = transform_angle(requested_delta)
+    tracked_delta = np.eye(4, dtype=np.float64)
+    tracked_delta[:3, :3] = (
+        predicted_end[:3, :3] @ start_pose[:3, :3].T
+    )
+    tracked_rotation_deg = transform_angle(tracked_delta)
+    rotation_rejected = bool(
+        enabled and requested_rotation_deg > maximum_correction_deg
+    )
+    effective_end = target_end.copy()
+    if rotation_rejected:
+        effective_end[:3, :3] = predicted_end[:3, :3]
+    effective_delta = np.eye(4, dtype=np.float64)
+    effective_delta[:3, :3] = (
+        effective_end[:3, :3] @ predicted_end[:3, :3].T
+    )
+    report = {
+        "enabled": enabled,
+        "maximum_correction_deg": maximum_correction_deg,
+        "requested_rotation_deg": requested_rotation_deg,
+        "applied_rotation_deg": transform_angle(effective_delta),
+        "raw_tracked_rotation_deg": tracked_rotation_deg,
+        "rotation_rejected": rotation_rejected,
+        "rejected_policy": (
+            "preserve_pairwise_tracked_rotation"
+            if rotation_rejected
+            else None
+        ),
+        "propagate_to_anchor": bool(
+            settings.get("propagate_to_anchor", True)
+        ),
+    }
+    return effective_end, report
+
+
 def interpolate_rigid_pose(
     first: np.ndarray, second: np.ndarray, fraction: float
 ) -> np.ndarray:
@@ -344,10 +441,31 @@ def track_cloud_registration(
             symmetry,
             include_observation_ambiguities=False,
         ).pose
-    delta = end_pose @ np.linalg.inv(predicted_end)
+    requested_end_pose = end_pose
+    end_pose, endpoint_consistency = resolve_endpoint_pose_correction(
+        start_pose,
+        predicted_end,
+        requested_end_pose,
+        registration_config,
+    )
+    endpoint_center_offset = end_pose[:3, 3] - predicted_end[:3, 3]
+    endpoint_rotation = np.eye(4, dtype=np.float64)
+    endpoint_rotation[:3, :3] = (
+        end_pose[:3, :3] @ predicted_end[:3, :3].T
+    )
+    registrations[
+        f"{start:06d}-{end:06d}:endpoint_correction"
+    ] = {
+        "method": "part_origin_rotation_and_linear_center_offset",
+        "translation_m": float(np.linalg.norm(endpoint_center_offset)),
+        "rotation_deg": transform_angle(endpoint_rotation),
+        **endpoint_consistency,
+    }
     for frame in range(start, end + 1):
         fraction = (frame - start) / max(end - start, 1)
-        poses[frame] = interpolate_transform(delta, fraction) @ poses[frame]
+        poses[frame] = apply_endpoint_pose_correction(
+            poses[frame], predicted_end, end_pose, fraction
+        )
     poses[start] = start_pose.copy()
     poses[end] = end_pose.copy()
     smooth_pose_sequence(poses, start, end, passes=2)

@@ -12,7 +12,7 @@ from common.backproject_utils import load_palette_masks
 from common.depth_gauge import gauge_masks, reference_part
 from common.io_utils import load_json, write_json
 from common.mask_io import list_timestamps, view_names
-from common.normalized_recon import load_recon
+from common.normalized_recon import load_recon, load_recon_camera
 from common.pose_transforms import (
     axis_rotation,
     axis_rotation_degrees,
@@ -66,6 +66,32 @@ class JsonIoTests(unittest.TestCase):
             self.assertFalse(masks[0][1, 1])
             self.assertFalse(masks[0][2, 3])
             self.assertEqual(int(masks[0].sum()), 18)
+
+    def test_background_gauge_excludes_unconfigured_occluder_labels(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            frame = root / "000000"
+            frame.mkdir(parents=True)
+            labels = np.zeros((4, 5), np.uint8)
+            labels[1, 1] = 1
+            labels[2, 3] = 2
+            labels[0, 4] = 3  # Non-rigid hand mask, not a pose part.
+            Image.fromarray(labels).save(frame / "view.png")
+
+            masks = gauge_masks(
+                {
+                    "masks_dir": str(root),
+                    "parts": ["main", "collector"],
+                    "part_ids": {"main": 1, "collector": 2},
+                    "views": ["view"],
+                },
+                "000000",
+                (4, 5),
+                "__background__",
+            )
+
+            self.assertFalse(masks[0][0, 4])
+            self.assertEqual(int(masks[0].sum()), 17)
 
     def test_json_round_trip_creates_parent_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -164,6 +190,18 @@ class JsonIoTests(unittest.TestCase):
             self.assertEqual(float(recon["depth"][0, 0, 0]), 16.0)
             self.assertEqual(float(recon["depth"][1, 0, 0]), 0.0)
             self.assertEqual(float(recon["images"][0, 0, 0, 0]), 30.0)
+
+            camera = load_recon_camera(
+                {
+                    "da3_self_cond_dir": str(root),
+                    "views": ["right", "left"],
+                },
+                "000000",
+            )
+            self.assertEqual(camera["view_names"], ["right", "left"])
+            self.assertEqual(camera["n_views"], 2)
+            self.assertEqual(camera["depth_hw"], (2, 4))
+            self.assertEqual(float(camera["intrinsics"][0, 0, 0]), 3.0)
 
     def test_reconstruction_subset_requires_view_name_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

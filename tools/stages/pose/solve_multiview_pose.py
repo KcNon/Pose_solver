@@ -50,7 +50,10 @@ from common.render_loss_refinement import (
 from common.symmetry import resolve_symmetric_pose, symmetry_spec_from_state
 from common.trajectory_constraints import interpolate_pose
 from common.pose_validation import validate_world_poses
-from common.scale_diagnostics import select_anchor_scale
+from common.scale_diagnostics import (
+    earliest_static_interval_scale_fits,
+    select_anchor_scale,
+)
 from common.silhouette_scale_calibration import (
     build_render_observations,
     calibrate_part_scale,
@@ -655,7 +658,24 @@ def _fit_calibration(
                 "candidate_count": len(fits),
             }
         else:
-            scale, consensus = select_anchor_scale(fits)
+            scale_fits = fits
+            scale_fit_selection = {
+                "method": "all_available_scale_anchors",
+                "selected_frames": [int(fit["frame"]) for fit in fits],
+                "excluded_frames": [],
+                "fallback_to_all_fits": False,
+            }
+            if config.get("automation", {}).get(
+                "scale_consensus_first_static_interval", False
+            ):
+                scale_fits, scale_fit_selection = (
+                    earliest_static_interval_scale_fits(
+                        fits,
+                        state.get("static_ranges", []),
+                    )
+                )
+            scale, consensus = select_anchor_scale(scale_fits)
+            consensus["fit_selection"] = scale_fit_selection
         scales[part] = scale
         scale_consensus[part] = consensus
         for free_fit in fits:
@@ -780,24 +800,37 @@ def _fit_calibration(
                     transform.tolist()
                 )
                 anchor_info[part][str(frame)]["fixed_scale"] = scales[part]
+            scale_report = scale_reports[part]
+            selected_scale_factor = float(
+                scale_report.get("selected_scale_factor", 1.0)
+            )
             print(
                 f"silhouette scale {part}: "
-                f"factor={scale_reports[part]['selected_scale_factor']:.3f} "
+                f"factor={selected_scale_factor:.3f} "
                 f"scale={scales[part]:.6f} "
-                f"accepted={scale_reports[part]['accepted']}",
+                f"accepted={scale_report['accepted']}"
+                + (
+                    f" reason={scale_report['reason']}"
+                    if scale_report.get("reason")
+                    else ""
+                ),
                 flush=True,
             )
             if (
                 scale_settings.get("require_quality_gate", False)
-                and not scale_reports[part].get("quality_passed", False)
+                and not scale_report.get("quality_passed", False)
             ):
-                selected_row = scale_reports[part].get("candidates", [{}])[
-                    int(scale_reports[part].get("selected_index", 0))
-                ]
+                candidates = scale_report.get("candidates", [])
+                selected_index = int(scale_report.get("selected_index", 0))
+                selected_row = (
+                    candidates[selected_index]
+                    if 0 <= selected_index < len(candidates)
+                    else {}
+                )
                 raise RuntimeError(
                     f"{part}: silhouette scale calibration failed absolute "
-                    f"quality gate (optimize_iou="
-                    f"{selected_row.get('optimize_iou')})"
+                    f"quality gate (reason={scale_report.get('reason')}, "
+                    f"optimize_iou={selected_row.get('optimize_iou')})"
                 )
 
             # Scale and rigid registration are coupled for a partial cloud.
@@ -1044,9 +1077,14 @@ def _fit_calibration(
                     transform.tolist()
                 )
                 anchor_info[part][str(frame)]["fixed_scale"] = scales[part]
+            selected_scale_factor = float(
+                post_anchor_scale_reports[part].get(
+                    "selected_scale_factor", 1.0
+                )
+            )
             print(
                 f"post-anchor scale {part}: "
-                f"factor={post_anchor_scale_reports[part]['selected_scale_factor']:.3f} "
+                f"factor={selected_scale_factor:.3f} "
                 f"scale={scales[part]:.6f} "
                 f"accepted={post_anchor_scale_reports[part]['accepted']}",
                 flush=True,
@@ -1192,10 +1230,14 @@ def _fit_calibration(
                     transform.tolist()
                 )
                 anchor_info[part][str(frame)]["fixed_scale"] = scales[part]
+            selected_scale_factor = float(
+                final_pose_scale_reports[part].get(
+                    "selected_scale_factor", 1.0
+                )
+            )
             print(
                 f"final-pose scale {part}: "
-                f"factor="
-                f"{final_pose_scale_reports[part]['selected_scale_factor']:.3f} "
+                f"factor={selected_scale_factor:.3f} "
                 f"scale={scales[part]:.6f} "
                 f"accepted={final_pose_scale_reports[part]['accepted']}",
                 flush=True,
@@ -1499,6 +1541,28 @@ def _solve_part(
             )
         else:
             raise ValueError(f"{part}: unknown tracking method {method!r}")
+        if method == "cloud_registration" and segment:
+            endpoint_key = (
+                f"{dynamic_start:06d}-{dynamic_end:06d}:endpoint_correction"
+            )
+            endpoint_report = segment_report.get(endpoint_key, {})
+            if (
+                endpoint_report.get("rotation_rejected", False)
+                and endpoint_report.get("propagate_to_anchor", True)
+                and end_anchor is not None
+            ):
+                resolved_end = segment[max(segment)]
+                anchors[end_anchor] = similarity_from_rigid(
+                    resolved_end,
+                    scale,
+                    origin,
+                )
+                endpoint_report["propagated_to_anchor_frame"] = int(
+                    end_anchor
+                )
+                endpoint_report["propagation_method"] = (
+                    "replace_anchor_rotation_with_pairwise_tracked_branch"
+                )
         poses.update(segment)
         registrations.update(segment_report)
         if method == "cloud_registration" and segment:
@@ -1904,4 +1968,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    from common.resource_safety import require_memory_guard
+
+    require_memory_guard("tools/stages/pose/solve_multiview_pose.py")
     main()

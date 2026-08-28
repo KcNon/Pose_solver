@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import zipfile
 from typing import Any, Literal
 
 import cv2
@@ -151,6 +152,87 @@ def load_recon(cfg: dict, timestamp: str, backend: ReconBackend | None = None) -
         "view_names": stored_views,
         "n_views": int(depth.shape[0]),
         "depth_hw": tuple(depth.shape[1:3]),
+    }
+
+
+def load_recon_camera(
+    cfg: dict,
+    timestamp: str,
+    backend: ReconBackend | None = None,
+) -> dict[str, Any]:
+    """Load only camera arrays and the depth shape from a reconstruction.
+
+    Full render videos need intrinsics/extrinsics but, unless depth occlusion is
+    enabled, should not decompress images, confidence, and point arrays for
+    every frame.  Reading the NPY header inside the NPZ keeps memory and I/O
+    bounded while preserving the exact intrinsic scaling contract.
+    """
+
+    path = recon_npz_path(cfg, timestamp, backend)
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+    with zipfile.ZipFile(path) as archive:
+        depth_name = "depth.npy"
+        if depth_name not in archive.namelist():
+            raise KeyError(f"{depth_name} missing from {path}")
+        with archive.open(depth_name) as stream:
+            version = np.lib.format.read_magic(stream)
+            if version == (1, 0):
+                shape, _fortran, _dtype = np.lib.format.read_array_header_1_0(
+                    stream
+                )
+            else:
+                shape, _fortran, _dtype = np.lib.format.read_array_header_2_0(
+                    stream
+                )
+    if len(shape) not in {3, 4}:
+        raise ValueError(f"unexpected depth shape in {path}: {shape}")
+    with np.load(path) as values:
+        K = values[
+            "intrinsic" if "intrinsic" in values.files else "intrinsics"
+        ]
+        E = values[
+            "extrinsic" if "extrinsic" in values.files else "extrinsics"
+        ]
+        stored_views = (
+            [str(value) for value in values["view_names"].tolist()]
+            if "view_names" in values.files
+            else None
+        )
+    requested_views = [str(value) for value in cfg.get("views", [])]
+    if requested_views:
+        if stored_views is None:
+            if len(requested_views) != int(shape[0]):
+                raise ValueError(
+                    f"reconstruction {path} has {shape[0]} views but no "
+                    "view_names metadata"
+                )
+            selected = list(range(len(requested_views)))
+            stored_views = requested_views
+        else:
+            index_by_view = {
+                value: index for index, value in enumerate(stored_views)
+            }
+            missing = [
+                value for value in requested_views if value not in index_by_view
+            ]
+            if missing:
+                raise ValueError(
+                    f"configured views missing from reconstruction {path}: "
+                    f"{missing}"
+                )
+            selected = [index_by_view[value] for value in requested_views]
+            K = K[selected]
+            E = E[selected]
+            stored_views = requested_views
+    return {
+        "path": path,
+        "backend": resolve_backend(cfg, backend),
+        "intrinsics": np.asarray(K, dtype=np.float64),
+        "extrinsics": np.asarray(E, dtype=np.float64),
+        "view_names": stored_views,
+        "n_views": int(len(K)),
+        "depth_hw": tuple(shape[1:3]),
     }
 
 

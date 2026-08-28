@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT))
 
 from common.io_utils import load_json, write_json
 from common.calibration_cache import build_calibration_fingerprint
+from common.multiframe_pose import multiframe_settings
 from common.pose_autoconfig import resolve_pose_config
 from common.pose_config import validate_pose_config
 from common.support_plane import validate_part_support_window
@@ -21,6 +22,7 @@ from common.stage_cache import (
     stage_fingerprint,
     write_checkpoint,
 )
+from common.resource_safety import require_memory_guard
 
 
 def _run(
@@ -97,6 +99,105 @@ def _calibration_cache_matches(config: dict, calibration_path: Path) -> bool:
     return bool(cached and cached == current)
 
 
+def _resolve_render_views(
+    config: dict,
+    requested_view: str | None = None,
+) -> list[str]:
+    """Resolve and validate the views selected for trajectory rendering."""
+
+    settings = config.get("render", {})
+    configured = settings.get("views")
+    if requested_view:
+        views = [requested_view]
+    elif configured == "all":
+        views = list(config["views"])
+    elif configured is None:
+        views = [settings.get("primary_view") or config["views"][0]]
+    else:
+        views = [str(value) for value in configured]
+    if not views or len(views) != len(set(views)):
+        raise ValueError("render.views must be non-empty and unique")
+    unknown = sorted(set(views) - set(config["views"]))
+    if unknown:
+        raise ValueError(f"unknown render views: {unknown}")
+    return views
+
+
+def _render_pose_outputs(
+    *,
+    config: dict,
+    config_path: Path,
+    trajectory: Path,
+    output: Path,
+    force: bool,
+    requested_view: str | None = None,
+) -> None:
+    """Render selected views and optional bounded multi-view grids."""
+
+    settings = config.get("render", {})
+    views = _resolve_render_views(config, requested_view)
+    for view in views:
+        command = [
+            sys.executable,
+            "-u",
+            "tools/stages/pose/render_multiview_pose.py",
+            "--config",
+            str(config_path),
+            "--trajectory",
+            str(trajectory),
+            "--output-root",
+            str(output),
+            "--view",
+            view,
+            "--width",
+            str(int(settings.get("width", 1280))),
+            "--height",
+            str(int(settings.get("height", 720))),
+        ]
+        if settings.get("basic_only", False):
+            command.append("--basic-only")
+        _run(
+            command,
+            output / "render" / view / "overlay.mp4",
+            force,
+            content_files=(config_path, trajectory),
+        )
+
+    grid = settings.get("grid", {})
+    if not grid.get("enabled", False):
+        return
+    expected_frames = len(load_json(trajectory).get("frames", {}))
+    for video_name in grid.get("video_names", ["overlay.mp4"]):
+        stem = Path(video_name).stem
+        grid_output = output / "render" / f"multiview_{stem}.mp4"
+        command = [
+            sys.executable,
+            "-u",
+            "tools/diagnostics/compose_multiview_render_grid.py",
+            "--input-root",
+            str(output / "render"),
+            "--views",
+            *views,
+            "--video-name",
+            str(video_name),
+            "--output",
+            str(grid_output),
+            "--report",
+            str(output / "render" / f"multiview_{stem}.json"),
+            "--expected-frames",
+            str(expected_frames),
+        ]
+        _run(
+            command,
+            grid_output,
+            force,
+            content_files=(config_path, trajectory),
+            stat_paths=tuple(
+                output / "render" / view / video_name for view in views
+            ),
+        )
+
+
 def main(argv: Sequence[str] | None = None) -> Path | None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
@@ -146,6 +247,10 @@ def main(argv: Sequence[str] | None = None) -> Path | None:
     parser.add_argument("--skip-review", action="store_true")
     parser.add_argument("--skip-render", action="store_true")
     parser.add_argument("--render-view")
+    parser.add_argument(
+        "--trajectory",
+        help="existing trajectory used by render/review without solving pose",
+    )
     args = parser.parse_args(argv)
 
     if args.point_cloud_root and not args.output_root:
@@ -440,50 +545,46 @@ def main(argv: Sequence[str] | None = None) -> Path | None:
         )
     ):
         render_refined_trajectory = coaxial_projected_trajectory
-    observed_assembly_trajectory = (
-        output / "pose" / "trajectory_observed_assembly.json"
+    multiframe_trajectory = output / "pose" / "trajectory_multiframe.json"
+    multiframe_enabled = bool(
+        multiframe_settings(config).get("enabled", False)
     )
-    observed_assembly_enabled = bool(
-        config.get("observed_assembly_regularization", {}).get(
-            "enabled", False
-        )
-    )
-    observed_assembly_command = [
+    multiframe_command = [
         python,
         "-u",
-        "tools/stages/pose/regularize_observed_assembly.py",
+        "tools/stages/pose/optimize_multiframe_pose.py",
         "--config",
         str(config_path),
         "--trajectory",
         str(render_refined_trajectory),
         "--output-trajectory",
-        str(observed_assembly_trajectory),
+        str(multiframe_trajectory),
         "--report",
-        str(output / "diagnostics" / "observed_assembly_regularization.json"),
+        str(output / "diagnostics" / "multiframe_optimization.json"),
     ]
-    observed_assembly_content_files = (
+    multiframe_content_files = (
         config_path,
         render_refined_trajectory,
     )
-    observed_assembly_stat_paths = (Path(config["masks_dir"]),)
-    if args.stage in {"all", "refine"} and observed_assembly_enabled:
+    multiframe_stat_paths = (Path(config["masks_dir"]),)
+    if args.stage in {"all", "refine"} and multiframe_enabled:
         _run(
-            observed_assembly_command,
-            observed_assembly_trajectory,
+            multiframe_command,
+            multiframe_trajectory,
             args.force,
-            content_files=observed_assembly_content_files,
-            stat_paths=observed_assembly_stat_paths,
+            content_files=multiframe_content_files,
+            stat_paths=multiframe_stat_paths,
         )
     if (
-        observed_assembly_enabled
+        multiframe_enabled
         and _stage_is_current(
-            observed_assembly_command,
-            observed_assembly_trajectory,
-            content_files=observed_assembly_content_files,
-            stat_paths=observed_assembly_stat_paths,
+            multiframe_command,
+            multiframe_trajectory,
+            content_files=multiframe_content_files,
+            stat_paths=multiframe_stat_paths,
         )
     ):
-        render_refined_trajectory = observed_assembly_trajectory
+        render_refined_trajectory = multiframe_trajectory
     constrained_trajectory = (
         output / "pose" / "trajectory_collision_refined.json"
     )
@@ -574,6 +675,33 @@ def main(argv: Sequence[str] | None = None) -> Path | None:
         else pre_stabilized_trajectory
     )
     active_trajectory = stabilized_active_trajectory
+    if args.trajectory:
+        active_trajectory = Path(args.trajectory).resolve()
+        if not active_trajectory.is_file():
+            raise FileNotFoundError(active_trajectory)
+    connector_report = output / "diagnostics" / "connector_readiness.json"
+    connectors_enabled = any(
+        value.get("enabled", True)
+        for value in config.get("connectors", {}).values()
+    )
+    connector_command = [
+        python,
+        "-u",
+        "tools/diagnostics/validate_connector_trajectory.py",
+        "--config",
+        str(config_path),
+        "--trajectory",
+        str(active_trajectory),
+        "--report",
+        str(connector_report),
+    ]
+    if args.stage in {"all", "review"} and connectors_enabled:
+        _run(
+            connector_command,
+            connector_report,
+            args.force,
+            content_files=(config_path, active_trajectory),
+        )
     if args.stage in {"all", "review"} and not args.skip_review:
         _run(
             [
@@ -592,34 +720,18 @@ def main(argv: Sequence[str] | None = None) -> Path | None:
             content_files=(config_path, active_trajectory),
         )
     if args.stage in {"all", "render"} and not args.skip_render:
-        view = (
-            args.render_view
-            or config.get("render", {}).get("primary_view")
-            or config["views"][0]
-        )
-        if view not in config["views"]:
-            raise ValueError(f"unknown render view: {view}")
-        _run(
-            [
-                python,
-                "-u",
-                "tools/stages/pose/render_multiview_pose.py",
-                "--config",
-                str(config_path),
-                "--trajectory",
-                str(active_trajectory),
-                "--output-root",
-                str(output),
-                "--view",
-                view,
-                "--width",
-                str(int(config.get("render", {}).get("width", 1280))),
-                "--height",
-                str(int(config.get("render", {}).get("height", 720))),
-            ],
-            output / "render" / view / "overlay.mp4",
-            args.force,
-            content_files=(config_path, active_trajectory),
+        _render_pose_outputs(
+            config=config,
+            config_path=config_path,
+            trajectory=active_trajectory,
+            output=output,
+            force=args.force,
+            requested_view=args.render_view,
         )
     print(f"complete: {active_trajectory}", flush=True)
     return active_trajectory
+
+
+if __name__ == "__main__":
+    require_memory_guard("scripts/run_pose_pipeline.py")
+    main()

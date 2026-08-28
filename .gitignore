@@ -10,4 +10,10 @@ data
 configs/*
 !configs/object9_pose.json
 !configs/pipeline.example.json
+!configs/object4_rigid_nozzle_inputs.json
+!configs/object4_rigid_nozzle_depth.json
+!configs/object4_rigid_nozzle_pose.json
+!configs/object9_rigid_nozzle_inputs.json
+!configs/object9_rigid_nozzle_depth.json
+!configs/object9_rigid_nozzle_pose.json
 exports

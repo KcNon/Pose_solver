@@ -43,6 +43,45 @@ def _frame_path(root: Path, timestamp: str, view: str) -> Path:
     return png
 
 
+def _video_path(root: Path, view: str) -> Path:
+    for suffix in (".MP4", ".mp4", ".MOV", ".mov"):
+        candidate = root / f"{view}{suffix}"
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError(f"missing source video for {view} under {root}")
+
+
+def _read_rgb(
+    *,
+    timestamp: str,
+    view: str,
+    frames_root: Path | None,
+    videos_root: Path | None,
+) -> tuple[np.ndarray, str]:
+    """Read one exact source frame without materializing the complete video."""
+    if frames_root is not None:
+        path = _frame_path(frames_root, timestamp, view)
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        return np.asarray(Image.open(path).convert("RGB")), str(path)
+
+    assert videos_root is not None
+    path = _video_path(videos_root, view)
+    frame = int(timestamp)
+    capture = cv2.VideoCapture(str(path))
+    try:
+        if not capture.isOpened():
+            raise RuntimeError(f"failed to open source video: {path}")
+        if not capture.set(cv2.CAP_PROP_POS_FRAMES, frame):
+            raise RuntimeError(f"failed to seek {path} to frame {frame}")
+        ok, bgr = capture.read()
+        if not ok or bgr is None:
+            raise RuntimeError(f"failed to decode frame {frame} from {path}")
+    finally:
+        capture.release()
+    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), f"{path}#frame={frame}"
+
+
 def _quality(mask: np.ndarray, *, min_pixels: int) -> dict[str, float] | None:
     ys, xs = np.nonzero(mask)
     pixels = int(len(xs))
@@ -143,6 +182,12 @@ def main() -> None:
     parser.add_argument("--minimum-mask-pixels", type=int, default=500)
     parser.add_argument("--padding", type=float, default=0.10)
     parser.add_argument(
+        "--maximum-candidate-frames",
+        type=int,
+        default=1000,
+        help="Hard limit preventing an accidentally unbounded mask scan.",
+    )
+    parser.add_argument(
         "--frame-start",
         type=int,
         help="Optional shared first candidate frame for every requested part.",
@@ -158,6 +203,8 @@ def main() -> None:
         parser.error("--frame-start and --frame-end must be provided together")
     if args.frame_start is not None and args.frame_end < args.frame_start:
         parser.error("--frame-end must be greater than or equal to --frame-start")
+    if args.maximum_candidate_frames <= 0:
+        parser.error("--maximum-candidate-frames must be positive")
 
     mask_config_path = Path(args.mask_config).resolve()
     config = _load(mask_config_path)
@@ -167,21 +214,33 @@ def main() -> None:
     if unknown:
         raise ValueError(f"unknown parts: {sorted(unknown)}")
     views = list(config["views"])
-    frames_root = Path(config["frames_dir"]).resolve()
+    frames_value = config.get("frames_dir")
+    videos_value = config.get("videos_dir")
+    if bool(frames_value) == bool(videos_value):
+        raise ValueError("configure exactly one of frames_dir or videos_dir")
+    frames_root = Path(frames_value).resolve() if frames_value else None
+    videos_root = Path(videos_value).resolve() if videos_value else None
     masks_root = Path(config["output_root"]).resolve() / "masks"
     output_root = Path(args.output_root).resolve()
     rgba_root = output_root / "rgba"
     mesh_root = output_root / "meshes"
-    maximum_frame = max(
-        int(path.stem)
-        for path in (frames_root / views[0]).iterdir()
-        if path.is_file() and path.stem.isdigit()
-    )
+    first_view_masks = list((masks_root / views[0]).glob("*.png"))
+    if not first_view_masks:
+        first_view_masks = list(masks_root.glob(f"*/{views[0]}.png"))
+    mask_frames = [
+        int(path.stem if path.parent.name == views[0] else path.parent.name)
+        for path in first_view_masks
+        if (path.stem if path.parent.name == views[0] else path.parent.name).isdigit()
+    ]
+    if not mask_frames:
+        raise RuntimeError(f"no numeric masks found for first view {views[0]}")
+    maximum_frame = max(mask_frames)
 
     manifest: dict[str, Any] = {
         "schema_version": 1,
         "mask_config": str(mask_config_path),
         "selection": {
+            "source": "frames" if frames_root is not None else "videos",
             "minimum_delay": args.minimum_delay,
             "candidate_window": args.candidate_window,
             "minimum_views": args.minimum_views,
@@ -195,6 +254,16 @@ def main() -> None:
     }
     for part in parts:
         label = int(configured_parts[part]["id"])
+        eligible_views = list(
+            configured_parts[part].get("reconstruction_views", views)
+        )
+        if not eligible_views or len(eligible_views) != len(set(eligible_views)):
+            raise ValueError(f"{part}: reconstruction_views must be unique and non-empty")
+        unknown_views = set(eligible_views).difference(views)
+        if unknown_views:
+            raise ValueError(
+                f"{part}: unknown reconstruction views: {sorted(unknown_views)}"
+            )
         candidates = []
         if args.frame_start is None:
             candidate_frames = _candidate_range(
@@ -209,10 +278,15 @@ def main() -> None:
                 max(0, args.frame_start),
                 min(maximum_frame, args.frame_end) + 1,
             )
+        if len(candidate_frames) > args.maximum_candidate_frames:
+            raise RuntimeError(
+                f"{part}: candidate range contains {len(candidate_frames)} frames; "
+                f"limit is {args.maximum_candidate_frames}"
+            )
         for frame in candidate_frames:
             timestamp = f"{frame:06d}"
             per_view = {}
-            for view in views:
+            for view in eligible_views:
                 path = _mask_path(masks_root, timestamp, view)
                 if not path.exists():
                     continue
@@ -255,9 +329,13 @@ def main() -> None:
         written = []
         records = []
         for view, metrics in ranked_views:
-            frame_path = _frame_path(frames_root, timestamp, view)
             mask_path = _mask_path(masks_root, timestamp, view)
-            rgb = np.asarray(Image.open(frame_path).convert("RGB"))
+            rgb, rgb_source = _read_rgb(
+                timestamp=timestamp,
+                view=view,
+                frames_root=frames_root,
+                videos_root=videos_root,
+            )
             labels = np.asarray(Image.open(mask_path))
             rgba = _crop_rgba(rgb, (labels == label).astype(np.uint8), args.padding)
             destination = destination_dir / f"{view}.png"
@@ -266,7 +344,7 @@ def main() -> None:
             records.append({
                 "view": view,
                 "frame": timestamp,
-                "rgb": str(frame_path),
+                "rgb": rgb_source,
                 "mask": str(mask_path),
                 "rgba": str(destination),
                 **metrics,
@@ -277,6 +355,7 @@ def main() -> None:
             "selected_frame": timestamp,
             "selection_score": selected["score"],
             "candidate_count": len(candidates),
+            "eligible_views": eligible_views,
             "automatically_excluded_views": sorted(
                 set(selected["views"]).difference(view for view, _ in ranked_views)
             ),
@@ -285,20 +364,31 @@ def main() -> None:
         print(f"{part}: frame {timestamp}, {len(records)} views")
 
     mesh_root.mkdir(parents=True, exist_ok=True)
+    reconstruction_defaults = {
+        "strategy": "adaptive_guidance_weight",
+        "pipeline_type": "1024_cascade",
+        "ss_source": "mesh",
+        "seed": 0,
+        "decimation_target": 500000,
+        "texture_size": 2048,
+    }
+    reconstruction_overrides = config.get("reconstruction", {})
+    unknown_reconstruction_keys = set(reconstruction_overrides).difference(
+        reconstruction_defaults
+    )
+    if unknown_reconstruction_keys:
+        raise ValueError(
+            "unknown reconstruction settings: "
+            f"{sorted(unknown_reconstruction_keys)}"
+        )
+    reconstruction_defaults.update(reconstruction_overrides)
     runtime_config = {
         "output_root": str(output_root),
         "rgba_root": str(rgba_root),
         "mesh_root": str(mesh_root),
         "recon_python": "/data_ft_9_10/wentai/projects/ReconViaGen/.venv/bin/python",
         "parts": {part: {} for part in parts},
-        "reconstruction": {
-            "strategy": "adaptive_guidance_weight",
-            "pipeline_type": "1024_cascade",
-            "ss_source": "mesh",
-            "seed": 0,
-            "decimation_target": 500000,
-            "texture_size": 2048,
-        },
+        "reconstruction": reconstruction_defaults,
     }
     (output_root / "input_manifest.json").write_text(
         json.dumps(manifest, indent=2), encoding="utf-8"

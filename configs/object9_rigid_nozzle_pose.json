@@ -1,0 +1,240 @@
+{
+  "schema_version": 1,
+  "dataset": "Object-9-rigid-nozzle",
+  "input": {
+    "frames_dir": "/data_ft_9_10/wentai/projects/data/objects-0805/Object-9/frames",
+    "views": [
+      "GX012742",
+      "GX012842",
+      "GX013117",
+      "GX013155",
+      "GX013483",
+      "GX014089",
+      "GX015368",
+      "GX017758"
+    ],
+    "frame_range": [168, 413]
+  },
+  "parts": {
+    "nozzle": {
+      "id": 1,
+      "mesh": "../experiments/objects_0805/Object-9/rigid_nozzle_v1/inputs/meshes/nozzle.glb",
+      "prompts": ["rigid sprayer head, trigger, collar and pump cylinder, excluding only the flexible terminal tube"],
+      "appearance_hint": 168
+    },
+    "body": {
+      "id": 2,
+      "mesh": "../experiments/objects_0805/Object-9/rigid_nozzle_v1/inputs/meshes/body.glb",
+      "prompts": ["yellow pressure sprayer bottle body and threaded neck"],
+      "appearance_hint": 168,
+      "reference": true
+    }
+  },
+  "connectors": {
+    "nozzle_body_thread": {
+      "enabled": true,
+      "type": "screw",
+      "reference_part": "body",
+      "moving_part": "nozzle",
+      "reference_axis_part": [-0.0218718079, -0.9997484904, -0.0049578275],
+      "moving_axis_part": [-0.0223400928, -0.1698031132, 0.9852247576],
+      "reference_origin_raw": [0.0224833450, 0.438, -0.0012472160],
+      "moving_origin_raw": [0.0590129640, 0.0025302897, 0.10],
+      "geometry_evidence": {
+        "maximum_rms_residual_m": 0.004,
+        "reference": {
+          "rms_residual_m": 0.0025743985,
+          "source": "inputs/diagnostics/body_connector_frame.json"
+        },
+        "moving": {
+          "rms_residual_m": 0.0009323547,
+          "source": "inputs/diagnostics/nozzle_connector_frame.json"
+        }
+      },
+      "allow_axis_flip": false,
+      "validation_frame_range": [340, 413],
+      "diagnostic_ranges": {
+        "occluded": [242, 258],
+        "approach": [262, 284],
+        "insertion": [285, 339],
+        "assembled": [340, 413]
+      },
+      "insertion_direction": 1.0,
+      "maximum_axis_angle_deg": 2.0,
+      "maximum_radial_offset_m": 0.001,
+      "insertion_length_m": null,
+      "radial_clearance_m": null,
+      "minimum_clearance_margin_m": 0.0,
+      "thread": {
+        "pitch_m": null,
+        "handedness": null,
+        "reference_zero_direction_part": null,
+        "moving_zero_direction_part": null,
+        "entry_phase_rad": null,
+        "maximum_helical_residual_m": null
+      },
+      "require_collision_validation": true
+    }
+  },
+  "output": {
+    "root": "../experiments/objects_0805/Object-9/rigid_nozzle_v1/pose_pipeline"
+  },
+  "runtime": {
+    "devices": [6, 7]
+  },
+  "models": {},
+  "mask": {
+    "mode": "reuse",
+    "artifact": "../experiments/objects_0805/Object-9/rigid_nozzle_v1/inputs/masks"
+  },
+  "depth": {
+    "mode": "reuse",
+    "artifact": "../experiments/objects_0805/Object-9/rigid_nozzle_v1/depth/parts_ply/composed_rigid_nozzle_original_body"
+  },
+  "pose": {
+    "mode": "run",
+    "compatibility_config": "../experiments/objects_0805/Object-9/runtime/pose_config_accurate_v2.json",
+    "overrides": {
+      "depth_gauge_path": "/data_ft_9_10/wentai/projects/pose_solver/experiments/objects_0805/Object-9/pose_outputs/diagnostics/depth_gauge.json",
+      "render_loss_refinement": {
+        "quality_cloud_summary": "/data_ft_9_10/wentai/projects/pose_solver/experiments/objects_0805/Object-9/rigid_nozzle_v1/depth/parts_ply/composed_rigid_nozzle_original_body/quality_cloud_summary.json",
+        "parts": {
+          "nozzle": {
+            "coaxial_constraint": {"enabled": false}
+          }
+        }
+      },
+      "multiframe_optimization": {
+        "enabled": true,
+        "auto_static_windows": false,
+        "auto_dynamic_windows": false,
+        "windows": [
+          {
+            "name": "nozzle_hand_occlusion_bridge",
+            "mode": "bridge_window",
+            "part": "nozzle",
+            "reference_part": "body",
+            "frame_range": [242, 258],
+            "apply": false
+          },
+          {
+            "name": "nozzle_reobserved_approach",
+            "mode": "dynamic_window",
+            "part": "nozzle",
+            "reference_part": "body",
+            "frame_range": [259, 284],
+            "candidate_radius_frames": 2,
+            "minimum_observing_views": 2,
+            "minimum_observed_views": 4,
+            "minimum_observed_iou": 0.25,
+            "maximum_translation_step_m": 0.06,
+            "maximum_rotation_step_deg": 25.0,
+            "maximum_boundary_translation_degradation_m": 0.005,
+            "maximum_boundary_rotation_degradation_deg": 3.0,
+            "temporal_weight": 0.20,
+            "baseline_weight": 0.05,
+            "maximum_visual_loss_degradation": 0.02,
+            "resolution": [160, 90],
+            "surface_points": 18000,
+            "render": {
+              "fallback_to_mask_views_when_cloud_unreliable": true,
+              "mask_fallback_minimum_cloud_views": 3,
+              "disable_depth_for_mask_only_fallback": true,
+              "minimum_full_mask_pixels": 30,
+              "minimum_mask_area_ratio": 0.05,
+              "minimum_refined_iou": 0.18,
+              "minimum_refined_target_coverage": 0.20,
+              "minimum_per_view_iou": 0.0
+            }
+          },
+          {
+            "name": "nozzle_visible_insertion",
+            "mode": "dynamic_window",
+            "part": "nozzle",
+            "reference_part": "body",
+            "frame_range": [285, 339],
+            "candidate_radius_frames": 2,
+            "minimum_observing_views": 3,
+            "minimum_observed_views": 4,
+            "minimum_observed_iou": 0.25,
+            "maximum_translation_step_m": 0.04,
+            "maximum_rotation_step_deg": 20.0,
+            "maximum_boundary_translation_degradation_m": 0.004,
+            "maximum_boundary_rotation_degradation_deg": 2.0,
+            "temporal_weight": 0.20,
+            "baseline_weight": 0.05,
+            "maximum_visual_loss_degradation": 0.02,
+            "resolution": [160, 90],
+            "surface_points": 18000,
+            "render": {
+              "fallback_to_mask_views_when_cloud_unreliable": true,
+              "mask_fallback_minimum_cloud_views": 3,
+              "disable_depth_for_mask_only_fallback": true,
+              "minimum_full_mask_pixels": 30,
+              "minimum_mask_area_ratio": 0.05,
+              "minimum_refined_iou": 0.18,
+              "minimum_refined_target_coverage": 0.20,
+              "minimum_per_view_iou": 0.0
+            }
+          },
+          {
+            "name": "nozzle_body_thread_diagnostic",
+            "mode": "relation_window",
+            "relation_type": "coaxial_insert",
+            "reference_part": "body",
+            "moving_part": "nozzle",
+            "apply_enabled": true,
+            "frame_range": [285, 339],
+            "terminal_anchor_frame": 411,
+            "stable_evidence_frames": [370, 380, 390, 400, 411],
+            "static_follow_range": [340, 413],
+            "reference_axis_part": [-0.0218718079, -0.9997484904, -0.0049578275],
+            "moving_axis_part": [-0.0223400928, -0.1698031132, 0.9852247576],
+            "reference_axis_origin_raw": [0.0224833450, 0.438, -0.0012472160],
+            "moving_axis_origin_raw": [0.0590129640, 0.0025302897, 0.10],
+            "allow_axis_flip": false,
+            "target_axis_offset_m": 0.0,
+            "insertion_direction": 1.0,
+            "preserve_observed_twist": true,
+            "terminal_twist_bridge_frames": 8,
+            "primary_view": "GX012742",
+            "primary_view_weight": 0.20,
+            "resolution": [160, 90],
+            "surface_points": 20000,
+            "anchor_twist_offsets_deg": [-30, -20, -10, 0, 10, 20, 30],
+            "anchor_axial_offsets_m": [-0.03, -0.02, -0.01, 0.0, 0.01, 0.02, 0.03],
+            "anchor_local_twist_radius_deg": 10.0,
+            "anchor_local_twist_step_deg": 2.0,
+            "anchor_local_axial_radius_m": 0.006,
+            "anchor_local_axial_step_m": 0.001,
+            "anchor_exact_top_k": 12,
+            "axial_grid_step_m": 0.002,
+            "axial_grid_margin_m": 0.015,
+            "maximum_axial_step_m": 0.008,
+            "maximum_axial_backtrack_m": 0.001,
+            "axial_temporal_weight": 0.08,
+            "diagnostic_frames": [285, 295, 310, 325, 339, 350, 370, 380, 400, 411],
+            "visual_acceptance_gate": {
+              "enabled": true,
+              "minimum_frames": 6,
+              "maximum_mean_loss_degradation": 0.08,
+              "maximum_frame_loss_degradation": 0.20,
+              "minimum_selected_mean_iou": 0.35,
+              "apply_on_failure": false
+            },
+            "render": {
+              "mask_primary": true,
+              "use_cloud_supported_view_gate": false,
+              "use_depth_loss": false,
+              "occlusion_aware": true,
+              "trim_worst_views": 1,
+              "minimum_full_mask_pixels": 20,
+              "minimum_mask_area_ratio": 0.05,
+              "weights": {"iou": 1.0, "contour": 0.30, "target_coverage": 0.20, "depth": 0.0}
+            }
+          }
+        ]
+      }
+    }
+  }
+}

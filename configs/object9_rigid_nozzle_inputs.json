@@ -1,0 +1,30 @@
+{
+  "source_masks_dir": "../experiments/objects_0805/Object-9/temporal_sam3/masks",
+  "source_mesh_dir": "../experiments/objects_0805/Object-9/part_reconstruction/meshes",
+  "output_root": "../experiments/objects_0805/Object-9/rigid_nozzle_v1/inputs",
+  "views": [
+    "GX012742",
+    "GX012842",
+    "GX013117",
+    "GX013155",
+    "GX013483",
+    "GX014089",
+    "GX015368",
+    "GX017758"
+  ],
+  "frame_range": [168, 413],
+  "part": {
+    "name": "nozzle",
+    "id": 1
+  },
+  "mask": {
+    "erosion_radius_pixels": 10,
+    "restore_radius_pixels": 20,
+    "minimum_core_pixels": 25
+  },
+  "mesh": {
+    "axis": "z",
+    "minimum": null,
+    "maximum": 0.42
+  }
+}

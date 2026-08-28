@@ -8,6 +8,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -17,7 +18,13 @@ VALID_MODES = {"run", "reuse"}
 
 def _resolve_path(value: str | Path, base: Path) -> Path:
     path = Path(value).expanduser()
-    return path.resolve() if path.is_absolute() else (base / path).resolve()
+    candidate = path if path.is_absolute() else base / path
+    # Normalize relative components without dereferencing symbolic links.
+    # Mesh collections commonly expose one logical directory of symlinks whose
+    # targets live in separate reconstruction folders.  Path.resolve() turns
+    # those valid collections into unrelated parent directories and breaks the
+    # <mesh_dir>/<part>.glb contract before preflight can even inspect them.
+    return Path(os.path.abspath(candidate))
 
 
 def deep_merge(base: Mapping[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
@@ -58,6 +65,16 @@ class StageConfig:
 
 
 @dataclass(frozen=True)
+class MemoryGuardConfig:
+    enabled: bool
+    minimum_available_gib: float
+    maximum_process_rss_gib: float
+    poll_seconds: float
+    report_seconds: float
+    stop_grace_seconds: float
+
+
+@dataclass(frozen=True)
 class PipelineConfig:
     source_path: Path
     raw: dict[str, Any]
@@ -69,6 +86,7 @@ class PipelineConfig:
     parts: tuple[PartConfig, ...]
     output_root: Path
     devices: tuple[int, ...]
+    memory_guard: MemoryGuardConfig
     models: dict[str, Any]
     input_options: dict[str, Any]
     mask: StageConfig
@@ -222,6 +240,46 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
         raise ValueError("runtime.devices must contain one or two unique GPUs")
     if any(device < 0 for device in devices):
         raise ValueError("runtime.devices cannot contain negative indices")
+    egl_device = int(runtime.get("egl_device", devices[0]))
+    if egl_device < 0 or egl_device > 31:
+        raise ValueError("runtime.egl_device must be in [0, 31]")
+    memory_raw = runtime.get("memory_guard", {})
+    if not isinstance(memory_raw, Mapping):
+        raise ValueError("runtime.memory_guard must be an object")
+    memory_guard = MemoryGuardConfig(
+        enabled=bool(memory_raw.get("enabled", True)),
+        minimum_available_gib=float(
+            memory_raw.get("minimum_available_gib", 128.0)
+        ),
+        maximum_process_rss_gib=float(
+            memory_raw.get("maximum_process_rss_gib", 32.0)
+        ),
+        poll_seconds=float(memory_raw.get("poll_seconds", 1.0)),
+        report_seconds=float(memory_raw.get("report_seconds", 10.0)),
+        stop_grace_seconds=float(
+            memory_raw.get("stop_grace_seconds", 2.0)
+        ),
+    )
+    if not memory_guard.enabled:
+        raise ValueError(
+            "runtime.memory_guard cannot be disabled for pipeline runs"
+        )
+    if memory_guard.minimum_available_gib <= 0.0:
+        raise ValueError(
+            "runtime.memory_guard.minimum_available_gib must be positive"
+        )
+    if memory_guard.maximum_process_rss_gib <= 0.0:
+        raise ValueError(
+            "runtime.memory_guard.maximum_process_rss_gib must be positive"
+        )
+    if memory_guard.poll_seconds <= 0.0:
+        raise ValueError("runtime.memory_guard.poll_seconds must be positive")
+    if memory_guard.report_seconds <= 0.0:
+        raise ValueError("runtime.memory_guard.report_seconds must be positive")
+    if memory_guard.stop_grace_seconds < 0.0:
+        raise ValueError(
+            "runtime.memory_guard.stop_grace_seconds cannot be negative"
+        )
     models = raw.get("models", {})
     if not isinstance(models, Mapping):
         raise ValueError("models must be an object")
@@ -249,6 +307,17 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
             str(view): str(_resolve_path(value, base))
             for view, value in videos.items()
         }
+    mask = _stage(raw, "mask", base)
+    source_layout = str(mask.overrides.get("source_layout", "frame_first"))
+    if source_layout not in {"frame_first", "view_first"}:
+        raise ValueError(
+            "mask.overrides.source_layout must be 'frame_first' or "
+            "'view_first'"
+        )
+    if source_layout != "frame_first" and mask.mode != "reuse":
+        raise ValueError(
+            "mask.overrides.source_layout is only valid when mask.mode='reuse'"
+        )
     return PipelineConfig(
         source_path=source,
         raw=raw,
@@ -260,9 +329,10 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
         parts=parts,
         output_root=output_root,
         devices=devices,
+        memory_guard=memory_guard,
         models=resolved_models,
         input_options=input_options,
-        mask=_stage(raw, "mask", base),
+        mask=mask,
         depth=_stage(raw, "depth", base),
         pose=_stage(raw, "pose", base),
     )

@@ -167,6 +167,9 @@ def main() -> None:
         "support_radius_m": float(
             settings.get("cross_view_support_mm", 10.0)
         ) / 1000.0,
+        "nearest_neighbor_workers": int(
+            settings.get("nearest_neighbor_workers", 4)
+        ),
         "min_support": int(settings.get("min_support", 1)),
         "min_support_by_part": {
             str(part): int(value)
@@ -270,6 +273,10 @@ def main() -> None:
         value < 1 for value in parameters["stride_by_part"].values()
     ):
         raise ValueError("quality_cloud stride values must be at least 1")
+    if not 1 <= parameters["nearest_neighbor_workers"] <= 32:
+        raise ValueError(
+            "quality_cloud.nearest_neighbor_workers must be in [1, 32]"
+        )
     for value in args.part_min_support:
         if "=" not in value:
             raise ValueError(
@@ -406,7 +413,9 @@ def main() -> None:
                     for index, mask in enumerate(filtered_masks)
                 ]
             assign_cross_view_support(
-                clouds, parameters["support_radius_m"]
+                clouds,
+                parameters["support_radius_m"],
+                workers=parameters["nearest_neighbor_workers"],
             )
             points, point_colors, stats = fuse_supported_clouds(
                 clouds,
@@ -422,7 +431,9 @@ def main() -> None:
                 clouds, min_support=min_support
             )
             cross_report = cross_view_consistency(
-                supported_clouds, parameters["support_radius_m"]
+                supported_clouds,
+                parameters["support_radius_m"],
+                workers=parameters["nearest_neighbor_workers"],
             )
             reprojection_report = reprojection_depth_consistency(
                 supported_clouds,

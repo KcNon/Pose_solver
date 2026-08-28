@@ -30,6 +30,34 @@
       "reference": true
     }
   },
+  "connectors": {
+    "nozzle_body_thread": {
+      "enabled": true,
+      "type": "screw",
+      "reference_part": "body",
+      "moving_part": "nozzle",
+      "reference_axis_part": [-0.04185893, -0.99909242, -0.00788491],
+      "moving_axis_part": [0.15341017, -0.11338566, 0.98163589],
+      "reference_origin_raw": [0.008, 0.438, -0.004],
+      "moving_origin_raw": [0.04, -0.02, 0.10],
+      "allow_axis_flip": false,
+      "validation_frame_range": [340, 413],
+      "maximum_axis_angle_deg": 2.0,
+      "maximum_radial_offset_m": 0.001,
+      "insertion_length_m": null,
+      "radial_clearance_m": null,
+      "minimum_clearance_margin_m": 0.0,
+      "thread": {
+        "pitch_m": null,
+        "handedness": null,
+        "reference_zero_direction_part": null,
+        "moving_zero_direction_part": null,
+        "entry_phase_rad": null,
+        "maximum_helical_residual_m": null
+      },
+      "require_collision_validation": true
+    }
+  },
   "output": {
     "root": "../experiments/objects_0805/Object-9/unified_pose_v1"
   },

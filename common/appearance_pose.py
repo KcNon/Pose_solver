@@ -14,6 +14,7 @@ from common.normalized_recon import load_recon, scale_intrinsics
 from common.pose_refinement import silhouette_metrics
 from common.pose_tracking import load_part_cloud
 from common.pose_transforms import rigid_from_similarity, similarity_from_rigid
+from common.pose_transforms import axis_rotation_degrees
 from common.symmetry import (
     SymmetrySpec,
     axis_direction_error_deg,
@@ -57,6 +58,17 @@ def rotation_distance_deg(transform_a: np.ndarray, transform_b: np.ndarray) -> f
     )[:3, :3]
     cosine = float(np.clip((np.trace(relative) - 1.0) * 0.5, -1.0, 1.0))
     return math.degrees(math.acos(cosine))
+
+
+def carry_pose_orientation(
+    current_pose: np.ndarray,
+    previous_pose: np.ndarray,
+) -> np.ndarray:
+    """Use the current centre with the previous anchor's orientation."""
+
+    carried = np.asarray(current_pose, dtype=np.float64).copy()
+    carried[:3, :3] = np.asarray(previous_pose, dtype=np.float64)[:3, :3]
+    return carried
 
 
 def align_pose_axis(
@@ -104,6 +116,47 @@ def align_pose_axis(
     return value, math.degrees(angle)
 
 
+def rigid_core_mask(
+    mask: np.ndarray,
+    *,
+    opening_pixels: int,
+    keep_largest: bool,
+) -> np.ndarray:
+    """Return the rigid silhouette core without changing source masks.
+
+    This auxiliary mask prevents a thin cable, strap, or segmentation whisker
+    from determining an otherwise rigid body's yaw.  If morphology removes
+    everything, the original mask is returned so scoring remains defined.
+    """
+
+    original = np.asarray(mask, dtype=bool)
+    if opening_pixels < 0:
+        raise ValueError("opening_pixels must be non-negative")
+    value = original.astype(np.uint8)
+    if opening_pixels > 0:
+        size = 2 * int(opening_pixels) + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
+        value = cv2.morphologyEx(value, cv2.MORPH_OPEN, kernel)
+    if keep_largest and int(value.sum()) > 0:
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(
+            value, connectivity=8
+        )
+        if count > 1:
+            largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+            value = (labels == largest).astype(np.uint8)
+    result = value.astype(bool)
+    return result if int(result.sum()) > 0 else original.copy()
+
+
+def table_yaw_angles(step_deg: float) -> list[float]:
+    """Return a deterministic, non-duplicated full turn of yaw candidates."""
+
+    if not 0.0 < float(step_deg) <= 360.0:
+        raise ValueError("table_yaw_step_deg must be in (0, 360]")
+    count = max(1, int(math.ceil(360.0 / float(step_deg))))
+    return [360.0 * index / count for index in range(count)]
+
+
 def _is_static_transition(
     frame_a: int,
     frame_b: int,
@@ -136,7 +189,15 @@ def select_candidate_chain(
 
     def selectable_score(row: dict[str, Any]) -> float:
         score = float(row.get("selection_score", row["score"]))
-        if row.get("candidate_gate_passed") is False or score <= -1.0e11:
+        # Semantic direction gates are hard. Relative silhouette quality is
+        # encoded in ``selection_score`` as a large but finite penalty:
+        # deleting every visually weak candidate can make a valid temporal
+        # chain infeasible after a real manipulation. The selected weak anchor
+        # is still rejected locally below and falls back to its geometry pose.
+        if (
+            row.get("semantic_candidate_gate_passed") is False
+            or score <= -1.0e11
+        ):
             return -np.inf
         return score
 
@@ -201,18 +262,20 @@ def select_candidate_chain(
         for current_index, current in enumerate(current_rows):
             penalties: list[float] = []
             for previous_index, previous in enumerate(previous_rows):
+                previous_pose = previous.get("transition_pose", previous["pose"])
+                current_pose = current.get("transition_pose", current["pose"])
                 if transition_symmetry is not None:
                     angle_deg = symmetry_rotation_distance_deg(
-                        previous["pose"],
-                        current["pose"],
+                        previous_pose,
+                        current_pose,
                         transition_symmetry,
                     )
                 elif transition_axis is None:
-                    angle_deg = rotation_distance_deg(previous["pose"], current["pose"])
+                    angle_deg = rotation_distance_deg(previous_pose, current_pose)
                 else:
                     angle_deg = axis_direction_error_deg(
-                        previous["pose"],
-                        current["pose"],
+                        previous_pose,
+                        current_pose,
                         transition_axis,
                     )
                 normalized_rate = angle_deg / frame_gap / max_rotation_deg_per_frame
@@ -229,8 +292,8 @@ def select_candidate_chain(
                             "max_translation_m_per_frame must be positive"
                         )
                     translation = float(np.linalg.norm(
-                        np.asarray(previous["pose"])[:3, 3]
-                        - np.asarray(current["pose"])[:3, 3]
+                        np.asarray(previous_pose)[:3, 3]
+                        - np.asarray(current_pose)[:3, 3]
                     ))
                     normalized_translation = (
                         translation
@@ -462,6 +525,61 @@ def _table_support_score(
     }
 
 
+def normalize_similarity_to_support_plane(
+    vertices_raw: np.ndarray,
+    similarity: np.ndarray,
+    plane_normal: np.ndarray,
+    plane_point: np.ndarray,
+    *,
+    contact_quantile: float,
+    maximum_shift_m: float,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Remove table-normal translation before comparing orientation basins.
+
+    Registration hypotheses can describe the same visible orientation with
+    different table-normal translations.  Penalizing their absolute support
+    gap before removing that nuisance translation can make a geometrically
+    upside-down basin win merely because one of its vertices already touches
+    the table.  Normalize every applicable candidate to the same robust
+    contact height first; silhouette/texture then compare orientation rather
+    than registration height.
+    """
+
+    transform = np.asarray(similarity, dtype=np.float64).copy()
+    vertices = np.asarray(vertices_raw, dtype=np.float64)
+    normal = np.asarray(plane_normal, dtype=np.float64).reshape(3)
+    point = np.asarray(plane_point, dtype=np.float64).reshape(3)
+    normal_norm = float(np.linalg.norm(normal))
+    if transform.shape != (4, 4) or not np.all(np.isfinite(transform)):
+        raise ValueError("similarity must be a finite 4x4 matrix")
+    if vertices.ndim != 2 or vertices.shape[1] != 3 or not len(vertices):
+        raise ValueError("vertices_raw must be a non-empty Nx3 array")
+    if normal_norm <= 1e-12 or not np.isfinite(normal_norm):
+        raise ValueError("plane_normal must be finite and non-zero")
+    quantile = float(contact_quantile)
+    if not 0.0 <= quantile < 0.5:
+        raise ValueError("contact_quantile must be in [0, 0.5)")
+    normal /= normal_norm
+    world = vertices @ transform[:3, :3].T + transform[:3, 3]
+    signed = (world - point) @ normal
+    gap_before = float(np.quantile(signed, quantile))
+    shift = -gap_before
+    accepted = bool(
+        np.isfinite(shift) and abs(shift) <= float(maximum_shift_m)
+    )
+    if accepted:
+        transform[:3, 3] += shift * normal
+    return transform, {
+        "accepted": accepted,
+        "contact_quantile": quantile,
+        "contact_gap_before_m": gap_before,
+        "translation_along_normal_m": shift if accepted else 0.0,
+        "contact_gap_after_m": 0.0 if accepted else gap_before,
+        "maximum_shift_m": float(maximum_shift_m),
+        "reason": None if accepted else "required_table_shift_exceeds_limit",
+    }
+
+
 def _range_pairs(values: list[Any]) -> list[list[int]]:
     pairs: list[list[int]] = []
     for item in values:
@@ -523,6 +641,17 @@ def refine_anchor_orientations(
     photometric_minimum_pixels = int(
         appearance_cfg.get("photometric_minimum_pixels", 60)
     )
+    rigid_core_weight = float(
+        appearance_cfg.get("rigid_core_silhouette_weight", 0.0)
+    )
+    rigid_core_opening_pixels = int(
+        appearance_cfg.get("rigid_core_opening_pixels", 0)
+    )
+    rigid_core_keep_largest = bool(
+        appearance_cfg.get("rigid_core_keep_largest", True)
+    )
+    if rigid_core_weight < 0.0:
+        raise ValueError("rigid_core_silhouette_weight must be non-negative")
     minimum_full_pixels = int(
         appearance_cfg.get("minimum_full_mask_pixels", 1)
     )
@@ -542,6 +671,12 @@ def refine_anchor_orientations(
     )
     table_support_penetration_tolerance_m = float(
         appearance_cfg.get("table_support_penetration_tolerance_m", 0.005)
+    )
+    normalize_table_height = bool(
+        appearance_cfg.get("normalize_table_height_before_scoring", True)
+    )
+    table_height_maximum_shift_m = float(
+        appearance_cfg.get("table_height_maximum_shift_m", 0.05)
     )
     support_facing_axis_raw = appearance_cfg.get("support_facing_axis_raw")
     if support_facing_axis_raw is not None:
@@ -621,6 +756,27 @@ def refine_anchor_orientations(
         )
         for anchor_frame in anchor_frames
     }
+    table_yaw_enabled = bool(
+        appearance_cfg.get("table_yaw_search", False)
+        and candidate_symmetry.equivalence == "none"
+        and support_normal is not None
+    )
+    table_yaw_frames = set(anchor_frames)
+    if (
+        table_yaw_enabled
+        and appearance_cfg.get("table_yaw_first_static_interval_only", True)
+    ):
+        table_yaw_frames = set()
+        for start, end in _range_pairs(state_cfg.get("static_ranges", [])):
+            inside = {
+                frame for frame in anchor_frames if start <= frame <= end
+            }
+            if inside:
+                table_yaw_frames = inside
+                break
+    yaw_angles = table_yaw_angles(
+        float(appearance_cfg.get("table_yaw_step_deg", 30.0))
+    )
     vertices_raw = np.asarray(mesh.vertices, dtype=np.float64)
     if len(vertices_raw) > 20000:
         vertices_raw = vertices_raw[:: max(1, len(vertices_raw) // 20000)][
@@ -677,6 +833,11 @@ def refine_anchor_orientations(
                         "timestamp": timestamp,
                         "view": view,
                         "target": target,
+                        "target_rigid_core": rigid_core_mask(
+                            target,
+                            opening_pixels=rigid_core_opening_pixels,
+                            keep_largest=rigid_core_keep_largest,
+                        ),
                         "observed_rgb": rgb,
                         "observed_edges": _texture_edges(
                             rgb, target, erosion_pixels=erosion_pixels
@@ -696,12 +857,39 @@ def refine_anchor_orientations(
     all_candidate_rows: list[list[dict[str, Any]]] = []
     per_anchor_report: dict[str, Any] = {}
     try:
-        for anchor_frame in anchor_frames:
+        for anchor_index, anchor_frame in enumerate(anchor_frames):
             scored_rows: list[dict[str, Any]] = []
-            hypotheses = (
+            hypotheses = list(
                 (anchor_hypotheses or {}).get(anchor_frame)
                 or [{"label": "registration", "similarity": anchors[anchor_frame]}]
             )
+            if (
+                anchor_index > 0
+                and bool(appearance_cfg.get(
+                    "include_previous_anchor_orientation_candidate", True
+                ))
+            ):
+                previous_frame = anchor_frames[anchor_index - 1]
+                current_rigid = rigid_from_similarity(
+                    np.asarray(anchors[anchor_frame], dtype=np.float64),
+                    origin,
+                )
+                previous_rigid = rigid_from_similarity(
+                    np.asarray(anchors[previous_frame], dtype=np.float64),
+                    origin,
+                )
+                carried_rigid = carry_pose_orientation(
+                    current_rigid,
+                    previous_rigid,
+                )
+                hypotheses.append({
+                    "label": f"temporal_hold_{previous_frame}",
+                    "similarity": similarity_from_rigid(
+                        carried_rigid,
+                        scale,
+                        origin,
+                    ),
+                })
             if (
                 bool(appearance_cfg.get(
                     "generate_support_aligned_candidates", True
@@ -741,11 +929,66 @@ def refine_anchor_orientations(
                     np.asarray(hypothesis["similarity"], dtype=np.float64),
                     origin,
                 )
-                for candidate in candidates:
+                anchor_candidates = candidates
+                if (
+                    table_yaw_enabled
+                    and anchor_frame in table_yaw_frames
+                    and semantic_support_applicable.get(anchor_frame, False)
+                ):
+                    anchor_candidates = [
+                        {
+                            **candidate,
+                            "label": (
+                                f"{candidate['label']}|world_yaw_"
+                                f"{angle_deg:.3f}"
+                            ),
+                            "world_yaw_deg": float(angle_deg),
+                        }
+                        for candidate in candidates
+                        for angle_deg in yaw_angles
+                    ]
+                for candidate in anchor_candidates:
                     pose = rigid_base @ candidate["local_transform"]
+                    world_yaw_deg = float(candidate.get("world_yaw_deg", 0.0))
+                    if abs(world_yaw_deg) > 1e-12:
+                        world_yaw = axis_rotation_degrees(
+                            support_normal, world_yaw_deg
+                        )[:3, :3]
+                        pose = pose.copy()
+                        pose[:3, :3] = world_yaw @ pose[:3, :3]
                     similarity_transform = similarity_from_rigid(
                         pose, scale, origin
                     )
+                    table_height_normalization = None
+                    if (
+                        normalize_table_height
+                        and support_applicable.get(anchor_frame, False)
+                        and support_normal is not None
+                        and support_point is not None
+                    ):
+                        (
+                            normalized_similarity,
+                            table_height_normalization,
+                        ) = normalize_similarity_to_support_plane(
+                            vertices_raw,
+                            similarity_transform,
+                            support_normal,
+                            support_point,
+                            contact_quantile=(
+                                table_support_contact_quantile
+                            ),
+                            maximum_shift_m=(
+                                table_height_maximum_shift_m
+                            ),
+                        )
+                        if table_height_normalization["accepted"]:
+                            translation_delta = (
+                                normalized_similarity[:3, 3]
+                                - similarity_transform[:3, 3]
+                            )
+                            pose = pose.copy()
+                            pose[:3, 3] += translation_delta
+                            similarity_transform = normalized_similarity
                     support_facing_alignment = None
                     if (
                         support_facing_axis_raw is not None
@@ -791,6 +1034,19 @@ def refine_anchor_orientations(
                             silhouette_chamfer,
                             silhouette_score,
                         ) = silhouette_metrics(predicted, observation["target"])
+                        predicted_rigid_core = rigid_core_mask(
+                            predicted,
+                            opening_pixels=rigid_core_opening_pixels,
+                            keep_largest=rigid_core_keep_largest,
+                        )
+                        (
+                            rigid_core_iou,
+                            rigid_core_chamfer,
+                            rigid_core_score,
+                        ) = silhouette_metrics(
+                            predicted_rigid_core,
+                            observation["target_rigid_core"],
+                        )
                         rendered_edges = _texture_edges(
                             rendered_rgb,
                             predicted,
@@ -821,6 +1077,7 @@ def refine_anchor_orientations(
                         )
                         score = (
                             silhouette_weight * float(silhouette_score)
+                            + rigid_core_weight * float(rigid_core_score)
                             + texture_weight * texture_score
                             + photometric_weight
                             * (
@@ -837,6 +1094,10 @@ def refine_anchor_orientations(
                                 "silhouette_iou": float(silhouette_iou),
                                 "silhouette_chamfer_px": float(
                                     silhouette_chamfer
+                                ),
+                                "rigid_core_iou": float(rigid_core_iou),
+                                "rigid_core_chamfer_px": float(
+                                    rigid_core_chamfer
                                 ),
                                 "texture_edge_chamfer_px": (
                                     None
@@ -916,6 +1177,13 @@ def refine_anchor_orientations(
                         if kept_scores
                         else 100.0
                     )
+                    mean_rigid_core_iou = (
+                        float(np.mean([
+                            row["rigid_core_iou"] for row in kept_scores
+                        ]))
+                        if kept_scores
+                        else 0.0
+                    )
                     edge_values = [
                         row["texture_edge_chamfer_px"]
                         for row in kept_scores
@@ -942,6 +1210,9 @@ def refine_anchor_orientations(
                             ),
                             "axis_flipped": bool(candidate["axis_flipped"]),
                             "axis_angle_deg": float(candidate["axis_angle_deg"]),
+                            "world_yaw_deg": float(
+                                candidate.get("world_yaw_deg", 0.0)
+                            ),
                             "pose": pose,
                             "score": aggregate,
                             "mean_silhouette_iou": mean_iou,
@@ -956,6 +1227,7 @@ def refine_anchor_orientations(
                             "mean_silhouette_chamfer_px": (
                                 mean_silhouette_chamfer
                             ),
+                            "mean_rigid_core_iou": mean_rigid_core_iou,
                             "mean_texture_edge_chamfer_px": (
                                 float(np.mean(edge_values))
                                 if edge_values
@@ -968,6 +1240,9 @@ def refine_anchor_orientations(
                             ),
                             "table_support_score": table_support_score,
                             "table_support": table_support_report,
+                            "table_height_normalization": (
+                                table_height_normalization
+                            ),
                             "support_facing_alignment": (
                                 support_facing_alignment
                             ),
@@ -1010,7 +1285,10 @@ def refine_anchor_orientations(
                 default=0.0,
             )
             maximum_iou_drop = appearance_cfg.get(
-                "maximum_candidate_iou_drop"
+                "maximum_candidate_iou_drop", 0.04
+            )
+            relative_iou_gate_penalty = float(
+                appearance_cfg.get("relative_iou_gate_penalty", 1.0)
             )
             minimum_iou_ratio = appearance_cfg.get(
                 "minimum_candidate_iou_ratio_to_best"
@@ -1035,18 +1313,60 @@ def refine_anchor_orientations(
                 opening_direction_gate_passed = bool(
                     row["opening_direction_gate_passed"]
                 )
-                gate_passed = bool(
-                    silhouette_gate_passed
-                    and support_facing_gate_passed
+                semantic_gate_passed = bool(
+                    support_facing_gate_passed
                     and opening_direction_gate_passed
+                )
+                gate_passed = bool(
+                    silhouette_gate_passed and semantic_gate_passed
                 )
                 row["silhouette_candidate_gate_passed"] = (
                     silhouette_gate_passed
                 )
+                row["semantic_candidate_gate_passed"] = (
+                    semantic_gate_passed
+                )
                 row["best_candidate_iou"] = best_candidate_iou
                 row["candidate_gate_passed"] = gate_passed
                 row["selection_score"] = (
-                    float(row["score"]) if gate_passed else -1.0e12
+                    float(row["score"])
+                    - (
+                        0.0
+                        if silhouette_gate_passed
+                        else relative_iou_gate_penalty
+                    )
+                    if semantic_gate_passed
+                    else -1.0e12
+                )
+            # A visually weak candidate is allowed to keep the temporal chain
+            # feasible, but it is not applied below: that anchor falls back to
+            # the geometry pose. The chain must therefore score transitions
+            # against the pose that will actually be written. Otherwise a
+            # rejected candidate can hide a near-180-degree discontinuity
+            # between the geometry fallback and the next accepted anchor.
+            fallback_rigid = rigid_from_similarity(
+                np.asarray(anchors[anchor_frame], dtype=np.float64),
+                origin,
+            )
+            minimum_iou = float(appearance_cfg.get("minimum_mean_iou", 0.0))
+            minimum_worst_iou = float(
+                appearance_cfg.get("minimum_worst_view_iou", 0.0)
+            )
+            minimum_observations = int(
+                appearance_cfg.get("minimum_observations", 1)
+            )
+            for row in scored_rows:
+                will_apply = bool(
+                    bool(row.get("silhouette_candidate_gate_passed", False))
+                    and bool(row.get("support_facing_gate_passed", False))
+                    and bool(row.get("opening_direction_gate_passed", False))
+                    and float(row["mean_silhouette_iou"]) >= minimum_iou
+                    and float(row["worst_silhouette_iou"])
+                    >= minimum_worst_iou
+                    and len(row["observations"]) >= minimum_observations
+                )
+                row["transition_pose"] = (
+                    row["pose"] if will_apply else fallback_rigid
                 )
             all_candidate_rows.append(scored_rows)
             per_anchor_report[str(anchor_frame)] = {
@@ -1063,7 +1383,7 @@ def refine_anchor_orientations(
                     {
                         key: value
                         for key, value in row.items()
-                        if key not in {"pose", "observations"}
+                        if key not in {"pose", "transition_pose", "observations"}
                     }
                     for row in scored_rows
                 ],
@@ -1119,7 +1439,7 @@ def refine_anchor_orientations(
             selected_report = {
                 key: value
                 for key, value in chosen.items()
-                if key not in {"pose", "observations"}
+                if key not in {"pose", "transition_pose", "observations"}
             }
             selected_report["appearance_accepted"] = True
         else:
@@ -1178,6 +1498,16 @@ def refine_anchor_orientations(
         "symmetry": symmetry.as_dict(),
         "candidate_symmetry": candidate_symmetry.as_dict(),
         "resolution": [width, height],
+        "table_yaw_search": {
+            "enabled": table_yaw_enabled,
+            "frames": sorted(table_yaw_frames) if table_yaw_enabled else [],
+            "angles_deg": yaw_angles if table_yaw_enabled else [0.0],
+        },
+        "rigid_core_silhouette": {
+            "weight": rigid_core_weight,
+            "opening_pixels": rigid_core_opening_pixels,
+            "keep_largest": rigid_core_keep_largest,
+        },
         "anchors": per_anchor_report,
         "chain": chain_report,
     }

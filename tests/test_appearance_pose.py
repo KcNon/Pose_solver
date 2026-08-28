@@ -8,11 +8,16 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from common.appearance_pose import (
+    _table_support_score,
     _is_static_transition,
     _masked_photometric_correlation,
     align_pose_axis,
     candidate_local_rotations,
+    carry_pose_orientation,
+    normalize_similarity_to_support_plane,
+    rigid_core_mask,
     select_candidate_chain,
+    table_yaw_angles,
 )
 from common.silhouette_scale_calibration import (
     _configured_prior_cross_frame_gate,
@@ -46,6 +51,28 @@ def test_candidate_modes_are_proper_rotations_and_include_axis_flip() -> None:
         "local_transform"
     ][:3, :3]
     assert np.allclose(flip_rotation @ axis, -axis, atol=1e-7)
+
+
+def test_table_yaw_angles_cover_full_turn_without_duplicate_endpoint() -> None:
+    assert table_yaw_angles(90.0) == [0.0, 90.0, 180.0, 270.0]
+    angles = table_yaw_angles(100.0)
+    assert angles == [0.0, 90.0, 180.0, 270.0]
+    assert len(set(angles)) == len(angles)
+
+
+def test_rigid_core_mask_removes_thin_appendage_and_small_component() -> None:
+    mask = np.zeros((60, 80), dtype=bool)
+    mask[15:45, 20:50] = True
+    mask[29:31, 50:75] = True
+    mask[5:8, 65:68] = True
+
+    core = rigid_core_mask(
+        mask, opening_pixels=2, keep_largest=True
+    )
+
+    assert int(core[:, 55:].sum()) == 0
+    assert int(core[5:8, 65:68].sum()) == 0
+    assert int(core[20:40, 25:45].sum()) > 300
 
 
 def test_chain_rejects_geometric_axis_flip_using_motion_prior() -> None:
@@ -135,6 +162,70 @@ def test_photometric_correlation_distinguishes_spatial_texture_flip() -> None:
     assert flipped < -0.8
 
 
+def test_support_normalization_removes_candidate_height_bias() -> None:
+    vertices = np.asarray([
+        [-0.5, -0.5, -0.2],
+        [-0.5, 0.5, -0.2],
+        [0.5, -0.5, -0.2],
+        [0.5, 0.5, -0.2],
+        [-0.5, -0.5, 0.2],
+        [0.5, 0.5, 0.2],
+    ])
+    candidate = np.eye(4)
+    candidate[2, 3] = 0.035
+    normal = np.asarray([0.0, 0.0, 1.0])
+    point = np.zeros(3)
+
+    before, _ = _table_support_score(
+        vertices,
+        candidate,
+        normal,
+        point,
+        contact_quantile=0.01,
+        gap_cap_m=0.02,
+        penetration_tolerance_m=0.005,
+    )
+    normalized, report = normalize_similarity_to_support_plane(
+        vertices,
+        candidate,
+        normal,
+        point,
+        contact_quantile=0.01,
+        maximum_shift_m=0.25,
+    )
+    after, support = _table_support_score(
+        vertices,
+        normalized,
+        normal,
+        point,
+        contact_quantile=0.01,
+        gap_cap_m=0.02,
+        penetration_tolerance_m=0.005,
+    )
+
+    assert report["accepted"]
+    assert abs(report["translation_along_normal_m"] - 0.165) < 1e-9
+    assert abs(report["contact_gap_after_m"]) < 1e-12
+    assert abs(support["contact_gap_m"]) < 1e-9
+    assert after > before
+
+
+def test_support_normalization_rejects_implausibly_large_shift() -> None:
+    vertices = np.asarray([[0.0, 0.0, -0.1], [0.0, 0.0, 0.1]])
+    candidate = np.eye(4)
+    candidate[2, 3] = 1.0
+    normalized, report = normalize_similarity_to_support_plane(
+        vertices,
+        candidate,
+        np.asarray([0.0, 0.0, 1.0]),
+        np.zeros(3),
+        contact_quantile=0.01,
+        maximum_shift_m=0.05,
+    )
+    assert not report["accepted"]
+    np.testing.assert_allclose(normalized, candidate)
+
+
 def test_configured_scale_prior_rejects_cross_frame_degradation() -> None:
     baseline = {
         "frames": {
@@ -198,6 +289,37 @@ def test_fingerprint_changes_for_content_and_observation_stat(tmp_path: Path) ->
 
 
 class CalibrationRegressionTests(unittest.TestCase):
+    def test_chain_rate_uses_pose_written_after_candidate_fallback(self):
+        selected, _report = select_candidate_chain(
+            [10, 20],
+            [
+                [{
+                    "pose": _pose_x(170),
+                    "transition_pose": _pose_x(0),
+                    "score": 0.0,
+                }],
+                [
+                    {"pose": _pose_x(170), "score": 1.0},
+                    {"pose": _pose_x(10), "score": 0.0},
+                ],
+            ],
+            transition_weight=0.0,
+            max_rotation_deg_per_frame=5.0,
+            hard_rotation_rate=True,
+        )
+        self.assertEqual(selected, [0, 1])
+
+    def test_carry_pose_orientation_preserves_current_centre(self):
+        previous = _pose_x(73)
+        previous[:3, 3] = [8.0, 9.0, 10.0]
+        current = _pose_x(-41)
+        current[:3, 3] = [1.0, 2.0, 3.0]
+
+        carried = carry_pose_orientation(current, previous)
+
+        np.testing.assert_allclose(carried[:3, :3], previous[:3, :3])
+        np.testing.assert_allclose(carried[:3, 3], current[:3, 3])
+
     def test_chain_honors_candidate_selection_gate(self):
         selected, report = select_candidate_chain(
             [10],
@@ -218,6 +340,26 @@ class CalibrationRegressionTests(unittest.TestCase):
         )
         self.assertEqual(selected, [1])
         self.assertAlmostEqual(report["path_score"], 0.2)
+
+    def test_chain_can_traverse_soft_silhouette_gate_failure(self):
+        selected, report = select_candidate_chain(
+            [10, 11],
+            [
+                [{"pose": _pose_x(0), "score": 0.0}],
+                [{
+                    "pose": _pose_x(5),
+                    "score": 0.5,
+                    "selection_score": -0.5,
+                    "candidate_gate_passed": False,
+                    "semantic_candidate_gate_passed": True,
+                }],
+            ],
+            transition_weight=0.0,
+            max_rotation_deg_per_frame=10.0,
+            hard_rotation_rate=True,
+        )
+        self.assertEqual(selected, [0, 0])
+        self.assertAlmostEqual(report["path_score"], -0.5)
 
     def test_chain_fails_closed_when_every_candidate_is_gated(self):
         with self.assertRaisesRegex(

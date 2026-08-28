@@ -17,7 +17,7 @@ sys.path.insert(0, str(ROOT))
 from common.io_utils import load_json, write_json
 from common.depth_gauge import apply_depth_gauge, load_depth_gauge
 from common.mesh_render import SceneRenderer
-from common.normalized_recon import load_recon
+from common.normalized_recon import load_recon, load_recon_camera
 from common.pose_visualization import camera_from_recon, part_color, solid_mesh
 
 
@@ -26,6 +26,19 @@ AXIS_COLORS_RGB = {
     "y": (40, 235, 70),
     "z": (50, 100, 255),
 }
+
+
+def resolved_render_settings(cfg: dict) -> dict:
+    """Return renderer defaults for the minimal unified pose contract."""
+
+    settings = dict(cfg.get("render", {}))
+    settings.setdefault("primary_view", cfg["views"][0])
+    settings.setdefault(
+        "fps", float(cfg.get("frames", {}).get("fps", 5.0) or 5.0)
+    )
+    settings.setdefault("axis_length_m", 0.09)
+    settings.setdefault("axis_radius_m", 0.004)
+    return settings
 
 
 def colored_primitive(mesh: trimesh.Trimesh, rgb: tuple[int, int, int]) -> trimesh.Trimesh:
@@ -114,6 +127,46 @@ def depth_visible_foreground(
     return rendered & ~occluded
 
 
+def mask_visible_foreground(
+    foreground: np.ndarray,
+    labels: np.ndarray,
+    *,
+    occluder_labels: list[int] | tuple[int, ...],
+    dilation_pixels: int = 0,
+) -> np.ndarray:
+    """Remove pixels hidden by explicitly labelled modal occluders.
+
+    This is a visualization/compositing operation only. It does not alter the
+    trajectory and deliberately requires explicit labels so a rigid part is
+    not accidentally treated as a hand.
+    """
+
+    visible = np.asarray(foreground, dtype=bool)
+    values = np.asarray(labels)
+    if visible.shape != values.shape or values.ndim != 2:
+        raise ValueError("foreground and labels must be same-size 2-D arrays")
+    selected = sorted({int(value) for value in occluder_labels})
+    if any(value < 1 or value > 255 for value in selected):
+        raise ValueError("mask occluder labels must be in [1, 255]")
+    if not selected:
+        return visible.copy()
+    occluded = np.isin(values, np.asarray(selected, dtype=values.dtype))
+    if dilation_pixels > 0 and occluded.any():
+        size = 2 * int(dilation_pixels) + 1
+        occluded = cv2.dilate(
+            occluded.astype(np.uint8),
+            np.ones((size, size), dtype=np.uint8),
+            iterations=1,
+        ).astype(bool)
+    return visible & ~occluded
+
+
+def should_report_progress(index: int, total: int, interval: int = 25) -> bool:
+    """Keep long renders observable without flooding the output pipe."""
+
+    return index == 1 or index == total or index % interval == 0
+
+
 def annotate_axes(image: np.ndarray, records: dict, K: np.ndarray, E: np.ndarray) -> None:
     for part, record in records.items():
         T = np.asarray(record["T_world_from_part"], float)
@@ -175,20 +228,27 @@ def main() -> None:
         action="store_true",
         help="write only mesh_only.mp4 and skip overlay/textured/axes/metrics",
     )
+    parser.add_argument(
+        "--basic-only",
+        action="store_true",
+        help="write overlay.mp4 and mesh_only.mp4 with one render pass",
+    )
     args = parser.parse_args()
-    if args.overlay_only and args.mesh_operation_only:
+    if sum((args.overlay_only, args.mesh_operation_only, args.basic_only)) > 1:
         raise ValueError(
-            "--overlay-only and --mesh-operation-only are mutually exclusive"
+            "--overlay-only, --mesh-operation-only, and --basic-only are "
+            "mutually exclusive"
         )
 
     cfg = load_json(Path(args.config))
+    render_settings = resolved_render_settings(cfg)
     output = Path(args.output_root or cfg["output_root"])
     trajectory_path = Path(args.trajectory) if args.trajectory else output / "pose" / "trajectory.json"
     trajectory = load_json(trajectory_path)
-    view = args.view or cfg["render"]["primary_view"]
+    view = args.view or render_settings["primary_view"]
     view_index = cfg["views"].index(view)
     width, height = args.width, args.height
-    fps = float(cfg["render"]["fps"])
+    fps = float(render_settings["fps"])
     render_dir = output / "render" / view
     render_dir.mkdir(parents=True, exist_ok=True)
 
@@ -200,11 +260,32 @@ def main() -> None:
         part: solid_mesh(raw_meshes[part], part_color(index))
         for index, part in enumerate(cfg["parts"])
     }
-    axes = make_axis_meshes(float(cfg["render"]["axis_length_m"]),
-                            float(cfg["render"]["axis_radius_m"]))
+    axes = (
+        []
+        if args.basic_only or args.overlay_only or args.mesh_operation_only
+        else make_axis_meshes(
+            float(render_settings["axis_length_m"]),
+            float(render_settings["axis_radius_m"]),
+        )
+    )
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    if args.mesh_operation_only:
+    if args.basic_only:
+        writers = {
+            "overlay": cv2.VideoWriter(
+                str(render_dir / "overlay.mp4"),
+                fourcc,
+                fps,
+                (width, height),
+            ),
+            "mesh_only": cv2.VideoWriter(
+                str(render_dir / "mesh_only.mp4"),
+                fourcc,
+                fps,
+                (width, height),
+            ),
+        }
+    elif args.mesh_operation_only:
         writers = {
             "mesh_only": cv2.VideoWriter(
                 str(render_dir / "mesh_only.mp4"),
@@ -222,7 +303,11 @@ def main() -> None:
                 (width, height),
             ),
         }
-    if not args.overlay_only and not args.mesh_operation_only:
+    if (
+        not args.overlay_only
+        and not args.mesh_operation_only
+        and not args.basic_only
+    ):
         writers.update({
             "mesh_only": cv2.VideoWriter(
                 str(render_dir / "mesh_only.mp4"),
@@ -307,9 +392,15 @@ def main() -> None:
     samples = []
     metrics = {"view": view, "frames": {}}
     mask_root = Path(cfg["masks_dir"])
-    render_settings = cfg.get("render", {})
     use_depth_occlusion = bool(
         render_settings.get("occlusion_aware", False)
+    )
+    mask_occluder_labels = [
+        int(value)
+        for value in render_settings.get("mask_occluder_labels", [])
+    ]
+    mask_occlusion_dilation = int(
+        render_settings.get("mask_occlusion_dilation_pixels", 0)
     )
     depth_gauge = (
         load_depth_gauge(str(cfg["depth_gauge_path"]))
@@ -327,6 +418,14 @@ def main() -> None:
                 if source is None:
                     raise FileNotFoundError(image_path)
                 source = cv2.resize(source, (width, height), interpolation=cv2.INTER_AREA)
+                labels = np.asarray(
+                    Image.open(mask_root / key / f"{view}.png")
+                )
+                labels = cv2.resize(
+                    labels.astype(np.uint8),
+                    (width, height),
+                    interpolation=cv2.INTER_NEAREST,
+                )
                 if frame_record is None:
                     blank = np.zeros_like(source)
                     overlay = source.copy()
@@ -338,14 +437,16 @@ def main() -> None:
                             cv2.resize(overlay, (480, 270), interpolation=cv2.INTER_AREA),
                             cv2.resize(blank, (480, 270), interpolation=cv2.INTER_AREA),
                         ]))
-                    print(
-                        f"rendered {frame:03d} ({item_index}/{len(trajectory_items)}; source only)",
-                        flush=True,
-                    )
+                    if should_report_progress(item_index, len(trajectory_items)):
+                        print(
+                            f"rendered {frame:03d} ({item_index}/{len(trajectory_items)}; source only)",
+                            flush=True,
+                        )
                     continue
 
                 records = frame_record["parts"]
-                recon = load_recon(
+                recon_loader = load_recon if use_depth_occlusion else load_recon_camera
+                recon = recon_loader(
                     cfg, f"{frame:06d}", backend=cfg["recon_backend"]
                 )
                 K, E = camera_from_recon(
@@ -395,6 +496,13 @@ def main() -> None:
                             )
                         ),
                     )
+                if mask_occluder_labels:
+                    foreground = mask_visible_foreground(
+                        foreground,
+                        labels,
+                        occluder_labels=mask_occluder_labels,
+                        dilation_pixels=mask_occlusion_dilation,
+                    )
                 mesh_bgr[~foreground] = 0
 
                 if args.mesh_operation_only:
@@ -413,11 +521,12 @@ def main() -> None:
                                 interpolation=cv2.INTER_AREA,
                             ),
                         ]))
-                    print(
-                        f"rendered {frame:03d} "
-                        f"({item_index}/{len(trajectory_items)})",
-                        flush=True,
-                    )
+                    if should_report_progress(item_index, len(trajectory_items)):
+                        print(
+                            f"rendered {frame:03d} "
+                            f"({item_index}/{len(trajectory_items)})",
+                            flush=True,
+                        )
                     continue
 
                 overlay = source.copy().astype(np.float32)
@@ -444,17 +553,50 @@ def main() -> None:
                             ),
                         ])
                         samples.append(tile)
-                    print(
-                        f"rendered {frame:03d} "
-                        f"({item_index}/{len(trajectory_items)})",
-                        flush=True,
-                    )
+                    if should_report_progress(item_index, len(trajectory_items)):
+                        print(
+                            f"rendered {frame:03d} "
+                            f"({item_index}/{len(trajectory_items)})",
+                            flush=True,
+                        )
+                    continue
+
+                if args.basic_only:
+                    writers["overlay"].write(overlay)
+                    writers["mesh_only"].write(mesh_bgr)
+                    if frame in sample_frames:
+                        samples.append(np.hstack([
+                            cv2.resize(
+                                overlay,
+                                (480, 270),
+                                interpolation=cv2.INTER_AREA,
+                            ),
+                            cv2.resize(
+                                mesh_bgr,
+                                (480, 270),
+                                interpolation=cv2.INTER_AREA,
+                            ),
+                        ]))
+                    if should_report_progress(item_index, len(trajectory_items)):
+                        print(
+                            f"rendered {frame:03d} "
+                            f"({item_index}/{len(trajectory_items)})",
+                            flush=True,
+                        )
                     continue
 
                 textured_rgb, textured_depth = renderer.render(
                     [(raw_meshes[part], transforms[part]) for part in visible_parts], K, E)
                 textured_bgr = cv2.cvtColor(textured_rgb, cv2.COLOR_RGB2BGR)
-                textured_bgr[textured_depth <= 0] = 0
+                textured_foreground = textured_depth > 0
+                if mask_occluder_labels:
+                    textured_foreground = mask_visible_foreground(
+                        textured_foreground,
+                        labels,
+                        occluder_labels=mask_occluder_labels,
+                        dilation_pixels=mask_occlusion_dilation,
+                    )
+                textured_bgr[~textured_foreground] = 0
                 annotate_status(textured_bgr, frame, records)
 
                 axis_parts = list(mesh_parts)
@@ -462,7 +604,15 @@ def main() -> None:
                     axis_parts.extend((axis, rigid[part]) for axis in axes)
                 axes_rgb, axes_depth = renderer.render(axis_parts, K, E)
                 axes_bgr = cv2.cvtColor(axes_rgb, cv2.COLOR_RGB2BGR)
-                axes_bgr[axes_depth <= 0] = 0
+                axes_foreground = axes_depth > 0
+                if mask_occluder_labels:
+                    axes_foreground = mask_visible_foreground(
+                        axes_foreground,
+                        labels,
+                        occluder_labels=mask_occluder_labels,
+                        dilation_pixels=mask_occlusion_dilation,
+                    )
+                axes_bgr[~axes_foreground] = 0
                 annotate_axes(
                     axes_bgr,
                     {part: records[part] for part in visible_parts},
@@ -479,9 +629,6 @@ def main() -> None:
                     K,
                     E,
                 )
-                labels = np.asarray(Image.open(mask_root / key / f"{view}.png"))
-                labels = cv2.resize(labels.astype(np.uint8), (width, height),
-                                    interpolation=cv2.INTER_NEAREST)
                 metrics["frames"][key] = {
                     part: {
                         "silhouette_iou": iou(
@@ -507,15 +654,17 @@ def main() -> None:
                         cv2.resize(axes_bgr, (480, 270), interpolation=cv2.INTER_AREA),
                     ])
                     samples.append(tile)
-                print(
-                    f"rendered {frame:03d} ({item_index}/{len(trajectory_items)})",
-                    flush=True,
-                )
+                if should_report_progress(item_index, len(trajectory_items)):
+                    print(
+                        f"rendered {frame:03d} ({item_index}/{len(trajectory_items)})",
+                        flush=True,
+                    )
     finally:
         for writer in writers.values():
             writer.release()
 
     metrics["summary"] = {}
+    metrics["basic_only"] = bool(args.basic_only)
     metrics["rendered_frame_count"] = len(trajectory_items)
     metrics["pose_frame_count"] = len(metrics["frames"])
     for part in cfg["parts"]:
@@ -544,4 +693,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    from common.resource_safety import require_memory_guard
+
+    require_memory_guard("tools/stages/pose/render_multiview_pose.py")
     main()

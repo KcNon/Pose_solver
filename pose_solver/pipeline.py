@@ -22,7 +22,9 @@ from pose_solver.resolved import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
-VALID_STAGES = ("all", "preflight", "frames", "mask", "depth", "pose")
+VALID_STAGES = (
+    "all", "preflight", "frames", "mask", "depth", "pose", "render"
+)
 
 
 class PipelineRunner:
@@ -34,17 +36,29 @@ class PipelineRunner:
         *,
         force: bool = False,
         dry_run: bool = False,
+        skip_review: bool = False,
+        skip_render: bool = False,
     ) -> None:
         self.config = config
         self.layout = ArtifactLayout(config.output_root)
         self.force = bool(force)
         self.dry_run = bool(dry_run)
+        self.skip_review = bool(skip_review)
+        self.skip_render = bool(skip_render)
 
     def _environment(self) -> dict[str, str]:
         return {
             "PYTHONUNBUFFERED": "1",
             "CUDA_VISIBLE_DEVICES": ",".join(
                 str(device) for device in self.config.devices
+            ),
+            # pyrender's EGL backend ignores CUDA_VISIBLE_DEVICES. On shared
+            # hosts its enumeration may differ from CUDA indices, so configs
+            # can provide the mapping audited by list_egl_devices.py.
+            "EGL_DEVICE_ID": str(
+                self.config.raw.get("runtime", {}).get(
+                    "egl_device", self.config.devices[0]
+                )
             ),
         }
 
@@ -141,7 +155,11 @@ class PipelineRunner:
                 ("sam_python", True),
                 ("sam_checkpoint", True),
             ))
-        if selected_stage in {"all", "depth"} and config.depth.mode == "run":
+        if (
+            selected_stage in {"all", "depth"}
+            and config.depth.mode == "run"
+            and not config.input_options.get("depth_dir")
+        ):
             required_models.append(("da3_python", True))
         for name, require_file in required_models:
             value = config.models.get(name)
@@ -229,6 +247,28 @@ class PipelineRunner:
         config = self.config
         if config.mask.mode == "reuse":
             assert config.mask.artifact is not None
+            source_layout = str(
+                config.mask.overrides.get("source_layout", "frame_first")
+            )
+            if source_layout == "view_first":
+                from common.reuse_inputs import normalize_view_first_masks
+
+                destination = masks_dir(config, self.layout)
+                report = normalize_view_first_masks(
+                    config.mask.artifact,
+                    destination,
+                    views=config.views,
+                    frame_start=config.frame_start,
+                    frame_end=config.frame_end,
+                    force=self.force,
+                    dry_run=self.dry_run,
+                )
+                print(
+                    f"[reuse] normalized {report['links']} view-first masks "
+                    f"-> {destination}",
+                    flush=True,
+                )
+                return destination
             print(f"[reuse] masks {config.mask.artifact}", flush=True)
             return config.mask.artifact
         resolved_path = write_resolved(
@@ -292,24 +332,17 @@ class PipelineRunner:
             assert config.pose.artifact is not None
             print(f"[reuse] pose {config.pose.artifact}", flush=True)
             return config.pose.artifact
-        resolved_path = write_resolved(
-            self.layout.resolved_config("pose"),
-            pose_config(config, self.layout, starts),
-        )
-        from common.pose_config import validate_pose_config
-
-        resolved = load_json(resolved_path)
-        validate_pose_config(
-            resolved,
-            check_paths=not self.dry_run,
-            allow_auto=bool(resolved.get("automation", {}).get("enabled", False)),
-        )
+        resolved_path = self._resolved_pose_config(starts)
         arguments = [
             "--config",
             str(resolved_path),
             "--stage",
             "all",
         ]
+        if self.skip_review:
+            arguments.append("--skip-review")
+        if self.skip_render:
+            arguments.append("--skip-render")
         if self.force:
             arguments.append("--force")
         command = [
@@ -322,6 +355,111 @@ class PipelineRunner:
         if active is not None:
             return Path(active)
         return self.layout.pose_output / "pose" / "trajectory_final.json"
+
+    def _render(self, starts: dict[str, int]) -> Path:
+        """Render an existing trajectory through the guarded pose adapter."""
+
+        trajectory = self._trajectory_path()
+        if trajectory is None or (not self.dry_run and not trajectory.is_file()):
+            raise FileNotFoundError(
+                "render requires pose.mode='reuse' with a trajectory artifact, "
+                "or an existing pose/pose/trajectory_final.json"
+            )
+        resolved_path = self._resolved_pose_config(starts)
+        arguments = [
+            "--config",
+            str(resolved_path),
+            "--stage",
+            "render",
+            "--trajectory",
+            str(trajectory),
+        ]
+        from scripts.run_pose_pipeline import main as run_pose
+
+        self._run_adapter(["internal:pose", *arguments], run_pose, arguments)
+        return trajectory
+
+    def _resolved_pose_config(self, starts: dict[str, int]) -> Path:
+        """Materialize and validate the internal pose-stage configuration."""
+
+        resolved_path = write_resolved(
+            self.layout.resolved_config("pose"),
+            pose_config(self.config, self.layout, starts),
+        )
+        from common.pose_config import validate_pose_config
+
+        resolved = load_json(resolved_path)
+        validate_pose_config(
+            resolved,
+            check_paths=not self.dry_run,
+            allow_auto=bool(
+                resolved.get("automation", {}).get("enabled", False)
+            ),
+        )
+        return resolved_path
+
+    def _trajectory_path(self) -> Path | None:
+        if self.config.pose.mode == "reuse":
+            return self.config.pose.artifact
+        return self.layout.pose_output / "pose" / "trajectory_final.json"
+
+    def _resolved_starts(self) -> dict[str, int]:
+        try:
+            return resolved_part_starts(self.config, self.layout)
+        except RuntimeError:
+            if not self.dry_run:
+                raise
+            starts = {
+                part.name: (
+                    self.config.frame_start
+                    if part.appearance_hint == "auto"
+                    else int(part.appearance_hint)
+                )
+                for part in self.config.parts
+            }
+            print(
+                "[dry-run] automatic appearance hints remain unresolved; "
+                "using frame-range start only to materialize the plan",
+                flush=True,
+            )
+            return starts
+
+    def _run_selected_stage(self, stage: str) -> dict[str, str]:
+        """Execute one public stage and return its resolved artifact paths."""
+
+        artifacts = {
+            "frames": str(
+                self._frames()
+                if stage in {"all", "frames"}
+                else self.config.frames_dir
+            )
+        }
+        if stage == "frames":
+            return artifacts
+
+        normalize_reused_masks = bool(
+            self.config.mask.mode == "reuse"
+            and self.config.mask.overrides.get(
+                "source_layout", "frame_first"
+            ) == "view_first"
+        )
+        artifacts["masks"] = str(
+            self._mask()
+            if stage in {"all", "mask"} or normalize_reused_masks
+            else masks_dir(self.config, self.layout)
+        )
+
+        starts = self._resolved_starts()
+        artifacts["point_clouds"] = str(
+            self._depth(starts)
+            if stage in {"all", "depth"}
+            else point_cloud_root(self.config, self.layout)
+        )
+        if stage in {"all", "pose"}:
+            artifacts["trajectory"] = str(self._pose(starts))
+        elif stage == "render":
+            artifacts["trajectory"] = str(self._render(starts))
+        return artifacts
 
     def run(self, stage: str = "all") -> Path:
         if stage not in VALID_STAGES:
@@ -340,46 +478,7 @@ class PipelineRunner:
             if stage == "preflight":
                 result = self.layout.manifest
             else:
-                if stage in {"all", "frames"}:
-                    artifacts["frames"] = str(self._frames())
-                else:
-                    artifacts["frames"] = str(self.config.frames_dir)
-                if stage != "frames":
-                    if stage in {"all", "mask"}:
-                        artifacts["masks"] = str(self._mask())
-                    else:
-                        artifacts["masks"] = str(
-                            masks_dir(self.config, self.layout)
-                        )
-
-                    try:
-                        starts = resolved_part_starts(self.config, self.layout)
-                    except RuntimeError:
-                        if not self.dry_run:
-                            raise
-                        starts = {
-                            part.name: (
-                                self.config.frame_start
-                                if part.appearance_hint == "auto"
-                                else int(part.appearance_hint)
-                            )
-                            for part in self.config.parts
-                        }
-                        print(
-                            "[dry-run] automatic appearance hints remain "
-                            "unresolved; using frame-range start only to "
-                            "materialize the plan",
-                            flush=True,
-                        )
-                    if stage in {"all", "depth"}:
-                        artifacts["point_clouds"] = str(self._depth(starts))
-                    else:
-                        artifacts["point_clouds"] = str(
-                            point_cloud_root(self.config, self.layout)
-                        )
-
-                    if stage in {"all", "pose"}:
-                        artifacts["trajectory"] = str(self._pose(starts))
+                artifacts = self._run_selected_stage(stage)
                 result = self.layout.manifest
         except Exception as error:
             update_manifest(
@@ -428,6 +527,30 @@ def inspect_result(config: PipelineConfig) -> dict[str, Any]:
             "parts": payload.get("parts", []),
             "frames": len(payload.get("frames", {})),
             "reference_part": payload.get("reference_part"),
+        }
+    metrics_path = layout.pose_output / "diagnostics" / "multiview_metrics.json"
+    if metrics_path.is_file():
+        metrics = load_json(metrics_path)
+        result["pose_quality"] = {
+            part: {
+                key: values.get("all_views", {}).get(key)
+                for key in (
+                    "visible_observations",
+                    "mean_iou",
+                    "mean_contour_chamfer_px",
+                )
+            }
+            for part, values in metrics.get("summary", {}).items()
+        }
+    connector_path = (
+        layout.pose_output / "diagnostics" / "connector_readiness.json"
+    )
+    if connector_path.is_file():
+        connectors = load_json(connector_path)
+        result["connector_readiness"] = {
+            "path": str(connector_path),
+            "simulation_ready": connectors.get("simulation_ready", False),
+            "failures": connectors.get("failures", {}),
         }
     regression = config.raw.get("regression", {})
     baseline_value = regression.get("trajectory")

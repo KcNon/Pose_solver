@@ -4,6 +4,7 @@ import numpy as np
 import trimesh
 
 from common.scale_diagnostics import (
+    earliest_static_interval_scale_fits,
     pareto_indices,
     select_anchor_scale,
     select_visual_gated_candidate,
@@ -11,11 +12,48 @@ from common.scale_diagnostics import (
 from common.silhouette_scale_calibration import (
     _mesh_bottom_gap,
     _preserve_support_contact,
+    select_scale_anchor_frames,
     select_scale_candidate_index,
 )
 
 
 class ScaleDiagnosticsTests(unittest.TestCase):
+    def test_render_scale_uses_earliest_static_interval_only(self):
+        selected, report = select_scale_anchor_frames(
+            [401, 429, 789, 875],
+            [[382, 738], [787, 794], [798, 957]],
+            first_static_interval_only=True,
+        )
+
+        self.assertEqual(selected, [401, 429])
+        self.assertEqual(report["selected_static_range"], [382, 738])
+        self.assertEqual(report["excluded_anchor_frames"], [789, 875])
+
+    def test_render_scale_policy_can_keep_all_intervals(self):
+        selected, report = select_scale_anchor_frames(
+            [10, 80],
+            [[0, 20], [70, 90]],
+            first_static_interval_only=False,
+        )
+
+        self.assertEqual(selected, [10, 80])
+        self.assertEqual(report["policy"], "all_available_anchors")
+
+    def test_scale_consensus_uses_earliest_static_interval_only(self):
+        fits = [
+            {"frame": 10, "scale": 0.18, "fit_rmse_m": 0.006},
+            {"frame": 15, "scale": 0.19, "fit_rmse_m": 0.007},
+            {"frame": 80, "scale": 0.75, "fit_rmse_m": 0.010},
+        ]
+
+        selected, report = earliest_static_interval_scale_fits(
+            fits, [[0, 30], [70, 100]]
+        )
+
+        self.assertEqual([fit["frame"] for fit in selected], [10, 15])
+        self.assertEqual(report["static_range"], [0, 30])
+        self.assertEqual(report["excluded_frames"], [80])
+
     def test_scale_candidate_prefers_physical_area_inside_visual_tie(self):
         rows = [
             {

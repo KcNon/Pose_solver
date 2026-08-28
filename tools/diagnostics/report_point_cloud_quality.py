@@ -33,7 +33,13 @@ def _quantiles(values: list[float]) -> dict | None:
     }
 
 
-def point_metrics(points: np.ndarray, *, max_nn_points: int, seed: int) -> dict:
+def point_metrics(
+    points: np.ndarray,
+    *,
+    max_nn_points: int,
+    seed: int,
+    workers: int = 4,
+) -> dict:
     points = np.asarray(points, dtype=np.float64).reshape(-1, 3)
     result = {"point_count": int(len(points))}
     if not len(points):
@@ -48,7 +54,11 @@ def point_metrics(points: np.ndarray, *, max_nn_points: int, seed: int) -> dict:
         query = points[rng.choice(len(points), max_nn_points, replace=False)]
     else:
         query = points
-    distances, _ = cKDTree(points).query(query, k=2, workers=-1)
+    if not 1 <= int(workers) <= 32:
+        raise ValueError("nearest-neighbour workers must be in [1, 32]")
+    distances, _ = cKDTree(points).query(
+        query, k=2, workers=int(workers)
+    )
     spacing = distances[:, 1] * 1000.0
     result["nearest_neighbor_mm"] = {
         "samples": int(len(spacing)),
@@ -129,6 +139,7 @@ def main() -> None:
     parser.add_argument("--parts", nargs="*")
     parser.add_argument("--sample-count", type=int, default=12)
     parser.add_argument("--max-nn-points", type=int, default=20000)
+    parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--markdown", type=Path)
     args = parser.parse_args()
@@ -214,6 +225,7 @@ def main() -> None:
                 read_ply_xyz(path),
                 max_nn_points=int(args.max_nn_points),
                 seed=frame_index * 101 + part_index,
+                workers=int(args.workers),
             )
             quality = summary_frame.get(part, {})
             cross = (quality.get("cross_view") or {}).get("median_m")

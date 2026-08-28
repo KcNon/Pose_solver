@@ -128,6 +128,29 @@ def _run(
     write_checkpoint(expected, fingerprint)
 
 
+def validate_reused_da3(
+    output: Path,
+    timestamps: Sequence[str],
+) -> None:
+    """Fail closed unless every requested reusable DA3 frame is present."""
+
+    if len(timestamps) > 100_000:
+        raise ValueError("refusing to validate more than 100000 DA3 frames")
+    missing = [
+        str(output / timestamp / "predictions.npz")
+        for timestamp in timestamps
+        if not (output / timestamp / "predictions.npz").is_file()
+    ]
+    if missing:
+        preview = missing[:10]
+        suffix = "" if len(missing) <= 10 else f" (+{len(missing) - 10} more)"
+        raise FileNotFoundError(
+            "reusable DA3 artifact is incomplete: "
+            + ", ".join(preview)
+            + suffix
+        )
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
@@ -149,16 +172,24 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if args.stage in {"all", "da3"}:
         da3_output = Path(config["da3_self_cond_dir"]).resolve()
-        expected = da3_output / timestamps[-1] / "predictions.npz"
-        command = build_da3_command(
-            config, runtime, timestamps, force=args.force
-        )
-        _run(
-            command,
-            expected,
-            args.force,
-            stat_paths=(Path(config["frames_dir"]).resolve(),),
-        )
+        if runtime.get("reuse_existing_da3", False):
+            validate_reused_da3(da3_output, timestamps)
+            print(
+                f"[reuse] validated {len(timestamps)} DA3 frames at "
+                f"{da3_output}",
+                flush=True,
+            )
+        else:
+            expected = da3_output / timestamps[-1] / "predictions.npz"
+            command = build_da3_command(
+                config, runtime, timestamps, force=args.force
+            )
+            _run(
+                command,
+                expected,
+                args.force,
+                stat_paths=(Path(config["frames_dir"]).resolve(),),
+            )
 
     gauge_value = config.get("depth_gauge_path")
     if args.stage == "gauge" and not gauge_value:
@@ -167,32 +198,39 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
     if args.stage in {"all", "gauge", "postprocess"} and gauge_value:
         gauge_path = Path(gauge_value).resolve()
-        command = [
-            sys.executable,
-            str(STAGES / "calibrate_depth_gauge.py"),
-            "--pipeline",
-            str(config_path),
-            "--measure-start",
-            str(int(runtime.get("gauge_measure_start", start))),
-            "--measure-end",
-            str(int(runtime.get("gauge_measure_end", end))),
-            "--cross-view-stride",
-            str(int(runtime.get("cross_view_stride", 5))),
-            "--out",
-            str(gauge_path),
-        ]
-        if runtime.get("cross_view", False):
-            command.append("--cross-view")
-        _run(
-            command,
-            gauge_path,
-            args.force,
-            content_files=(config_path,),
-            stat_paths=(
-                Path(config["masks_dir"]).resolve(),
-                Path(config["da3_self_cond_dir"]).resolve(),
-            ),
-        )
+        if runtime.get("reuse_existing_depth_gauge", False):
+            if not gauge_path.is_file():
+                raise FileNotFoundError(
+                    f"configured reusable depth gauge is missing: {gauge_path}"
+                )
+            print(f"[reuse] depth gauge {gauge_path}", flush=True)
+        else:
+            command = [
+                sys.executable,
+                str(STAGES / "calibrate_depth_gauge.py"),
+                "--pipeline",
+                str(config_path),
+                "--measure-start",
+                str(int(runtime.get("gauge_measure_start", start))),
+                "--measure-end",
+                str(int(runtime.get("gauge_measure_end", end))),
+                "--cross-view-stride",
+                str(int(runtime.get("cross_view_stride", 5))),
+                "--out",
+                str(gauge_path),
+            ]
+            if runtime.get("cross_view", False):
+                command.append("--cross-view")
+            _run(
+                command,
+                gauge_path,
+                args.force,
+                content_files=(config_path,),
+                stat_paths=(
+                    Path(config["masks_dir"]).resolve(),
+                    Path(config["da3_self_cond_dir"]).resolve(),
+                ),
+            )
 
     quality_enabled = bool(config.get("quality_cloud", {}).get("enabled", False))
     if args.stage == "cloud" or (

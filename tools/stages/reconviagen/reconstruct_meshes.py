@@ -83,14 +83,14 @@ def load_pipeline() -> TrellisHybridPipeline:
     return TrellisHybridPipeline(vggt, trellis2, low_vram=True)
 
 
-def export_glb(pipeline: TrellisHybridPipeline, mesh, path: Path,
+def export_glb(pbr_attr_layout, mesh, path: Path,
                decimation_target: int, texture_size: int) -> None:
     glb = o_voxel.postprocess.to_glb(
         vertices=mesh.vertices,
         faces=mesh.faces,
         attr_volume=mesh.attrs,
         coords=mesh.coords,
-        attr_layout=pipeline.pbr_attr_layout,
+        attr_layout=pbr_attr_layout,
         grid_size=int(round(1.0 / float(mesh.voxel_size))),
         aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
         decimation_target=decimation_target,
@@ -157,7 +157,7 @@ def main() -> None:
             "seed": seed,
             "parts": {},
         }
-    for part in parts:
+    for part_index, part in enumerate(parts):
         paths = sorted((input_root / part).glob("*.png"))
         if not paths:
             raise RuntimeError(f"no RGBA inputs found for {part}")
@@ -177,9 +177,21 @@ def main() -> None:
             ss_source=ss_source,
         )
         mesh = meshes[0]
+        pbr_attr_layout = pipeline.pbr_attr_layout
+        final_part = part_index == len(parts) - 1
+        if final_part:
+            # GLB remeshing/simplification has its own substantial CPU-memory
+            # peak.  The neural pipelines are no longer needed after the last
+            # inference, so release their weights before entering export.
+            # Keeping both resident exceeded the repository's 32 GiB guard on
+            # otherwise valid 512 reconstructions.
+            del meshes, pipeline
+            gc.collect()
+            torch.cuda.empty_cache()
+            print(f"{part}: released inference pipelines before GLB export", flush=True)
         destination = output_root / f"{part}.glb"
         export_glb(
-            pipeline, mesh, destination,
+            pbr_attr_layout, mesh, destination,
             decimation_target, texture_size,
         )
         manifest["parts"][part] = {
@@ -189,7 +201,9 @@ def main() -> None:
         }
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
         manifest_path.write_text(json.dumps(manifest, indent=2))
-        del images, meshes, mesh
+        del images, mesh
+        if not final_part:
+            del meshes
         gc.collect()
         torch.cuda.empty_cache()
         print(f"{part}: exported {destination}", flush=True)
