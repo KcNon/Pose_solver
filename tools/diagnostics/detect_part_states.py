@@ -11,8 +11,9 @@ machine with minimum dwell times turns the noisy score into stable states:
     unobserved      no view sees the part
     occluded        visible, but silhouette support collapsed vs its typical size
     static / moving hysteresis on the motion score
-    assembled       static after the last motion, near the final body-relative
-                    offset (a proximity label, not a contact check)
+    assembled       an explicitly configured child that approached its
+                    assembly parent and stayed settled for a confirmation
+                    window; the state remains latched through later occlusion
 
 Detected moving ranges are compared against the manual ``dynamic_ranges`` in
 the config so the detector can be judged before it replaces them.
@@ -273,19 +274,89 @@ def cloud_centroid(cloud_root: Path, timestamp: str, part: str) -> np.ndarray | 
     return points.mean(axis=0) if len(points) >= 30 else None
 
 
-def mark_assembled(states: list[str], distances: list[float | None],
-                   tol_m: float) -> list[str]:
-    """Post-motion static frames near the final body-relative offset."""
-    last_moving = max((i for i, s in enumerate(states) if s == "moving"), default=None)
-    final = next((d for d in reversed(distances) if d is not None), None)
-    if last_moving is None or final is None:
-        return states
+def assembly_latch_interval(
+    states: list[str],
+    distances: list[float | None],
+    tol_m: float,
+    *,
+    minimum_stable_frames: int = 10,
+    minimum_approach_m: float = 0.03,
+) -> tuple[int, int] | None:
+    """Return ``(settled_start, confirmation_frame)`` for one-way assembly.
+
+    This is called only for a child with an explicit ``assembly_parent``.
+    Requiring motion, a stable distance window, and a meaningful approach
+    prevents a later lid/hand occlusion from being mistaken for a new motion.
+    """
+
+    if len(states) != len(distances):
+        raise ValueError("assembly states and distances must have equal length")
+    size = max(2, int(minimum_stable_frames))
+    tolerance = float(tol_m)
+    approach = float(minimum_approach_m)
+    if tolerance <= 0.0 or approach < 0.0:
+        raise ValueError("assembly thresholds are invalid")
+
+    moving_seen = False
+    pre_motion_distances: list[float] = []
+    for index, state in enumerate(states):
+        distance = distances[index]
+        if state == "moving":
+            moving_seen = True
+            continue
+        if not moving_seen:
+            if distance is not None and np.isfinite(float(distance)):
+                pre_motion_distances.append(float(distance))
+            continue
+        if index == 0 or states[index - 1] != "moving":
+            continue
+        stop = min(len(states), index + size)
+        if stop - index < size:
+            continue
+        if any(value == "moving" for value in states[index:stop]):
+            continue
+        window = np.asarray([
+            float(value)
+            for value in distances[index:stop]
+            if value is not None and np.isfinite(float(value))
+        ], dtype=np.float64)
+        if len(window) < max(3, size // 2):
+            continue
+        center = float(np.median(window))
+        if float(np.max(np.abs(window - center))) > tolerance:
+            continue
+        if not pre_motion_distances:
+            continue
+        baseline = float(np.median(np.asarray(pre_motion_distances)))
+        if baseline - center < approach:
+            continue
+        return index, stop - 1
+    return None
+
+
+def mark_assembled(
+    states: list[str],
+    distances: list[float | None],
+    tol_m: float,
+    *,
+    minimum_stable_frames: int = 10,
+    minimum_approach_m: float = 0.03,
+) -> tuple[list[str], tuple[int, int] | None]:
+    """Latch an explicitly configured assembled child after confirmation."""
+
+    latch = assembly_latch_interval(
+        states,
+        distances,
+        tol_m,
+        minimum_stable_frames=minimum_stable_frames,
+        minimum_approach_m=minimum_approach_m,
+    )
+    if latch is None:
+        return list(states), None
+    start, _ = latch
     out = list(states)
-    for f in range(last_moving + 1, len(states)):
-        d = distances[f]
-        if out[f] == "static" and d is not None and abs(d - final) <= tol_m:
-            out[f] = "assembled"
-    return out
+    out[start:] = ["assembled"] * (len(out) - start)
+    return out, latch
 
 
 def ranges_of(states: list[str], name: str, start: int) -> list[list[int]]:
@@ -339,6 +410,8 @@ def main() -> None:
     parser.add_argument("--dwell-off-seconds", type=float, default=0.6)
     parser.add_argument("--occlusion-ratio", type=float, default=0.35)
     parser.add_argument("--assembled-tol-m", type=float, default=0.03)
+    parser.add_argument("--assembled-minimum-stable-frames", type=int, default=10)
+    parser.add_argument("--assembled-minimum-approach-m", type=float, default=0.03)
     args = parser.parse_args()
 
     cfg = load_json(Path(args.config))
@@ -360,7 +433,16 @@ def main() -> None:
     mask_root = Path(cfg["masks_dir"])
     cloud_root = Path(cfg.get(
         "point_cloud_root", Path(cfg["output_root"]) / "parts_ply" / cfg["recon_backend"]))
-    body = cfg["reference_part"]
+    configured_parents = {
+        part: str(cfg.get("states", {}).get(part, {}).get("assembly_parent"))
+        for part in cfg["parts"]
+        if cfg.get("states", {}).get(part, {}).get("assembly_parent") is not None
+    }
+    unknown_parents = sorted(
+        set(configured_parents.values()).difference(cfg["parts"])
+    )
+    if unknown_parents:
+        raise ValueError(f"unknown assembly parents: {unknown_parents}")
 
     view_quality = cfg.get("view_quality", {})
     obs = mask_observations(
@@ -372,7 +454,13 @@ def main() -> None:
         float(view_quality.get("maximum_mask_area_ratio", 4.0)),
     )
 
-    body_centroids = [cloud_centroid(cloud_root, t, body) for t in frames]
+    parent_centroids = {
+        parent: [
+            cloud_centroid(cloud_root, timestamp, parent)
+            for timestamp in frames
+        ]
+        for parent in sorted(set(configured_parents.values()))
+    }
     report = {
         "config": args.config,
         "frames": [start, end],
@@ -394,13 +482,35 @@ def main() -> None:
         occluded = occlusion_flags(areas, visible, args.occlusion_ratio)
         states = [("occluded" if occluded[f] and states[f] == "static" else states[f])
                   for f in range(len(states))]
+        parent = configured_parents.get(part)
         distances: list[float | None] = []
         for f, timestamp in enumerate(frames):
-            c = cloud_centroid(cloud_root, timestamp, part) if part != body else None
-            b = body_centroids[f]
-            distances.append(float(np.linalg.norm(c - b)) if c is not None and b is not None else None)
-        if part != body:
-            states = mark_assembled(states, distances, args.assembled_tol_m)
+            child = cloud_centroid(cloud_root, timestamp, part) if parent else None
+            parent_center = parent_centroids[parent][f] if parent else None
+            distances.append(
+                float(np.linalg.norm(child - parent_center))
+                if child is not None and parent_center is not None
+                else None
+            )
+        latch = None
+        if parent is not None:
+            latch_settings = cfg.get("states", {}).get(part, {}).get(
+                "assembly_latch", {}
+            )
+            states, latch = mark_assembled(
+                states,
+                distances,
+                float(latch_settings.get(
+                    "distance_tolerance_m", args.assembled_tol_m
+                )),
+                minimum_stable_frames=int(latch_settings.get(
+                    "minimum_stable_frames",
+                    args.assembled_minimum_stable_frames,
+                )),
+                minimum_approach_m=float(latch_settings.get(
+                    "minimum_approach_m", args.assembled_minimum_approach_m
+                )),
+            )
 
         detected = ranges_of(states, "moving", start)
         manual = cfg["states"][part].get("dynamic_ranges", [])
@@ -409,12 +519,16 @@ def main() -> None:
                 "state": states[f], "observing_views": int(visible[f]),
                 "motion_px": None if np.isnan(disp[f]) else float(disp[f]),
                 "surface_shift_mm": None if np.isnan(d3d[f]) else float(d3d[f]),
-                "body_distance_m": distances[f],
+                "assembly_parent_distance_m": distances[f],
             } for f in range(len(frames))},
             "detected_moving_ranges": detected,
             "manual_dynamic_ranges": manual,
             "detected_assembled_from": next(
                 (start + f for f, s in enumerate(states) if s == "assembled"), None),
+            "detected_assembled_confirmed_at": (
+                None if latch is None else start + int(latch[1])
+            ),
+            "assembly_parent": parent,
         }
         counts = {s: states.count(s) for s in sorted(set(states))}
         print(f"\n{part}: {counts}")

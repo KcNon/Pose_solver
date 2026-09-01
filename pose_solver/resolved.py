@@ -22,7 +22,8 @@ _POSE_CONTRACT_KEYS = (
     "frames_dir", "masks_dir", "mesh_dir", "output_root",
     "point_cloud_output_root", "point_cloud_root", "point_cloud_variant",
     "recon_backend", "views", "parts", "part_ids", "part_start_frames",
-    "reference_part", "frames", "connectors", "da3_self_cond_dir",
+    "reference_part", "frames", "connectors", "assembly_task",
+    "da3_self_cond_dir",
 )
 
 
@@ -351,6 +352,8 @@ def pose_config(
         )
     if config.raw.get("connectors") is not None:
         raw["connectors"] = deepcopy(config.raw["connectors"])
+    if config.raw.get("assembly_task") is not None:
+        raw["assembly_task"] = deepcopy(config.raw["assembly_task"])
     compatibility = _compatibility_base(config.pose)
     if compatibility:
         # Compatibility presets carry only the proven algorithm policy. The

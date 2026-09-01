@@ -320,6 +320,8 @@ def main(argv: Sequence[str] | None = None) -> Path | None:
         "motion_lag_frames": "motion-lag",
         "occlusion_ratio": "occlusion-ratio",
         "assembled_tolerance_m": "assembled-tol-m",
+        "assembled_minimum_stable_frames": "assembled-minimum-stable-frames",
+        "assembled_minimum_approach_m": "assembled-minimum-approach-m",
     }
     for key, option in state_option_names.items():
         value = source_config.get("state_detection", {}).get(key)
@@ -701,6 +703,36 @@ def main(argv: Sequence[str] | None = None) -> Path | None:
             connector_report,
             args.force,
             content_files=(config_path, active_trajectory),
+        )
+    assembly_task = config.get("assembly_task", {})
+    assembly_enabled = bool(
+        isinstance(assembly_task, dict)
+        and assembly_task.get("enabled", True)
+        and assembly_task
+    )
+    assembly_report = output / "diagnostics" / "assembly_task_readiness.json"
+    assembly_command = [
+        python,
+        "-u",
+        "tools/diagnostics/validate_assembly_task.py",
+        "--config",
+        str(config_path),
+        "--trajectory",
+        str(active_trajectory),
+        "--report",
+        str(assembly_report),
+    ]
+    if connectors_enabled:
+        assembly_command.extend(["--connector-report", str(connector_report)])
+    if args.stage in {"all", "review"} and assembly_enabled:
+        assembly_inputs = [config_path, active_trajectory]
+        if connectors_enabled:
+            assembly_inputs.append(connector_report)
+        _run(
+            assembly_command,
+            assembly_report,
+            args.force,
+            content_files=tuple(assembly_inputs),
         )
     if args.stage in {"all", "review"} and not args.skip_review:
         _run(

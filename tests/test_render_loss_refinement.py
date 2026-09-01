@@ -162,6 +162,60 @@ class RenderLossRefinementTests(unittest.TestCase):
         self.assertGreater(report["loss_improvement"], 0.0)
         self.assertLess(abs(selected[0, 3]), abs(initial[0, 3]))
 
+    def test_coarse_reacquire_uses_rotation_prior_to_break_visual_tie(self) -> None:
+        class AmbiguousObjective:
+            def evaluate(self, pose, _views):
+                angle = Rotation.from_matrix(pose[:3, :3]).magnitude()
+                return {"loss": 1.0 if angle < np.deg2rad(45.0) else 0.0}
+
+        initial = np.eye(4, dtype=np.float64)
+        reference = np.eye(4, dtype=np.float64)
+        reference[:3, :3] = Rotation.from_euler(
+            "x", 90.0, degrees=True
+        ).as_matrix()
+        selected, report = coarse_reacquire_pose(
+            AmbiguousObjective(),
+            initial,
+            views=["view"],
+            translation_radii_m=[],
+            rotation_angles_deg=[90.0],
+            symmetry_axis_part=None,
+            alternating_passes=1,
+            rotation_reference_pose=reference,
+            rotation_prior_weight=0.2,
+            rotation_prior_scale_deg=90.0,
+        )
+        delta = Rotation.from_matrix(reference[:3, :3]).inv() * Rotation.from_matrix(
+            selected[:3, :3]
+        )
+        self.assertLess(np.degrees(delta.magnitude()), 1e-8)
+        self.assertTrue(report["rotation_prior"]["enabled"])
+
+    def test_coarse_reacquire_uses_translation_prior_to_break_visual_tie(self) -> None:
+        class AmbiguousObjective:
+            def evaluate(self, pose, _views):
+                distance = abs(float(pose[0, 3]))
+                return {"loss": 1.0 if distance < 0.5 else 0.0}
+
+        initial = np.eye(4, dtype=np.float64)
+        reference = np.eye(4, dtype=np.float64)
+        reference[0, 3] = 1.0
+        selected, report = coarse_reacquire_pose(
+            AmbiguousObjective(),
+            initial,
+            views=["view"],
+            translation_radii_m=[1.0],
+            rotation_angles_deg=[],
+            symmetry_axis_part=None,
+            optimize_rotation=False,
+            alternating_passes=1,
+            translation_reference_pose=reference,
+            translation_prior_weight=0.2,
+            translation_prior_scale_m=1.0,
+        )
+        self.assertAlmostEqual(float(selected[0, 3]), 1.0)
+        self.assertTrue(report["translation_prior"]["enabled"])
+
     def test_holdout_gate_rejects_view_specific_improvement(self) -> None:
         initial = self.target_pose.copy()
         initial[0, 3] += 0.06

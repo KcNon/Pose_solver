@@ -580,6 +580,8 @@ def main() -> None:
             )
         )
         temporal_delta = np.zeros(6, dtype=np.float64)
+        last_accepted_pose = None
+        last_accepted_frame = None
         previous_coaxial_relative = None
         previous_coaxial_frame = None
         coaxial_boundaries = {
@@ -704,6 +706,17 @@ def main() -> None:
                         )
                     )
                 ):
+                    translation_prior_max_gap = int(
+                        part_refinement.get(
+                            "global_reacquire_translation_prior_max_gap_frames", 2
+                        )
+                    )
+                    translation_reference_pose = (
+                        last_accepted_pose
+                        if last_accepted_frame is not None
+                        and frame - last_accepted_frame <= translation_prior_max_gap
+                        else None
+                    )
                     candidate, reacquire_report = coarse_reacquire_pose(
                         objective,
                         initial,
@@ -729,6 +742,28 @@ def main() -> None:
                         alternating_passes=int(
                             part_refinement.get(
                                 "global_reacquire_alternating_passes", 1
+                            )
+                        ),
+                        rotation_reference_pose=last_accepted_pose,
+                        rotation_prior_weight=float(
+                            part_refinement.get(
+                                "global_reacquire_rotation_prior_weight", 0.0
+                            )
+                        ),
+                        rotation_prior_scale_deg=float(
+                            part_refinement.get(
+                                "global_reacquire_rotation_prior_scale_deg", 90.0
+                            )
+                        ),
+                        translation_reference_pose=translation_reference_pose,
+                        translation_prior_weight=float(
+                            part_refinement.get(
+                                "global_reacquire_translation_prior_weight", 0.0
+                            )
+                        ),
+                        translation_prior_scale_m=float(
+                            part_refinement.get(
+                                "global_reacquire_translation_prior_scale_m", 0.04
                             )
                         ),
                     )
@@ -1365,6 +1400,8 @@ def main() -> None:
                     temporal_delta = world_pose_delta_vector(
                         tracking_initial, selected
                     )
+                    last_accepted_pose = selected.copy()
+                    last_accepted_frame = frame
                     if coaxial_active:
                         previous_coaxial_relative = (
                             np.linalg.inv(reference_world) @ selected
@@ -1451,6 +1488,12 @@ def main() -> None:
                             ],
                             "rotation_delta_deg": reacquire_report[
                                 "rotation_delta_deg"
+                            ],
+                            "rotation_prior": reacquire_report[
+                                "rotation_prior"
+                            ],
+                            "translation_prior": reacquire_report[
+                                "translation_prior"
                             ],
                             "baseline": compact_metric(
                                 reacquire_report["baseline"]

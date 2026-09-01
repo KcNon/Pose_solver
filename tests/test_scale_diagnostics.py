@@ -12,6 +12,7 @@ from common.scale_diagnostics import (
 from common.silhouette_scale_calibration import (
     _mesh_bottom_gap,
     _preserve_support_contact,
+    _rendered_to_target_ratios,
     select_scale_anchor_frames,
     select_scale_candidate_index,
 )
@@ -99,6 +100,18 @@ class ScaleDiagnosticsTests(unittest.TestCase):
         )
 
         self.assertEqual(selected, 1)
+
+    def test_scale_area_uses_visible_render_under_known_occlusion(self):
+        ratios = _rendered_to_target_ratios([{
+            "views": [{
+                "target_pixels": 80,
+                "rendered_pixels": 88,
+                "full_rendered_pixels": 160,
+                "ignored_occluded_pixels": 72,
+            }]
+        }])
+
+        self.assertEqual(ratios, [1.1])
 
     def test_scale_change_preserves_support_plane_contact(self):
         mesh = trimesh.creation.box(extents=[1.0, 1.0, 2.0])

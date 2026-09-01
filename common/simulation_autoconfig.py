@@ -112,7 +112,12 @@ def generate_simulation_config(
             # dynamic SDF. A compound shell of watertight convex cells is a
             # deterministic, category-agnostic fallback which also preserves
             # observed openings instead of filling the entire convex hull.
-            part: {"type": "voxel_shell", "resolution": 24}
+            part: {
+                "type": "voxel_shell",
+                "resolution": 24,
+                "parameter_source": "mesh_fit",
+                "confidence": "low",
+            }
             for part in moving_parts
         },
         "assembly_targets": assembly_targets,
@@ -138,6 +143,21 @@ def generate_simulation_config(
             "restitution": 0.0,
             "contact_offset_m": 0.001,
             "rest_offset_m": 0.0,
+            "assembly_validation": {
+                "allow_pose_mutation": False,
+                "release_height_m": 0.0,
+                "settle_seconds": 3.0,
+                "contact_window_seconds": 1.0,
+                "minimum_contact_fraction": 0.1,
+                "maximum_contact_gap_seconds": 0.12,
+                "maximum_lateral_error_m": 0.005,
+                "maximum_axial_error_m": 0.008,
+                "maximum_tilt_error_deg": 5.0,
+                "maximum_final_linear_speed_mps": 0.01,
+                "maximum_final_angular_speed_radps": 0.1,
+                "translation_levels_m": [0.001, 0.002, 0.005],
+                "tilt_levels_deg": [1.0, 3.0, 5.0],
+            },
             "settled_contact_control": {
                 "enabled": True,
                 "states": ["static"],

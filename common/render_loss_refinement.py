@@ -129,6 +129,12 @@ def coarse_reacquire_pose(
     symmetry_axis_part: np.ndarray | None,
     optimize_rotation: bool = True,
     alternating_passes: int = 2,
+    rotation_reference_pose: np.ndarray | None = None,
+    rotation_prior_weight: float = 0.0,
+    rotation_prior_scale_deg: float = 90.0,
+    translation_reference_pose: np.ndarray | None = None,
+    translation_prior_weight: float = 0.0,
+    translation_prior_scale_m: float = 0.04,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """Deterministically escape a bad local pose basin using mask evidence.
 
@@ -143,6 +149,46 @@ def coarse_reacquire_pose(
     best_data = objective.evaluate(best, views)
     initial_data = best_data
     evaluations = 1
+    reference = (
+        None
+        if rotation_reference_pose is None
+        else np.asarray(rotation_reference_pose, dtype=np.float64)
+    )
+    prior_weight = max(0.0, float(rotation_prior_weight))
+    prior_scale = max(1e-6, float(rotation_prior_scale_deg))
+    translation_reference = (
+        None
+        if translation_reference_pose is None
+        else np.asarray(translation_reference_pose, dtype=np.float64)
+    )
+    translation_weight = max(0.0, float(translation_prior_weight))
+    translation_scale = max(1e-9, float(translation_prior_scale_m))
+
+    def rotation_from_reference_deg(pose: np.ndarray) -> float:
+        if reference is None:
+            return 0.0
+        delta = Rotation.from_matrix(reference[:3, :3]).inv() * Rotation.from_matrix(
+            np.asarray(pose, dtype=np.float64)[:3, :3]
+        )
+        return float(np.degrees(delta.magnitude()))
+
+    def regularized_score(data: dict[str, Any], pose: np.ndarray) -> float:
+        angle = rotation_from_reference_deg(pose)
+        translation = (
+            0.0
+            if translation_reference is None
+            else float(np.linalg.norm(
+                np.asarray(pose, dtype=np.float64)[:3, 3]
+                - translation_reference[:3, 3]
+            ))
+        )
+        return (
+            float(data["loss"])
+            + prior_weight * (angle / prior_scale) ** 2
+            + translation_weight * (translation / translation_scale) ** 2
+        )
+
+    best_score = regularized_score(best_data, best)
     directions = (
         symmetry_aware_rotation_directions(best, symmetry_axis_part)
         if optimize_rotation
@@ -163,8 +209,9 @@ def coarse_reacquire_pose(
                         candidate[:3, 3] += [dx, dy, dz]
                         data = objective.evaluate(candidate, views)
                         evaluations += 1
-                        if float(data["loss"]) < float(best_data["loss"]):
-                            best, best_data = candidate, data
+                        score = regularized_score(data, candidate)
+                        if score < best_score:
+                            best, best_data, best_score = candidate, data, score
         if optimize_rotation:
             # Recompute observable axes after translation/rotation updates.
             directions = symmetry_aware_rotation_directions(
@@ -184,8 +231,9 @@ def coarse_reacquire_pose(
                         candidate[:3, :3] = increment @ candidate[:3, :3]
                         data = objective.evaluate(candidate, views)
                         evaluations += 1
-                        if float(data["loss"]) < float(best_data["loss"]):
-                            best, best_data = candidate, data
+                        score = regularized_score(data, candidate)
+                        if score < best_score:
+                            best, best_data, best_score = candidate, data, score
     delta = world_pose_delta_vector(initial_pose, best)
     return best, {
         "evaluations": evaluations,
@@ -198,6 +246,27 @@ def coarse_reacquire_pose(
         "rotation_delta_deg": float(
             np.degrees(np.linalg.norm(delta[3:]))
         ),
+        "rotation_prior": {
+            "enabled": bool(reference is not None and prior_weight > 0.0),
+            "weight": prior_weight,
+            "scale_deg": prior_scale,
+            "selected_rotation_from_reference_deg": (
+                rotation_from_reference_deg(best) if reference is not None else None
+            ),
+            "selected_regularized_score": best_score,
+        },
+        "translation_prior": {
+            "enabled": bool(
+                translation_reference is not None and translation_weight > 0.0
+            ),
+            "weight": translation_weight,
+            "scale_m": translation_scale,
+            "selected_translation_from_reference_m": (
+                float(np.linalg.norm(best[:3, 3] - translation_reference[:3, 3]))
+                if translation_reference is not None
+                else None
+            ),
+        },
     }
 
 

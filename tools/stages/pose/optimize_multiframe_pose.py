@@ -20,6 +20,7 @@ from typing import Any
 
 import numpy as np
 import trimesh
+from scipy.spatial.transform import Rotation
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
@@ -33,6 +34,7 @@ from common.multiframe_pose import (
     evenly_spaced_frames,
     internal_continuity_gate,
     multiframe_settings,
+    parallel_transport_orientations,
     pose_distance,
     solve_pose_candidate_path,
     static_candidate_scores,
@@ -42,7 +44,10 @@ from common.pose_config import validate_pose_config
 from common.pose_refinement import sample_canonical
 from common.pose_tracking import bridge_pose_ranges
 from common.pose_validation import validate_trajectory
-from common.render_loss_refinement import MultiViewRenderObjective
+from common.render_loss_refinement import (
+    MultiViewRenderObjective,
+    refine_pose_coordinate_search,
+)
 from common.trajectory_constraints import (
     _axis_origin_coordinates,
     _set_axis_origin_coordinates,
@@ -179,6 +184,310 @@ def _bridge_window(
     }
 
 
+def _coaxial_snap_window(
+    cfg: dict[str, Any],
+    baseline: dict[str, Any],
+    trajectory: dict[str, Any],
+    window: dict[str, Any],
+) -> dict[str, Any]:
+    """Deterministically seat a connector without an expensive render search."""
+
+    reference_part = str(window["reference_part"])
+    moving_part = str(window["moving_part"])
+    start, seat = map(int, window["frame_range"])
+    terminal = int(window["terminal_anchor_frame"])
+    reference_axis = axis_vector(window["reference_axis_part"])
+    moving_axis = axis_vector(window["moving_axis_part"])
+    reference_origin = canonical_axis_origin(
+        window, "reference", reference_part, baseline
+    )
+    moving_origin = canonical_axis_origin(
+        window, "moving", moving_part, baseline
+    )
+    terminal_relative, _ = relative_pose(
+        baseline, terminal, reference_part, moving_part
+    )
+    terminal_axial, _ = _axis_origin_coordinates(
+        terminal_relative, reference_axis, reference_origin, moving_origin
+    )
+    if "target_axial_offset_m" in window:
+        axial_delta = float(window["target_axial_offset_m"]) - float(
+            terminal_axial
+        )
+    else:
+        axial_delta = float(window.get("terminal_axial_delta_m", 0.0))
+    twist_offsets = [
+        float(value)
+        for value in window.get("twist_search_offsets_deg", [0.0])
+    ]
+    if not twist_offsets:
+        twist_offsets = [0.0]
+
+    def projected(twist_deg: float) -> np.ndarray:
+        return project_coaxial_pose(
+            terminal_relative,
+            reference_axis=reference_axis,
+            moving_axis=moving_axis,
+            reference_axis_origin_m=reference_origin,
+            moving_axis_origin_m=moving_origin,
+            allow_axis_flip=bool(window.get("allow_axis_flip", False)),
+            target_axis_offset_m=float(window.get("target_axis_offset_m", 0.0)),
+            twist_rad=float(np.deg2rad(twist_deg)),
+            axial_delta_m=axial_delta,
+        )
+
+    twist_rows = []
+    target_relative = projected(twist_offsets[0])
+    if len(twist_offsets) > 1:
+        evidence_frames = [
+            int(value)
+            for value in window.get("twist_evidence_frames", [terminal])
+        ]
+        _, _, observations, objectives = _window_objectives(
+            cfg, baseline, window, moving_part, evidence_frames
+        )
+        primary_view = window.get("primary_view")
+        primary_weight = float(window.get("primary_view_weight", 0.0))
+        candidates = []
+        for twist_deg in twist_offsets:
+            candidate = projected(twist_deg)
+            scores = []
+            frame_rows = []
+            for frame in evidence_frames:
+                objective = objectives.get(frame)
+                if objective is None:
+                    continue
+                _, reference_world = relative_pose(
+                    baseline, frame, reference_part, moving_part
+                )
+                metric = objective.evaluate(reference_world @ candidate)
+                score = metric_score(metric, primary_view, primary_weight)
+                scores.append(score)
+                frame_rows.append({"frame": frame, **compact_metric(metric)})
+            mean_score = float(np.mean(scores)) if scores else float("inf")
+            row = {
+                "twist_offset_deg": twist_deg,
+                "score": mean_score,
+                "frames": frame_rows,
+                "candidate": candidate,
+            }
+            candidates.append(row)
+        selected = min(candidates, key=lambda row: row["score"])
+        if not np.isfinite(float(selected["score"])):
+            raise ValueError("coaxial twist search has no renderable evidence")
+        target_relative = np.asarray(selected["candidate"], dtype=np.float64)
+        twist_rows = [
+            {key: value for key, value in row.items() if key != "candidate"}
+            for row in candidates
+        ]
+        selected_twist = float(selected["twist_offset_deg"])
+    else:
+        evidence_frames = []
+        selected_twist = float(twist_offsets[0])
+
+    def metrics(value: np.ndarray) -> dict[str, float | None]:
+        result = pairwise_alignment_metrics(
+            value,
+            reference_axis=reference_axis,
+            moving_axis=moving_axis,
+            allow_axis_flip=bool(window.get("allow_axis_flip", False)),
+            reference_axis_origin_m=reference_origin,
+            moving_axis_origin_m=moving_origin,
+        )
+        axial, _ = _axis_origin_coordinates(
+            value, reference_axis, reference_origin, moving_origin
+        )
+        result["axial_offset_m"] = float(axial)
+        return result
+
+    apply_snap = bool(window.get("apply", True))
+    dynamic_rows = []
+    denominator = max(seat - start, 1)
+    for frame in range(start, seat + 1):
+        current, _ = relative_pose(
+            baseline, frame, reference_part, moving_part
+        )
+        fraction = float((frame - start) / denominator)
+        # Smoothly distribute only the terminal connector correction.  The
+        # observed free-motion centre and tilt remain authoritative at entry.
+        amount = fraction * fraction * (3.0 - 2.0 * fraction)
+        selected = interpolate_pose(current, target_relative, amount)
+        if apply_snap:
+            records = trajectory["frames"][f"{frame:06d}"]["parts"]
+            reference_world = np.asarray(
+                records[reference_part]["T_world_from_part"], dtype=np.float64
+            )
+            record = records[moving_part]
+            record["T_world_from_part"] = (
+                reference_world @ selected
+            ).tolist()
+            record["source"] = str(record.get("source", "pose")) + "+coaxial_snap"
+            record["pose_source"] = "mechanism_coaxial_snap"
+        dynamic_rows.append({
+            "frame": frame,
+            "correction_fraction": amount,
+            "before": metrics(current),
+            "after": metrics(selected),
+        })
+
+    follow_start, follow_end = map(
+        int, window.get("static_follow_range", [terminal, terminal])
+    )
+    followed = []
+    if apply_snap:
+        for frame in range(follow_start, follow_end + 1):
+            frame_id = f"{frame:06d}"
+            if frame_id not in trajectory["frames"]:
+                continue
+            records = trajectory["frames"][frame_id]["parts"]
+            reference_world = np.asarray(
+                records[reference_part]["T_world_from_part"], dtype=np.float64
+            )
+            record = records[moving_part]
+            record["T_world_from_part"] = (
+                reference_world @ target_relative
+            ).tolist()
+            record["source"] = str(record.get("source", "pose")) + "+coaxial_seated"
+            record["pose_source"] = "mechanism_coaxial_seated"
+            followed.append(frame)
+    return {
+        "mode": "coaxial_snap_window",
+        "reference_part": reference_part,
+        "moving_part": moving_part,
+        "frame_range": [start, seat],
+        "terminal_anchor_frame": terminal,
+        "target_axial_offset_m": window.get("target_axial_offset_m"),
+        "applied_axial_delta_m": axial_delta,
+        "twist_evidence_frames": evidence_frames,
+        "twist_candidates": twist_rows,
+        "selected_twist_offset_deg": selected_twist,
+        "static_follow_range": [follow_start, follow_end],
+        "terminal_before": metrics(terminal_relative),
+        "terminal_after": metrics(target_relative),
+        "dynamic_frames": dynamic_rows,
+        "followed_frame_count": len(followed),
+        "applied": apply_snap,
+    }
+
+
+def _orientation_transport_window(
+    baseline: dict[str, Any],
+    trajectory: dict[str, Any],
+    window: dict[str, Any],
+) -> dict[str, Any]:
+    """Remove accumulated connector-axis twist while preserving tilt and centres."""
+
+    part = str(window["part"])
+    reference_part = (
+        str(window["reference_part"])
+        if window.get("reference_part") is not None
+        else None
+    )
+    start, end = map(int, window["frame_range"])
+    seed = int(window.get("seed_frame", end))
+    axis = axis_vector(window["moving_axis_part"])
+    poses: dict[int, np.ndarray] = {}
+    for frame in range(start, end + 1):
+        records = baseline["frames"][f"{frame:06d}"]["parts"]
+        moving = np.asarray(records[part]["T_world_from_part"], dtype=np.float64)
+        if reference_part is None:
+            poses[frame] = moving
+        else:
+            reference = np.asarray(
+                records[reference_part]["T_world_from_part"], dtype=np.float64
+            )
+            poses[frame] = np.linalg.inv(reference) @ moving
+    lock_full_orientation = bool(window.get("lock_full_orientation", False))
+    if lock_full_orientation:
+        lock_start = int(window.get("lock_start_frame", start))
+        if lock_start < start or lock_start > end:
+            raise ValueError("lock_start_frame must lie inside frame_range")
+        seed_rotation = poses[seed][:3, :3]
+        start_rotation = poses[start][:3, :3]
+        transported = {}
+        denominator = max(lock_start - start, 1)
+        for frame in range(start, end + 1):
+            if frame >= lock_start:
+                transported[frame] = seed_rotation.copy()
+                continue
+            fraction = float((frame - start) / denominator)
+            amount = fraction * fraction * (3.0 - 2.0 * fraction)
+            initial = np.eye(4, dtype=np.float64)
+            # Use one trusted pickup orientation as the left endpoint.  Using
+            # each noisy per-frame ICP rotation here would only attenuate the
+            # jitter; it would not produce a continuous orientation path.
+            initial[:3, :3] = start_rotation
+            target = np.eye(4, dtype=np.float64)
+            target[:3, :3] = seed_rotation
+            transported[frame] = interpolate_pose(
+                initial, target, amount
+            )[:3, :3]
+        method = "trusted_endpoint_full_orientation_lock_with_pickup_blend"
+    else:
+        lock_start = None
+        transported = parallel_transport_orientations(
+            {frame: pose[:3, :3] for frame, pose in poses.items()},
+            axis,
+            seed_frame=seed,
+        )
+        method = "minimum_rotation_parallel_transport_from_trusted_seed"
+    apply_transport = bool(window.get("apply", True))
+    rows = []
+    for frame in range(start, end + 1):
+        original = poses[frame]
+        corrected = original.copy()
+        corrected[:3, :3] = transported[frame]
+        axis_error = float(np.degrees(np.arccos(np.clip(
+            np.dot(original[:3, :3] @ axis, corrected[:3, :3] @ axis),
+            -1.0,
+            1.0,
+        ))))
+        adjustment = Rotation.from_matrix(
+            corrected[:3, :3] @ original[:3, :3].T
+        )
+        if apply_transport:
+            records = trajectory["frames"][f"{frame:06d}"]["parts"]
+            selected_world = corrected
+            if reference_part is not None:
+                reference = np.asarray(
+                    records[reference_part]["T_world_from_part"], dtype=np.float64
+                )
+                selected_world = reference @ corrected
+            record = records[part]
+            record["T_world_from_part"] = selected_world.tolist()
+            record["source"] = (
+                str(record.get("source", "pose")) + "+axis_parallel_transport"
+            )
+            record["pose_source"] = "connector_axis_parallel_transport"
+        rows.append({
+            "frame": frame,
+            "rotation_adjustment_deg": float(np.degrees(adjustment.magnitude())),
+            "connector_axis_direction_error_deg": axis_error,
+            "center_preserved": bool(np.array_equal(
+                original[:3, 3], corrected[:3, 3]
+            )),
+        })
+    return {
+        "mode": "orientation_transport_window",
+        "part": part,
+        "reference_part": reference_part,
+        "frame_range": [start, end],
+        "seed_frame": seed,
+        "method": method,
+        "lock_full_orientation": lock_full_orientation,
+        "lock_start_frame": lock_start,
+        "maximum_rotation_adjustment_deg": max(
+            row["rotation_adjustment_deg"] for row in rows
+        ),
+        "maximum_connector_axis_direction_error_deg": max(
+            row["connector_axis_direction_error_deg"] for row in rows
+        ),
+        "translations_changed": False,
+        "frames": rows,
+        "applied": apply_transport,
+    }
+
+
 def compact_metric(metric: dict[str, Any]) -> dict[str, Any]:
     return {
         key: metric.get(key)
@@ -306,6 +615,235 @@ def _window_objectives(
     return render_cfg, raw_mesh, observations, objectives
 
 
+class AggregateStaticObjective:
+    """Evaluate one reference-relative pose across multiple timestamps."""
+
+    def __init__(
+        self,
+        trajectory: dict[str, Any],
+        *,
+        part: str,
+        reference_part: str | None,
+        objectives: dict[int, Any],
+        optimize_frames: list[int],
+        holdout_frames: list[int],
+    ) -> None:
+        self.trajectory = trajectory
+        self.part = part
+        self.reference_part = reference_part
+        self.objectives = objectives
+        self.optimize_frames = list(optimize_frames)
+        self.holdout_frames = list(holdout_frames)
+        # ``refine_pose_coordinate_search`` routes evidence by view name.
+        # These synthetic names instead route disjoint timestamp groups;
+        # every per-frame objective still evaluates all of its real cameras.
+        self.by_view = {"optimize_frames": True}
+        if self.holdout_frames:
+            self.by_view["holdout_frames"] = True
+
+    def evaluate(
+        self,
+        pose: np.ndarray,
+        views: list[str] | None = None,
+    ) -> dict[str, Any]:
+        requested = set(views or self.by_view)
+        frames = []
+        if "optimize_frames" in requested:
+            frames.extend(self.optimize_frames)
+        if "holdout_frames" in requested:
+            frames.extend(self.holdout_frames)
+        rows = []
+        view_rows = []
+        for frame in frames:
+            metric = self.objectives[frame].evaluate(world_pose(
+                self.trajectory,
+                frame=frame,
+                pose=np.asarray(pose, dtype=np.float64),
+                reference_part=self.reference_part,
+            ))
+            rows.append(metric)
+            view_rows.extend([
+                {**dict(item), "frame": int(frame)}
+                for item in metric.get("views", [])
+            ])
+        if not rows:
+            return {
+                "loss": float("inf"),
+                "worst_view_loss": float("inf"),
+                "mean_iou": 0.0,
+                "worst_view_iou": 0.0,
+                "mean_contour_chamfer_px": float("inf"),
+                "mean_target_coverage": 0.0,
+                "views": [],
+                "frames": [],
+            }
+        return {
+            "loss": float(np.mean([row["loss"] for row in rows])),
+            "worst_view_loss": float(max(
+                row.get("worst_view_loss", row["loss"]) for row in rows
+            )),
+            "mean_iou": float(np.mean([
+                row.get("mean_iou", 0.0) for row in rows
+            ])),
+            "worst_view_iou": float(min(
+                row.get("worst_view_iou", row.get("mean_iou", 0.0))
+                for row in rows
+            )),
+            "mean_contour_chamfer_px": float(np.mean([
+                row.get("mean_contour_chamfer_px", 0.0) for row in rows
+            ])),
+            "mean_target_coverage": float(np.mean([
+                row.get("mean_target_coverage", 0.0) for row in rows
+            ])),
+            "views": view_rows,
+            "frames": frames,
+        }
+
+
+def _refine_constant_static_pose(
+    cfg: dict[str, Any],
+    baseline: dict[str, Any],
+    trajectory: dict[str, Any],
+    window: dict[str, Any],
+    *,
+    part: str,
+    reference_part: str | None,
+    start: int,
+    end: int,
+    evidence: list[int],
+) -> dict[str, Any]:
+    render_cfg, raw_mesh, observations, _ = _window_objectives(
+        cfg, baseline, window, part, evidence
+    )
+    usable = [frame for frame in evidence if observations.get(frame)]
+    if not usable:
+        return {
+            "mode": "static_window",
+            "part": part,
+            "reference_part": reference_part,
+            "frame_range": [start, end],
+            "applied": False,
+            "reason": "no_renderable_evidence",
+        }
+    configured_holdout = [
+        int(value) for value in window.get("constant_holdout_frames", [])
+        if int(value) in usable
+    ]
+    holdout = (
+        configured_holdout
+        if configured_holdout
+        else [usable[-1]] if len(usable) >= 3 else []
+    )
+    holdout_set = set(holdout)
+    optimize = [frame for frame in usable if frame not in holdout_set]
+    if not optimize:
+        optimize = usable
+        holdout = []
+    width, height = [int(value) for value in render_cfg["resolution"]]
+    renderer = SceneRenderer(width, height, cache_mesh_resources=True)
+    try:
+        exact = {
+            frame: ExactMultiViewRenderObjective(
+                raw_mesh,
+                float(baseline["scales"][part]),
+                np.asarray(
+                    baseline["raw_mesh_origins"][part], dtype=np.float64
+                ),
+                observations[frame],
+                render_cfg,
+                renderer,
+            )
+            for frame in usable
+        }
+        objective = AggregateStaticObjective(
+            baseline,
+            part=part,
+            reference_part=reference_part,
+            objectives=exact,
+            optimize_frames=optimize,
+            holdout_frames=holdout,
+        )
+        initial = candidate_pose(
+            baseline,
+            frame=usable[0],
+            part=part,
+            reference_part=reference_part,
+        )
+        selected, refinement = refine_pose_coordinate_search(
+            objective,
+            initial,
+            optimize_views=["optimize_frames"],
+            holdout_views=["holdout_frames"] if holdout else [],
+            translation_steps_m=[
+                float(value) for value in window.get(
+                    "constant_translation_steps_m",
+                    [0.015, 0.008, 0.004, 0.002],
+                )
+            ],
+            rotation_steps_deg=[
+                float(value) for value in window.get(
+                    "constant_rotation_steps_deg", [2.0, 1.0]
+                )
+            ],
+            symmetry_axis_part=None,
+            optimize_rotation=bool(
+                window.get("constant_optimize_rotation", False)
+            ),
+            maximum_translation_delta_m=float(
+                window.get("constant_maximum_translation_delta_m", 0.03)
+            ),
+            maximum_rotation_delta_deg=float(
+                window.get("constant_maximum_rotation_delta_deg", 5.0)
+            ),
+            minimum_improvement=float(
+                window.get("constant_minimum_improvement", 0.005)
+            ),
+            maximum_holdout_degradation=float(
+                window.get("constant_maximum_holdout_degradation", 0.02)
+            ),
+            minimum_refined_iou=float(
+                window.get("constant_minimum_refined_iou", 0.02)
+            ),
+            prior_weight=float(window.get("constant_prior_weight", 0.002)),
+            temporal_weight=0.0,
+        )
+    finally:
+        renderer.close()
+
+    applied_frames = []
+    if refinement["accepted"]:
+        for frame in range(start, end + 1):
+            frame_id = f"{frame:06d}"
+            if frame_id not in trajectory["frames"]:
+                continue
+            record = trajectory["frames"][frame_id]["parts"][part]
+            record["T_world_from_part"] = world_pose(
+                trajectory,
+                frame=frame,
+                pose=selected,
+                reference_part=reference_part,
+            ).tolist()
+            record["source"] = (
+                str(record.get("source", "pose"))
+                + "+constant_static_exact_refinement"
+            )
+            record["pose_source"] = "constant_static_exact_refinement"
+            applied_frames.append(frame)
+    return {
+        "mode": "static_window",
+        "part": part,
+        "reference_part": reference_part,
+        "frame_range": [start, end],
+        "evidence_frames": usable,
+        "optimize_frames": optimize,
+        "holdout_frames": holdout,
+        "constant_pose_refinement": refinement,
+        "applied": bool(refinement["accepted"]),
+        "reason": None if refinement["accepted"] else "local_visual_gate_failed",
+        "applied_frame_count": len(applied_frames),
+    }
+
+
 def _static_window(
     cfg: dict[str, Any],
     baseline: dict[str, Any],
@@ -361,6 +899,18 @@ def _static_window(
         np.allclose(interval_values[0], value, atol=1e-10, rtol=1e-10)
         for value in interval_values[1:]
     ):
+        if window.get("refine_constant_pose", False):
+            return _refine_constant_static_pose(
+                cfg,
+                baseline,
+                trajectory,
+                window,
+                part=part,
+                reference_part=reference_part,
+                start=apply_start,
+                end=apply_end,
+                evidence=evidence,
+            )
         return {
             "mode": "static_window",
             "part": part,
@@ -826,6 +1376,14 @@ def main() -> None:
             )
         elif mode == "bridge_window":
             report["windows"][name] = _bridge_window(
+                window_baseline, trajectory, dict(window)
+            )
+        elif mode == "coaxial_snap_window":
+            report["windows"][name] = _coaxial_snap_window(
+                cfg, window_baseline, trajectory, dict(window)
+            )
+        elif mode == "orientation_transport_window":
+            report["windows"][name] = _orientation_transport_window(
                 window_baseline, trajectory, dict(window)
             )
 

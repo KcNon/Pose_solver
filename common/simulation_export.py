@@ -24,6 +24,10 @@ from common.simulation_assets import (
     write_urdf,
 )
 from common.io_utils import load_json, write_json
+from common.assembly_validation import (
+    validate_assembly_interface,
+    validation_readiness_report,
+)
 from common.pose_transforms import transform_points
 from common.physics_control import dynamic_collision_approximation
 
@@ -208,6 +212,13 @@ def export_simulation_assets(
     simulation = config["simulation"]
     container_part = str(simulation["container_part"])
     inserted_part = str(simulation["inserted_part"])
+    assembly_interface = (
+        validate_assembly_interface(
+            config["assembly_interface"], parts=set(config["meshes"])
+        )
+        if "assembly_interface" in config
+        else None
+    )
     carving = dict(simulation.get("observed_overlap_carving", {}))
     if carving.get("enabled", False):
         components = collision_components_by_part[inserted_part]
@@ -274,8 +285,8 @@ def export_simulation_assets(
         )
     display_parts = list(config.get("display_parts", config["meshes"].keys()))
     write_urdf(
-        urdf_dir / "rice_cooker_display.urdf",
-        robot_name="rice_cooker_display",
+        urdf_dir / "assembly_display.urdf",
+        robot_name="assembly_display",
         parts=display_parts,
         part_info=part_info,
         fixed_transforms={part: assembled_transforms[part] for part in display_parts},
@@ -305,11 +316,18 @@ def export_simulation_assets(
             for part in part_info
         },
         "assembly_pose_statistics": assembly_stats,
+        "assembly_interface": assembly_interface,
         "assembled_aabb": aabb_overlap(np.asarray(body_mesh.bounds), inserted_bounds),
         "inserted_to_container_vertex_distance_m": vertex_surface_distance_summary(
             np.asarray(body_mesh.vertices), inserted_world_vertices
         ),
     }
+    geometry_report["validation_readiness"] = validation_readiness_report(
+        assembly_interface,
+        part_info=part_info,
+        transform_checks=transform_checks,
+        simulation=simulation,
+    )
 
     replay_start, replay_end = simulation.get("observed_replay_frame_range", [0, 10**9])
     replay_frames = []
@@ -340,7 +358,7 @@ def export_simulation_assets(
 
     manifest = {
         "schema_version": 1,
-        "asset_name": config.get("asset_name", "rice_cooker"),
+        "asset_name": config.get("asset_name", "assembly_asset"),
         "units": "meter",
         "coordinate_convention": {
             "handedness": "right",
@@ -359,6 +377,7 @@ def export_simulation_assets(
         "states": {part: state_runs(trajectory, part) for part in trajectory["parts"]},
         "assembled_T_body_from_part": {part: matrix.tolist() for part, matrix in assembled_transforms.items()},
         "assembly_pose_statistics": assembly_stats,
+        "assembly_interface": assembly_interface,
         "simulation": {
             **simulation,
             "collision_policy": {
@@ -370,7 +389,7 @@ def export_simulation_assets(
             },
         },
         "outputs": {
-            "display_urdf": "urdf/rice_cooker_display.urdf",
+            "display_urdf": "urdf/assembly_display.urdf",
             "independent_urdfs": {part: f"urdf/{part}.urdf" for part in part_info},
             "geometry_report": "qa/geometry_report.json",
             "observed_replay": "qa/insertion_trajectory_body.json",

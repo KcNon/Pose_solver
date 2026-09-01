@@ -688,6 +688,25 @@ def resolve_pose_config(
         int(config["frames"]["start"]),
         int(config["frames"]["end"]),
     )
+    # State detection is intentionally conservative: a lagged motion vote,
+    # median filtering, and enter dwell suppress hand-occlusion false
+    # positives.  The detected boundary therefore describes when motion was
+    # confirmed, not necessarily its first physical frame.  Backdate the
+    # unlocked range by that known detector latency so static consensus does
+    # not visibly pin a part during pickup.  Explicit automation settings
+    # remain authoritative, and legacy reports without thresholds retain the
+    # previous zero-padding behavior.
+    detector_thresholds = state_report.get("thresholds", {})
+    if "motion_padding_before" not in settings and detector_thresholds:
+        detector_latency = (
+            max(1, int(detector_thresholds.get("motion_lag", 1)))
+            + max(1, int(detector_thresholds.get("dwell_on", 1)))
+            + 2  # one median-filter radius plus the first threshold frame
+        )
+        settings["motion_padding_before"] = min(12, detector_latency)
+        settings["motion_padding_before_source"] = (
+            "detector_latency_compensation"
+        )
     minimum_views = int(settings.get(
         "minimum_observing_views",
         max(1, min(2, len(config["views"]))),
@@ -992,6 +1011,77 @@ def resolve_pose_config(
                         )
                     ),
                 }
+                follows_dynamic = any(
+                    int(dynamic_end) + 1 == int(range_start)
+                    for _, dynamic_end in dynamic
+                )
+                is_initial_static = int(range_start) == int(part_start)
+                initial_parts = multiframe_auto.get("initial_refinement_parts")
+                refine_initial = bool(
+                    multiframe_auto.get("refine_initial_static_pose", False)
+                ) and (
+                    initial_parts is None or part in set(map(str, initial_parts))
+                )
+                refine_post_dynamic = bool(
+                    multiframe_auto.get(
+                        "refine_post_dynamic_static_pose", False
+                    )
+                )
+                if (
+                    (is_initial_static and refine_initial)
+                    or (
+                        follows_dynamic
+                        and part != reference
+                        and refine_post_dynamic
+                    )
+                ):
+                    refinement = {
+                        "refine_constant_pose": True,
+                        "constant_translation_steps_m": list(
+                            multiframe_auto.get(
+                                "constant_translation_steps_m",
+                                [0.015, 0.008, 0.004, 0.002],
+                            )
+                        ),
+                        "constant_rotation_steps_deg": list(
+                            multiframe_auto.get(
+                                "constant_rotation_steps_deg", [2.0, 1.0]
+                            )
+                        ),
+                        "constant_maximum_translation_delta_m": float(
+                            multiframe_auto.get(
+                                "constant_maximum_translation_delta_m", 0.03
+                            )
+                        ),
+                        "constant_maximum_rotation_delta_deg": float(
+                            multiframe_auto.get(
+                                "constant_maximum_rotation_delta_deg", 5.0
+                            )
+                        ),
+                        "constant_minimum_improvement": float(
+                            multiframe_auto.get(
+                                "constant_minimum_improvement", 0.005
+                            )
+                        ),
+                        "constant_maximum_holdout_degradation": float(
+                            multiframe_auto.get(
+                                "constant_maximum_holdout_degradation", 0.02
+                            )
+                        ),
+                        "constant_optimize_rotation": bool(
+                            multiframe_auto.get(
+                                (
+                                    "initial_constant_optimize_rotation"
+                                    if is_initial_static
+                                    else "constant_optimize_rotation"
+                                ),
+                                is_initial_static,
+                            )
+                        ),
+                    }
+                    if part != reference:
+                        refinement["reference_part"] = reference
+                    window.update(refinement)
                 multiframe_windows.append(window)
                 multiframe_window_names.add(name)
                 generated_multiframe_windows.append(name)
@@ -1063,6 +1153,62 @@ def resolve_pose_config(
             ),
             "generated_multiframe_windows": generated_multiframe_windows,
         }
+        assembly_parent = state.get("assembly_parent")
+        assembled_from = state_report["parts"][part].get(
+            "detected_assembled_from"
+        )
+        assembled_confirmed = state_report["parts"][part].get(
+            "detected_assembled_confirmed_at"
+        )
+        if assembly_parent is not None and assembled_from is not None:
+            assembled_from = int(assembled_from)
+            assembled_confirmed = int(
+                assembled_confirmed
+                if assembled_confirmed is not None
+                else assembled_from
+            )
+            candidate_frames = [
+                frame
+                for frame in range(assembled_from, assembled_confirmed + 1)
+                if frame in rows
+                and rows[frame].get("state") == "assembled"
+                and int(rows[frame].get("observing_views", 0)) > 0
+            ]
+            if candidate_frames:
+                maximum = max(1, int(
+                    state.get("assembly_latch", {}).get(
+                        "maximum_relative_anchor_frames", 5
+                    )
+                ))
+                if len(candidate_frames) > maximum:
+                    indices = [
+                        round(index * (len(candidate_frames) - 1) / (maximum - 1))
+                        for index in range(maximum)
+                    ] if maximum > 1 else [len(candidate_frames) - 1]
+                    candidate_frames = [candidate_frames[index] for index in indices]
+                consensus = resolved.setdefault("static_pose_consensus", {})
+                rigid_follow = consensus.setdefault("rigid_follow", {})
+                rigid_follow.setdefault(part, []).append({
+                    "reference_part": str(assembly_parent),
+                    "frame_range": [assembled_from, end],
+                    "relative_anchor_frames": candidate_frames,
+                    "maximum_relative_translation_residual_m": float(
+                        state.get("assembly_latch", {}).get(
+                            "maximum_relative_translation_residual_m", 0.03
+                        )
+                    ),
+                    "maximum_relative_rotation_residual_deg": float(
+                        state.get("assembly_latch", {}).get(
+                            "maximum_relative_rotation_residual_deg", 20.0
+                        )
+                    ),
+                })
+                part_audit["assembly_rigid_follow"] = {
+                    "reference_part": str(assembly_parent),
+                    "assembled_from": assembled_from,
+                    "confirmed_at": assembled_confirmed,
+                    "relative_anchor_frames": candidate_frames,
+                }
         if part == reference and allow_moving_reference and dynamic:
             validation = state.setdefault("validation", {})
             old_limits = {

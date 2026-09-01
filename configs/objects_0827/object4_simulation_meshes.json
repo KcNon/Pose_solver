@@ -1,0 +1,16 @@
+{
+  "output_dir": "../../experiments/objects_0827/Object-4/simulation_ready/simulation_inputs/meshes",
+  "maximum_faces": 1000000,
+  "parts": {
+    "sprayer_pump": {
+      "source": "/data_ft_9_10/wentai/projects/DiffSynth-Studio/data/objects-0827/Object-4/meshes/sprayer_pump.glb",
+      "raw_aabb": {
+        "minimum": [-0.37, -0.11, -0.44],
+        "maximum": [0.15, 0.13, 0.20]
+      }
+    },
+    "bottle_body": {
+      "source": "/data_ft_9_10/wentai/projects/DiffSynth-Studio/data/objects-0827/Object-4/meshes/bottle_body.glb"
+    }
+  }
+}

@@ -1,0 +1,388 @@
+{
+  "schema_version": 1,
+  "dataset": "Object-1-0827-rigid-nozzle",
+  "input": {
+    "frames_dir": "/data_ft_9_10/wentai/projects/DiffSynth-Studio/data/objects-0827/Object-1/frames",
+    "depth_dir": "/data_ft_9_10/wentai/projects/DiffSynth-Studio/data/objects-0827/Object-1/da3-self_cond",
+    "views": [
+      "GX012854",
+      "GX013167",
+      "GX013168",
+      "GX013495",
+      "GX014101",
+      "GX015380",
+      "GX015381",
+      "GX017770"
+    ],
+    "frame_range": [400, 630]
+  },
+  "parts": {
+    "sprayer_pump": {
+      "id": 1,
+      "mesh": "../../experiments/objects_0827/Object-1/rigid_nozzle_v1/inputs/meshes/sprayer_pump.glb",
+      "prompts": ["rigid trigger sprayer head and collar, excluding the flexible dip tube"],
+      "appearance_hint": 400
+    },
+    "bottle_body": {
+      "id": 2,
+      "mesh": "../../experiments/objects_0827/Object-1/rigid_nozzle_v1/inputs/meshes/bottle_body.glb",
+      "prompts": ["spray bottle body and threaded neck"],
+      "appearance_hint": 400,
+      "reference": true
+    }
+  },
+  "connectors": {
+    "sprayer_bottle_neck": {
+      "enabled": true,
+      "type": "insert",
+      "reference_part": "bottle_body",
+      "moving_part": "sprayer_pump",
+      "reference_axis_part": [0.0068894440, -0.9999437572, -0.0080633770],
+      "moving_axis_part": [-0.0151592849, -0.0172947697, 0.9997355085],
+      "reference_origin_raw": [-0.0387474404, 0.50098, 0.0034926387],
+      "moving_origin_raw": [-0.0084509128, -0.0098850322, -0.14808],
+      "allow_axis_flip": false,
+      "validation_frame_range": [569, 630],
+      "diagnostic_ranges": {
+        "insertion": [557, 568],
+        "assembled": [569, 630]
+      },
+      "maximum_axis_angle_deg": 2.0,
+      "maximum_radial_offset_m": 0.003,
+      "insertion_length_m": null,
+      "radial_clearance_m": null,
+      "minimum_clearance_margin_m": 0.0,
+      "require_collision_validation": false
+    }
+  },
+  "output": {
+    "root": "../../experiments/objects_0827/Object-1/rigid_nozzle_v1/pose_pipeline"
+  },
+  "runtime": {
+    "devices": [1],
+    "egl_device": 1,
+    "memory_guard": {
+      "enabled": true,
+      "minimum_available_gib": 128,
+      "maximum_process_rss_gib": 32,
+      "poll_seconds": 1,
+      "report_seconds": 10,
+      "stop_grace_seconds": 2
+    }
+  },
+  "models": {},
+  "mask": {
+    "mode": "reuse",
+    "artifact": "../../experiments/objects_0827/Object-1/rigid_nozzle_v1/inputs/masks"
+  },
+  "depth": {
+    "mode": "run",
+    "overrides": {
+      "quality_cloud": {
+        "enabled": true,
+        "variant": "da3_self_cond_quality_rigid_nozzle_hand_excluded",
+        "mask_resize_mode": "nearest",
+        "mask_erode": 1,
+        "depth_edge_mm": 30.0,
+        "cross_view_support_mm": 15.0,
+        "nearest_neighbor_workers": 4,
+        "min_support": 1,
+        "retain_unsupported_fraction": 0.0,
+        "stride": 2,
+        "fusion_voxel_mm": 1.0,
+        "max_points": 50000,
+        "minimum_mask_pixels": 30,
+        "minimum_fused_points": 150,
+        "minimum_supported_views": 2,
+        "minimum_supported_points_per_view": 20
+      }
+    }
+  },
+  "pose": {
+    "mode": "run",
+    "compatibility_config": "../../experiments/objects_0827/Object-1/current_pipeline_full/pose/automation/resolved_pose_config.json",
+    "overrides": {
+      "automation": {
+        "enabled": false,
+        "use_detected_states": false,
+        "infer_reference_part": false,
+        "infer_calibration_frames": false,
+        "infer_anchors": false,
+        "infer_appearance_evidence": false,
+        "infer_symmetry": false,
+        "minimum_observing_views": 3,
+        "silhouette_scale_calibration": {
+          "enabled": true,
+          "known_part_occlusion_aware": true,
+          "known_occluder_labels": [2, 3],
+          "occlusion_aware": true,
+          "post_anchor_render_pass": false,
+          "final_pose_scale_pass": false,
+          "scale_factors": [0.85, 0.90, 0.95, 1.0, 1.05, 1.10, 1.15],
+          "minimum_full_mask_pixels": 100,
+          "minimum_mask_area_ratio": 0.10,
+          "minimum_selected_iou": 0.20,
+          "minimum_selected_holdout_iou": 0.10,
+          "require_quality_gate": false,
+          "optimize_views": [
+            "GX012854",
+            "GX013167",
+            "GX013168",
+            "GX013495",
+            "GX014101",
+            "GX015380"
+          ],
+          "holdout_views": ["GX015381"],
+          "parts": {
+            "sprayer_pump": {
+              "anchor_frames": [420, 432, 451],
+              "minimum_full_mask_pixels": 60,
+              "minimum_mask_area_ratio": 0.05
+            },
+            "bottle_body": {
+              "scale_factors": [1.0],
+              "minimum_selected_iou": 0.50,
+              "minimum_selected_holdout_iou": 0.40
+            }
+          }
+        },
+        "anchor_render_refinement": {
+          "known_part_occlusion_aware": true,
+          "known_occluder_labels": [1, 2, 3],
+          "minimum_full_mask_pixels": 80,
+          "minimum_mask_area_ratio": 0.05
+        }
+      },
+      "states": {
+        "sprayer_pump": {
+          "appearance": {
+            "minimum_full_mask_pixels": 80,
+            "minimum_observations": 3,
+            "minimum_mean_iou": 0.10,
+            "minimum_worst_view_iou": 0.0
+          }
+        }
+      },
+      "registration": {
+        "endpoint_rotation_consistency": {
+          "enabled": true,
+          "maximum_correction_deg": 5.0,
+          "propagate_to_anchor": true
+        }
+      },
+      "multiframe_optimization": {
+        "enabled": true,
+        "auto_static_windows": false,
+        "auto_dynamic_windows": false,
+        "windows": [
+          {
+            "name": "sprayer_pump_hand_occlusion_bridge",
+            "mode": "bridge_window",
+            "part": "sprayer_pump",
+            "reference_part": "bottle_body",
+            "frame_range": [510, 520],
+            "apply": true
+          },
+          {
+            "name": "sprayer_pump_reobserved_mask_track",
+            "mode": "dynamic_window",
+            "part": "sprayer_pump",
+            "reference_part": "bottle_body",
+            "frame_range": [521, 551],
+            "candidate_radius_frames": 2,
+            "minimum_observing_views": 3,
+            "minimum_observed_views": 3,
+            "minimum_observed_iou": 0.25,
+            "maximum_translation_step_m": 0.04,
+            "maximum_rotation_step_deg": 25.0,
+            "maximum_boundary_translation_degradation_m": 0.004,
+            "maximum_boundary_rotation_degradation_deg": 2.0,
+            "maximum_internal_translation_degradation_m": 0.0,
+            "maximum_internal_rotation_degradation_deg": 0.0,
+            "temporal_weight": 0.25,
+            "baseline_weight": 0.03,
+            "maximum_visual_loss_degradation": 0.01,
+            "resolution": [160, 90],
+            "surface_points": 16000,
+            "render": {
+              "fallback_to_mask_views_when_cloud_unreliable": true,
+              "mask_fallback_minimum_cloud_views": 3,
+              "disable_depth_for_mask_only_fallback": true,
+              "use_depth_loss": false,
+              "minimum_full_mask_pixels": 30,
+              "minimum_mask_area_ratio": 0.03,
+              "minimum_refined_iou": 0.15,
+              "minimum_refined_target_coverage": 0.20,
+              "minimum_per_view_iou": 0.0
+            }
+          },
+          {
+            "name": "sprayer_bottle_coaxial_seating",
+            "mode": "coaxial_snap_window",
+            "reference_part": "bottle_body",
+            "moving_part": "sprayer_pump",
+            "frame_range": [557, 568],
+            "terminal_anchor_frame": 569,
+            "static_follow_range": [569, 630],
+            "reference_axis_part": [0.0068894440, -0.9999437572, -0.0080633770],
+            "moving_axis_part": [-0.0151592849, -0.0172947697, 0.9997355085],
+            "reference_axis_origin_raw": [-0.0387474404, 0.50098, 0.0034926387],
+            "moving_axis_origin_raw": [-0.0084509128, -0.0098850322, -0.14808],
+            "allow_axis_flip": false,
+            "target_axis_offset_m": 0.0,
+            "target_axial_offset_m": 0.0,
+            "twist_search_offsets_deg": [-180, -150, -120, -90, -60, -30, 0, 30, 60, 90, 120, 150],
+            "twist_evidence_frames": [583, 601, 616, 630],
+            "primary_view": "GX012854",
+            "primary_view_weight": 0.15,
+            "resolution": [160, 90],
+            "surface_points": 12000,
+            "render": {
+              "mask_primary": true,
+              "use_cloud_supported_view_gate": false,
+              "use_depth_loss": false,
+              "occlusion_aware": false,
+              "known_part_occlusion_aware": true,
+              "known_occluder_labels": [2, 3],
+              "trim_worst_views": 1,
+              "minimum_full_mask_pixels": 20,
+              "minimum_mask_area_ratio": 0.03,
+              "maximum_mask_area_ratio": 8.0,
+              "weights": {
+                "iou": 1.0,
+                "contour": 0.30,
+                "target_coverage": 0.20,
+                "depth": 0.0
+              }
+            },
+            "apply": true
+          },
+          {
+            "name": "sprayer_pump_final_visual_pose",
+            "mode": "static_window",
+            "part": "sprayer_pump",
+            "reference_part": "bottle_body",
+            "frame_range": [569, 630],
+            "apply_range": [569, 630],
+            "evidence_frames": [569, 583, 601, 616, 630],
+            "candidate_frames": [569],
+            "minimum_observing_views": 4,
+            "refine_constant_pose": true,
+            "constant_holdout_frames": [630],
+            "constant_optimize_rotation": true,
+            "constant_translation_steps_m": [0.012, 0.006, 0.003, 0.0015],
+            "constant_rotation_steps_deg": [12.0, 6.0, 3.0, 1.5],
+            "constant_maximum_translation_delta_m": 0.02,
+            "constant_maximum_rotation_delta_deg": 48.0,
+            "constant_minimum_improvement": 0.002,
+            "constant_maximum_holdout_degradation": 0.02,
+            "constant_minimum_refined_iou": 0.40,
+            "constant_prior_weight": 0.003,
+            "resolution": [320, 180],
+            "surface_points": 16000,
+            "render": {
+              "fallback_to_mask_views_when_cloud_unreliable": true,
+              "mask_fallback_minimum_cloud_views": 3,
+              "disable_depth_for_mask_only_fallback": true,
+              "mask_primary": true,
+              "use_cloud_supported_view_gate": false,
+              "use_depth_loss": false,
+              "occlusion_aware": false,
+              "known_part_occlusion_aware": true,
+              "known_occluder_labels": [2, 3],
+              "trim_worst_views": 1,
+              "minimum_full_mask_pixels": 30,
+              "minimum_mask_area_ratio": 0.03,
+              "maximum_mask_area_ratio": 8.0,
+              "weights": {
+                "iou": 1.0,
+                "contour": 0.30,
+                "target_coverage": 0.20,
+                "depth": 0.0
+              }
+            }
+          },
+          {
+            "name": "sprayer_pump_weak_texture_orientation_lock",
+            "mode": "orientation_transport_window",
+            "part": "sprayer_pump",
+            "reference_part": "bottle_body",
+            "frame_range": [458, 630],
+            "seed_frame": 569,
+            "moving_axis_part": [-0.0151592849, -0.0172947697, 0.9997355085],
+            "lock_full_orientation": true,
+            "lock_start_frame": 502,
+            "apply": true
+          }
+        ]
+      },
+      "render_loss_refinement": {
+        "known_part_occlusion_aware": true,
+        "known_occluder_labels": [1, 2, 3],
+        "quality_cloud_summary": "/data_ft_9_10/wentai/projects/pose_solver/experiments/objects_0827/Object-1/rigid_nozzle_v1/pose_pipeline/depth/parts_ply/da3_self_cond_quality_rigid_nozzle_hand_excluded/quality_cloud_summary.json",
+        "minimum_full_mask_pixels": 60,
+        "minimum_mask_area_ratio": 0.05,
+        "minimum_optimize_views": 3,
+        "optimize_views": [
+          "GX012854",
+          "GX013167",
+          "GX013168",
+          "GX013495",
+          "GX014101",
+          "GX015380",
+          "GX015381",
+          "GX017770"
+        ],
+        "holdout_views": [],
+        "minimum_holdout_iou": 0.0,
+        "parts": {
+          "sprayer_pump": {
+            "enabled": true,
+            "optimize_rotation": true,
+            "fallback_to_mask_views_when_cloud_unreliable": true,
+            "mask_fallback_minimum_cloud_views": 3,
+            "disable_depth_for_mask_only_fallback": true,
+            "global_reacquire_enabled": true,
+            "global_reacquire_iou_threshold": 0.40,
+            "global_reacquire_translation_radii_m": [0.06, 0.03, 0.015],
+            "global_reacquire_rotation_angles_deg": [90.0, 45.0, 22.5],
+            "global_reacquire_alternating_passes": 2,
+            "global_reacquire_minimum_improvement": 0.03,
+            "global_reacquire_relax_temporal_boundary": true,
+            "global_reacquire_rotation_prior_weight": 0.12,
+            "global_reacquire_rotation_prior_scale_deg": 90.0,
+            "global_reacquire_translation_prior_weight": 0.10,
+            "global_reacquire_translation_prior_scale_m": 0.04,
+            "global_reacquire_translation_prior_max_gap_frames": 2,
+            "minimum_per_view_iou": 0.0,
+            "ranges": [[458, 551], [557, 568]]
+          },
+          "bottle_body": {
+            "enabled": false,
+            "optimize_rotation": false,
+            "ranges": []
+          }
+        }
+      },
+      "view_quality": {
+        "minimum_full_mask_pixels": 60,
+        "maximum_mask_area_ratio": 6.0
+      },
+      "render": {
+        "views": "all",
+        "primary_view": "GX012854",
+        "width": 1280,
+        "height": 720,
+        "fps": 29.97002997002997,
+        "basic_only": true,
+        "occlusion_aware": true,
+        "mask_occluder_labels": [3],
+        "mask_occlusion_dilation_pixels": 1,
+        "grid": {
+          "enabled": true,
+          "video_names": ["overlay.mp4", "mesh_only.mp4"]
+        }
+      }
+    }
+  }
+}

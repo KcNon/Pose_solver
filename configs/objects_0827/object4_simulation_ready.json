@@ -1,0 +1,171 @@
+{
+  "schema_version": 1,
+  "dataset": "Object-4-0827-simulation-ready",
+  "input": {
+    "frames_dir": "/data_ft_9_10/wentai/projects/DiffSynth-Studio/data/objects-0827/Object-4/frames",
+    "depth_dir": "/data_ft_9_10/wentai/projects/DiffSynth-Studio/data/objects-0827/Object-4/pose_solver_icp/depth/da3-self-cond",
+    "views": [
+      "GX012853", "GX013166", "GX013167", "GX013494",
+      "GX014100", "GX015379", "GX015380", "GX017769"
+    ],
+    "frame_range": [300, 500]
+  },
+  "parts": {
+    "sprayer_pump": {
+      "id": 1,
+      "mesh": "/data_ft_9_10/wentai/projects/DiffSynth-Studio/data/objects-0827/Object-4/meshes/sprayer_pump.glb",
+      "prompts": ["sprayer pump, trigger head, collar, and attached dip tube"],
+      "appearance_hint": 300
+    },
+    "bottle_body": {
+      "id": 2,
+      "mesh": "/data_ft_9_10/wentai/projects/DiffSynth-Studio/data/objects-0827/Object-4/meshes/bottle_body.glb",
+      "prompts": ["spray bottle body and threaded open neck"],
+      "appearance_hint": 300,
+      "reference": true
+    }
+  },
+  "connectors": {
+    "sprayer_bottle_thread": {
+      "enabled": true,
+      "type": "screw",
+      "reference_part": "bottle_body",
+      "moving_part": "sprayer_pump",
+      "reference_axis_part": [0.0100001991, 0.9999404406, 0.0043716424],
+      "moving_axis_part": [0.2731951992, -0.0104415103, -0.9619019482],
+      "reference_origin_raw": [-0.0267321887, 0.5, 0.0312614046],
+      "moving_origin_raw": [0.0372083321, 0.0131589162, -0.065],
+      "allow_axis_flip": false,
+      "validation_frame_range": [427, 500],
+      "diagnostic_ranges": {
+        "grasped_transport": [350, 387],
+        "approach": [388, 416],
+        "insertion": [417, 426],
+        "assembled": [427, 500]
+      },
+      "insertion_direction": 1.0,
+      "maximum_axis_angle_deg": 5.0,
+      "maximum_radial_offset_m": 0.005,
+      "insertion_length_m": null,
+      "radial_clearance_m": null,
+      "minimum_clearance_margin_m": 0.0,
+      "thread": {
+        "pitch_m": null,
+        "handedness": null,
+        "reference_zero_direction_part": null,
+        "moving_zero_direction_part": null,
+        "entry_phase_rad": null,
+        "maximum_helical_residual_m": null
+      },
+      "geometry_evidence": {
+        "maximum_rms_residual_m": 0.0005,
+        "reference": {
+          "rms_residual_m": 0.000374249,
+          "source": "connector_geometry/bottle_neck_fit.json"
+        },
+        "moving": {
+          "rms_residual_m": 0.000751785,
+          "source": "connector_geometry/nozzle_collar_fit.json",
+          "note": "Inconclusive reconstruction fit; terminal axis disagreement is about 49.5 degrees."
+        }
+      },
+      "require_collision_validation": true
+    }
+  },
+  "assembly_task": {
+    "enabled": true,
+    "reference_part": "bottle_body",
+    "moving_part": "sprayer_pump",
+    "reference_axis_part": [0.0100001991, 0.9999404406, 0.0043716424],
+    "phases": {
+      "pregrasp": {
+        "frame_range": [300, 349],
+        "physics_semantic": "inactive"
+      },
+      "grasped_transport": {
+        "frame_range": [350, 387],
+        "physics_semantic": "external_kinematic_constraint"
+      },
+      "approach": {
+        "frame_range": [388, 416],
+        "physics_semantic": "external_kinematic_constraint"
+      },
+      "insertion": {
+        "frame_range": [417, 426],
+        "physics_semantic": "connector_constraint"
+      },
+      "assembled": {
+        "frame_range": [427, 500],
+        "physics_semantic": "terminal_hold"
+      }
+    },
+    "terminal_frame_range": [427, 500],
+    "terminal_target_frame": 500,
+    "terminal_thresholds": {
+      "maximum_translation_residual_m": 0.005,
+      "maximum_rotation_residual_deg": 2.0
+    },
+    "terminal_visual_evidence": {
+      "report": "/data_ft_9_10/wentai/projects/pose_solver/experiments/objects_0827/Object-4/simulation_ready/pose/diagnostics/assembly_pose_axial_validation_after.json",
+      "accepted_diagnoses": [
+        "visual_pose_supports_raw_pose_and_rejects_contact_correction"
+      ],
+      "maximum_abs_best_offset_m": 0.005
+    },
+    "external_constraint_model_available": false,
+    "omitted_geometry": ["flexible dip tube"]
+  },
+  "output": {
+    "root": "../../experiments/objects_0827/Object-4/simulation_ready"
+  },
+  "runtime": {
+    "devices": [1],
+    "egl_device": 1,
+    "memory_guard": {
+      "enabled": true,
+      "minimum_available_gib": 128,
+      "maximum_process_rss_gib": 32,
+      "poll_seconds": 1,
+      "report_seconds": 10,
+      "stop_grace_seconds": 2
+    }
+  },
+  "models": {},
+  "mask": {
+    "mode": "reuse",
+    "artifact": "/data_ft_9_10/wentai/projects/DiffSynth-Studio/data/objects-0827/Object-4/masks",
+    "overrides": {"source_layout": "view_first"}
+  },
+  "depth": {
+    "mode": "reuse",
+    "artifact": "/data_ft_9_10/wentai/projects/DiffSynth-Studio/data/objects-0827/Object-4/pose_solver_icp/depth/parts_ply/da3_self_cond_quality"
+  },
+  "pose": {
+    "mode": "run",
+    "overrides": {
+      "multiframe_optimization": {
+        "auto": {
+          "refine_post_dynamic_static_pose": true,
+          "constant_translation_steps_m": [0.015, 0.008, 0.004, 0.002],
+          "constant_maximum_translation_delta_m": 0.03,
+          "constant_minimum_improvement": 0.005,
+          "constant_maximum_holdout_degradation": 0.02,
+          "constant_optimize_rotation": false
+        }
+      },
+      "render": {
+        "views": "all",
+        "primary_view": "GX012853",
+        "width": 1280,
+        "height": 720,
+        "fps": 29.97002997002997,
+        "basic_only": true,
+        "occlusion_aware": false,
+        "grid": {
+          "enabled": true,
+          "video_names": ["overlay.mp4", "mesh_only.mp4"]
+        }
+      }
+    }
+  }
+}

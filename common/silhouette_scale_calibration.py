@@ -16,6 +16,7 @@ from common.multiview_quality import (
 )
 from common.mesh_render import SceneRenderer
 from common.normalized_recon import load_recon
+from common.occlusion_masks import known_occluder_mask
 from common.pose_refinement import sample_canonical, silhouette_metrics
 from common.pose_transforms import rigid_from_similarity, similarity_from_rigid
 from common.pose_visualization import camera_from_recon
@@ -60,6 +61,15 @@ def _evaluate_exact_mesh(
         full_predicted = rendered_depth > 0.0
         target = np.asarray(observation.target_mask, dtype=bool)
         occluded = np.zeros_like(target, dtype=bool)
+        if observation.known_occluder_mask is not None:
+            known = np.asarray(
+                observation.known_occluder_mask, dtype=bool
+            )
+            if known.shape != target.shape:
+                raise ValueError(
+                    "known_occluder_mask must match target_mask shape"
+                )
+            occluded |= known & full_predicted
         if (
             settings.get("occlusion_aware", False)
             and observation.observed_depth is not None
@@ -211,14 +221,23 @@ def _configured_prior_cross_frame_gate(
 def _rendered_to_target_ratios(
     evaluations: list[dict[str, Any]],
 ) -> list[float]:
+    """Compare the visible render area with the modal target-mask area.
+
+    A labelled hand or another rigid part can hide a large fraction of the
+    mesh.  Using the amodal ``full_rendered_pixels`` count against a modal
+    target mask systematically selects a smaller physical scale.  The
+    renderer has already removed known/depth-supported occluders from
+    ``rendered_pixels``, so that is the comparable projected area.
+    """
+
     ratios = []
     for evaluation in evaluations:
         for row in evaluation.get("views", []):
             target = int(row.get("target_pixels", 0))
             rendered = int(
                 row.get(
-                    "full_rendered_pixels",
-                    row.get("rendered_pixels", 0),
+                    "rendered_pixels",
+                    row.get("full_rendered_pixels", 0),
                 )
             )
             if target > 0 and rendered > 0:
@@ -409,6 +428,17 @@ def build_render_observations(
         intrinsics, extrinsics = camera_from_recon(
             recon, view_index, (height, width)
         )
+        known_occluder = None
+        if settings.get("known_part_occlusion_aware", True):
+            known_occluder = cv2.resize(
+                known_occluder_mask(
+                    labels_by_view[view],
+                    part_id,
+                    settings.get("known_occluder_labels"),
+                ).astype(np.uint8),
+                (width, height),
+                interpolation=cv2.INTER_NEAREST,
+            ).astype(bool)
         result.append(
             RenderObservation(
                 view=view,
@@ -420,6 +450,7 @@ def build_render_observations(
                     (width, height),
                     interpolation=cv2.INTER_LINEAR,
                 ),
+                known_occluder_mask=known_occluder,
             )
         )
     return result

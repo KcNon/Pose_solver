@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from common.assembly_task import validate_assembly_task_config
 from common.connector_geometry import validate_connector_config
 from common.multiframe_pose import validate_multiframe_settings
 from common.symmetry import symmetry_spec_from_state
@@ -68,6 +69,28 @@ def validate_pose_config(
         )
     for part in parts:
         state = config["states"][part]
+        assembly_parent = state.get("assembly_parent")
+        if assembly_parent is not None:
+            assembly_parent = str(assembly_parent)
+            if assembly_parent not in parts or assembly_parent == part:
+                raise ValueError(
+                    f"{part}: assembly_parent must name a different part"
+                )
+            latch = state.get("assembly_latch", {})
+            if not isinstance(latch, dict):
+                raise ValueError(f"{part}: assembly_latch must be an object")
+            if float(latch.get("distance_tolerance_m", 0.03)) <= 0.0:
+                raise ValueError(
+                    f"{part}: assembly distance_tolerance_m must be positive"
+                )
+            if int(latch.get("minimum_stable_frames", 10)) < 2:
+                raise ValueError(
+                    f"{part}: assembly minimum_stable_frames must be >= 2"
+                )
+            if float(latch.get("minimum_approach_m", 0.03)) < 0.0:
+                raise ValueError(
+                    f"{part}: assembly minimum_approach_m must be non-negative"
+                )
         try:
             symmetry_spec_from_state(state)
         except (TypeError, ValueError) as error:
@@ -169,6 +192,13 @@ def validate_pose_config(
         frame_start=start,
         frame_end=end,
     )
+    if config.get("assembly_task") is not None:
+        validate_assembly_task_config(
+            config["assembly_task"],
+            parts=parts,
+            frame_start=start,
+            frame_end=end,
+        )
     constraints = config.get("trajectory_constraints", {})
     if constraints.get("enabled", False):
         proxy_config = constraints.get(

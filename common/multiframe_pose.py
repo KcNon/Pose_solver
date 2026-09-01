@@ -19,6 +19,8 @@ WINDOW_MODES = {
     "static_window",
     "dynamic_window",
     "bridge_window",
+    "orientation_transport_window",
+    "coaxial_snap_window",
     "relation_window",
 }
 
@@ -90,14 +92,15 @@ def validate_multiframe_settings(
         mode = str(value.get("mode", ""))
         if mode not in WINDOW_MODES:
             raise ValueError(f"{name}: unsupported multi-frame mode {mode!r}")
-        if mode == "relation_window":
+        if mode in {"relation_window", "coaxial_snap_window"}:
             moving_part = str(value.get("moving_part", ""))
             reference_part = str(value.get("reference_part", ""))
-            relation_type = str(value.get("relation_type", "coaxial_insert"))
-            if relation_type != "coaxial_insert":
-                raise ValueError(
-                    f"{name}: unsupported relation_type {relation_type!r}"
-                )
+            if mode == "relation_window":
+                relation_type = str(value.get("relation_type", "coaxial_insert"))
+                if relation_type != "coaxial_insert":
+                    raise ValueError(
+                        f"{name}: unsupported relation_type {relation_type!r}"
+                    )
             if moving_part not in part_names or reference_part not in part_names:
                 raise ValueError(f"{name}: relation contains unknown parts")
             if moving_part == reference_part:
@@ -110,6 +113,19 @@ def validate_multiframe_settings(
             missing = required.difference(value)
             if missing:
                 raise ValueError(f"{name}: missing keys {sorted(missing)}")
+            terminal = int(value["terminal_anchor_frame"])
+            if terminal < frame_start or terminal > frame_end:
+                raise ValueError(f"{name}: terminal_anchor_frame lies outside sequence")
+            if mode == "coaxial_snap_window":
+                follow_start, follow_end = map(
+                    int, value.get("static_follow_range", [terminal, terminal])
+                )
+                if (
+                    follow_start < frame_start
+                    or follow_end > frame_end
+                    or follow_start > follow_end
+                ):
+                    raise ValueError(f"{name}: invalid static_follow_range")
         else:
             part = str(value.get("part", ""))
             if part not in part_names:
@@ -154,7 +170,83 @@ def validate_multiframe_settings(
             ):
                 if float(value.get(key, 0.0)) < 0.0:
                     raise ValueError(f"{name}: {key} must be non-negative")
+        if mode == "orientation_transport_window":
+            axis = np.asarray(value.get("moving_axis_part"), dtype=np.float64)
+            if axis.shape != (3,) or not np.isfinite(axis).all():
+                raise ValueError(f"{name}: moving_axis_part must have 3 finite values")
+            if float(np.linalg.norm(axis)) <= 1e-9:
+                raise ValueError(f"{name}: moving_axis_part cannot be zero")
+            seed = int(value.get("seed_frame", end))
+            if seed < start or seed > end:
+                raise ValueError(f"{name}: seed_frame must lie inside frame_range")
+            lock_start = int(value.get("lock_start_frame", start))
+            if lock_start < start or lock_start > end:
+                raise ValueError(f"{name}: lock_start_frame must lie inside frame_range")
     return settings
+
+
+def _shortest_arc_rotation(source: np.ndarray, target: np.ndarray) -> np.ndarray:
+    """Return the deterministic minimum rotation mapping one unit vector to another."""
+
+    left = np.asarray(source, dtype=np.float64)
+    right = np.asarray(target, dtype=np.float64)
+    left /= np.linalg.norm(left)
+    right /= np.linalg.norm(right)
+    dot = float(np.clip(np.dot(left, right), -1.0, 1.0))
+    if dot >= 1.0 - 1e-12:
+        return np.eye(3, dtype=np.float64)
+    if dot <= -1.0 + 1e-12:
+        basis = np.zeros(3, dtype=np.float64)
+        basis[int(np.argmin(np.abs(left)))] = 1.0
+        axis = np.cross(left, basis)
+        axis /= np.linalg.norm(axis)
+        return Rotation.from_rotvec(np.pi * axis).as_matrix()
+    cross = np.cross(left, right)
+    cross /= np.linalg.norm(cross)
+    return Rotation.from_rotvec(np.arccos(dot) * cross).as_matrix()
+
+
+def parallel_transport_orientations(
+    rotations: dict[int, np.ndarray],
+    moving_axis_part: np.ndarray,
+    *,
+    seed_frame: int,
+) -> dict[int, np.ndarray]:
+    """Preserve each observed connector-axis direction while removing axial spin.
+
+    The trusted seed orientation is transported along the observed axis path by
+    minimum rotations.  This retains real tilt (for example lifting a nozzle
+    from horizontal to vertical) without allowing pairwise ICP to accumulate
+    the unobservable twist about a near-cylindrical connector axis.
+    """
+
+    frames = sorted(int(frame) for frame in rotations)
+    if seed_frame not in rotations:
+        raise ValueError("seed_frame is absent from rotations")
+    axis = np.asarray(moving_axis_part, dtype=np.float64)
+    if axis.shape != (3,) or not np.isfinite(axis).all():
+        raise ValueError("moving_axis_part must have three finite values")
+    norm = float(np.linalg.norm(axis))
+    if norm <= 1e-9:
+        raise ValueError("moving_axis_part cannot be zero")
+    axis /= norm
+    observed = {
+        frame: np.asarray(rotations[frame], dtype=np.float64)
+        for frame in frames
+    }
+    result = {int(seed_frame): observed[int(seed_frame)].copy()}
+    seed_index = frames.index(int(seed_frame))
+    for index in range(seed_index + 1, len(frames)):
+        previous, frame = frames[index - 1], frames[index]
+        source = result[previous] @ axis
+        target = observed[frame] @ axis
+        result[frame] = _shortest_arc_rotation(source, target) @ result[previous]
+    for index in range(seed_index - 1, -1, -1):
+        following, frame = frames[index + 1], frames[index]
+        source = result[following] @ axis
+        target = observed[frame] @ axis
+        result[frame] = _shortest_arc_rotation(source, target) @ result[following]
+    return result
 
 
 def _frame_range(window: dict[str, Any], name: str) -> tuple[int, int]:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render the complete 05-style force-driven PhysX trajectory video."""
+"""Render a complete force-controlled or hand-constrained PhysX trajectory."""
 from __future__ import annotations
 
 import argparse
@@ -28,6 +28,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--asset-root", type=Path, default=DEFAULT_ASSET_ROOT)
     parser.add_argument("--runtime-root", type=Path, default=DEFAULT_RUNTIME_ROOT)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_ROOT)
+    parser.add_argument(
+        "--trajectory",
+        type=Path,
+        help=(
+            "Explicit trajectory to render. Defaults to the trajectory recorded "
+            "in the exported asset manifest."
+        ),
+    )
+    parser.add_argument(
+        "--tube-constrained-assembly",
+        action="store_true",
+        help=(
+            "Use the configured flexible dip-tube constraint during insertion, "
+            "then disable pose control, axial preload, and FixedJoint in the "
+            "assembled phase."
+        ),
+    )
     parser.add_argument("--fps", type=float, default=5.0)
     parser.add_argument("--start-frame", type=int)
     parser.add_argument("--end-frame", type=int)
@@ -54,8 +71,20 @@ def main() -> None:
     manifest = json.loads(
         (asset_root / "manifest.json").read_text(encoding="utf-8")
     )
-    trajectory_path = PROJECT_ROOT / manifest["inputs"]["trajectory"]
+    trajectory_value = Path(
+        args.trajectory
+        if args.trajectory is not None
+        else manifest["inputs"]["trajectory"]
+    )
+    trajectory_path = (
+        trajectory_value
+        if trajectory_value.is_absolute()
+        else PROJECT_ROOT / trajectory_value
+    ).resolve()
+    if not trajectory_path.is_file():
+        raise FileNotFoundError(f"Trajectory does not exist: {trajectory_path}")
     trajectory = json.loads(trajectory_path.read_text(encoding="utf-8"))
+    args.trajectory = trajectory_path
 
     from isaacsim import SimulationApp
 

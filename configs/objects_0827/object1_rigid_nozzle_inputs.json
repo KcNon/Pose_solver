@@ -1,0 +1,30 @@
+{
+  "source_masks_dir": "../../experiments/objects_0827/Object-1/current_pipeline_full/mask/masks",
+  "source_mesh_dir": "/data_ft_9_10/wentai/projects/DiffSynth-Studio/data/objects-0827/Object-1/meshes",
+  "output_root": "../../experiments/objects_0827/Object-1/rigid_nozzle_v1/inputs",
+  "views": [
+    "GX012854",
+    "GX013167",
+    "GX013168",
+    "GX013495",
+    "GX014101",
+    "GX015380",
+    "GX015381",
+    "GX017770"
+  ],
+  "frame_range": [400, 630],
+  "part": {
+    "name": "sprayer_pump",
+    "id": 1
+  },
+  "mask": {
+    "erosion_radius_pixels": 25,
+    "restore_radius_pixels": 40,
+    "minimum_core_pixels": 25
+  },
+  "mesh": {
+    "axis": "z",
+    "minimum": null,
+    "maximum": -0.15
+  }
+}

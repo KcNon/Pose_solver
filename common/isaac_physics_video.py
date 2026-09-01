@@ -25,10 +25,14 @@ from pxr import Gf, PhysxSchema, Sdf, Usd, UsdGeom, UsdLux, UsdPhysics, UsdShade
 
 from common.io_utils import write_json
 from common.physics_control import (
+    assembly_target_translation,
     dynamic_collision_approximation,
+    elastic_tube_wrench,
+    physics_pose_refinement_settings,
     rigid_body_controller_parameters,
     select_control_profile,
     settled_contact_settings,
+    sustained_contact_summary,
     transformed_bounds_minimum_z,
 )
 import common.isaac_runtime as runtime
@@ -65,6 +69,81 @@ UNOBSERVABLE_STATES = {
     "out_of_frame",
     "unknown",
 }
+
+
+def _author_fixed_assembly_lock(
+    stage: Usd.Stage,
+    *,
+    reference_part: str,
+    moving_part: str,
+    moving_prim: Usd.Prim,
+    achieved_world_pose: np.ndarray,
+    position_error_m: float,
+    rotation_error_deg: float,
+    contact_observed: bool,
+    contact_sustained: bool,
+    settings: dict[str, Any],
+) -> dict[str, Any]:
+    """Persist an achieved seated pose as a fixed assembly constraint.
+
+    The bottle collider is intentionally static, so fixing the inserted body
+    to the world at its achieved pose is physically equivalent to a fixed
+    bottle-to-nozzle joint while avoiding a joint target without a rigid-body
+    API.  The semantic reference part and measured lock error remain explicit
+    in the report.
+    """
+
+    enabled = bool(settings.get("enabled", False))
+    maximum_position = float(settings.get("maximum_position_error_m", 0.02))
+    maximum_rotation = float(settings.get("maximum_rotation_error_deg", 5.0))
+    require_contact = bool(settings.get("require_contact", True))
+    require_sustained_contact = bool(
+        settings.get("require_sustained_contact", require_contact)
+    )
+    qualified = bool(
+        enabled
+        and position_error_m <= maximum_position
+        and rotation_error_deg <= maximum_rotation
+        and (contact_observed or not require_contact)
+        and (contact_sustained or not require_sustained_contact)
+    )
+    result = {
+        "enabled": enabled,
+        "qualified": qualified,
+        "reference_part": reference_part,
+        "moving_part": moving_part,
+        "position_error_m": float(position_error_m),
+        "rotation_error_deg": float(rotation_error_deg),
+        "contact_observed": bool(contact_observed),
+        "contact_sustained": bool(contact_sustained),
+        "require_contact": require_contact,
+        "require_sustained_contact": require_sustained_contact,
+        "maximum_position_error_m": maximum_position,
+        "maximum_rotation_error_deg": maximum_rotation,
+        "joint_path": None,
+    }
+    if not qualified:
+        return result
+
+    scope = UsdGeom.Scope.Define(stage, "/World/AssemblyJoints")
+    path = scope.GetPath().AppendChild(
+        f"{reference_part}_to_{moving_part}"
+    )
+    joint = UsdPhysics.FixedJoint.Define(stage, path)
+    joint.CreateBody1Rel().SetTargets([moving_prim.GetPath()])
+    position = np.asarray(achieved_world_pose[:3, 3], dtype=np.float64)
+    quaternion = matrix_to_quaternion_wxyz(achieved_world_pose[:3, :3])
+    joint.CreateLocalPos0Attr().Set(Gf.Vec3f(*position.tolist()))
+    joint.CreateLocalRot0Attr().Set(Gf.Quatf(
+        float(quaternion[0]),
+        Gf.Vec3f(*np.asarray(quaternion[1:], dtype=float).tolist()),
+    ))
+    joint.CreateLocalPos1Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
+    joint.CreateLocalRot1Attr().Set(Gf.Quatf(1.0, Gf.Vec3f(0.0, 0.0, 0.0)))
+    result["joint_path"] = str(path)
+    result["achieved_T_world_from_part"] = achieved_world_pose.tolist()
+    result["constraint"] = "fixed_to_world_with_static_reference_part"
+    return result
 
 
 def _font(size: int) -> ImageFont.ImageFont:
@@ -225,24 +304,54 @@ def _control(
     natural_frequency: float,
     damping_ratio: float,
     mode: str,
+    external_force_world: np.ndarray | None = None,
+    external_torque_world: np.ndarray | None = None,
+    angular_natural_frequency: float | None = None,
 ) -> dict[str, Any]:
     actual, linear_velocity, angular_velocity = _read_state(view)
     mass = float(parameters["mass_kg"])
     inertia = float(parameters["inertia_scale"])
+    rotation_frequency = float(
+        natural_frequency
+        if angular_natural_frequency is None
+        else angular_natural_frequency
+    )
+    if rotation_frequency <= 0.0:
+        raise ValueError("angular_natural_frequency must be positive")
     position_error = target[:3, 3] - actual[:3, 3]
     rotation_error = _rotation_error_vector(actual[:3, :3], target[:3, :3])
+    feedforward_force = (
+        np.zeros(3, dtype=np.float64)
+        if external_force_world is None
+        else np.asarray(external_force_world, dtype=np.float64)
+    )
+    if feedforward_force.shape != (3,) or not np.isfinite(
+        feedforward_force
+    ).all():
+        raise ValueError("external_force_world must contain three finite values")
+    feedforward_torque = (
+        np.zeros(3, dtype=np.float64)
+        if external_torque_world is None
+        else np.asarray(external_torque_world, dtype=np.float64)
+    )
+    if feedforward_torque.shape != (3,) or not np.isfinite(
+        feedforward_torque
+    ).all():
+        raise ValueError("external_torque_world must contain three finite values")
     force = (
         mass * natural_frequency**2 * position_error
         - 2.0 * damping_ratio * mass * natural_frequency * linear_velocity
         + np.array([0.0, 0.0, mass * 9.81])
+        + feedforward_force
     )
     torque = (
-        inertia * natural_frequency**2 * rotation_error
+        inertia * rotation_frequency**2 * rotation_error
         - 2.0
         * damping_ratio
         * inertia
-        * natural_frequency
+        * rotation_frequency
         * angular_velocity
+        + feedforward_torque
     )
     force, force_saturated = _clip_vector(force, float(parameters["force_limit_n"]))
     torque, torque_saturated = _clip_vector(
@@ -256,10 +365,13 @@ def _control(
     return {
         "force_world_n": force.tolist(),
         "torque_world_nm": torque.tolist(),
+        "external_force_world_n": feedforward_force.tolist(),
+        "external_torque_world_nm": feedforward_torque.tolist(),
         "force_saturated": force_saturated,
         "torque_saturated": torque_saturated,
         "controller_mode": mode,
         "controller_frequency_radps": natural_frequency,
+        "controller_rotation_frequency_radps": rotation_frequency,
         "controller_damping_ratio": damping_ratio,
     }
 
@@ -273,6 +385,10 @@ def _snapshot(
     rotation_error = _rotation_error_vector(actual[:3, :3], target[:3, :3])
     return {
         "T_world_from_part": actual.tolist(),
+        "target_T_world_from_part": target.tolist(),
+        "position_error_vector_m": (
+            target[:3, 3] - actual[:3, 3]
+        ).tolist(),
         "linear_velocity_mps": linear_velocity.tolist(),
         "angular_velocity_radps": angular_velocity.tolist(),
         "position_error_m": float(np.linalg.norm(target[:3, 3] - actual[:3, 3])),
@@ -461,6 +577,8 @@ def _compose(
     snapshots: dict[str, dict[str, Any]],
     contacts: dict[str, dict[str, Any]],
     dynamic_parts: list[str],
+    target_is_contact_corrected: bool,
+    tube_constrained_assembly: bool = False,
 ) -> Image.Image:
     canvas = Image.new("RGB", (1280, 720), (22, 22, 24))
     canvas.paste(views["perspective"], (0, 0))
@@ -468,13 +586,27 @@ def _compose(
     canvas.paste(views["side"], (640, 360))
     draw = ImageDraw.Draw(canvas, "RGBA")
     draw.rectangle((0, 0, 1280, 63), fill=(0, 0, 0, 200))
+    title = (
+        "Isaac assembly | hand-constrained path -> passive physics"
+        if tube_constrained_assembly
+        else "PhysX force-driven trajectory"
+    )
     draw.text(
         (18, 12),
-        f"PhysX force-driven trajectory | frame {frame_id:03d}",
+        f"{title} | frame {frame_id:03d}",
         font=FONT_LARGE,
         fill=(255, 255, 255, 255),
     )
-    lines = ["Textured = actual PhysX pose | transparent colored = solver target"]
+    target_label = (
+        "contact-corrected target"
+        if target_is_contact_corrected
+        else "trajectory target (no correction)"
+    )
+    lines = [f"Textured = actual PhysX pose | transparent cyan = {target_label}"]
+    if tube_constrained_assembly:
+        lines.append(
+            "Green curve = flexible dip tube | assembled = contact + gravity + tube only"
+        )
     for part in dynamic_parts:
         if part not in snapshots:
             lines.append(f"{part}: {states.get(part, 'not started')} | inactive")
@@ -521,6 +653,22 @@ def render_complete_physics_video(
     dynamic_parts = [part for part in parts if part != reference_part]
     usd_paths = _load_usd_cache(runtime_root, parts)
     simulation = manifest["simulation"]
+    tube_constrained_assembly = bool(
+        getattr(args, "tube_constrained_assembly", False)
+    )
+    physics_refinement = (
+        physics_pose_refinement_settings(simulation)
+        if tube_constrained_assembly
+        else None
+    )
+    if tube_constrained_assembly and not physics_refinement["enabled"]:
+        raise ValueError(
+            "--tube-constrained-assembly requires "
+            "simulation.physics_pose_refinement.enabled"
+        )
+    target_is_contact_corrected = bool(
+        simulation.get("assembly_target_corrections")
+    )
     world_from_body = np.eye(4, dtype=np.float64)
     world_from_body[:3, :3] = align_vectors(
         np.asarray(simulation["up_axis_body"], dtype=np.float64),
@@ -622,16 +770,25 @@ def render_complete_physics_video(
         )
         for index, part in enumerate(dynamic_parts)
     }
-    ghosts = {
-        part: _create_target_ghost(
-            stage,
-            asset_root,
-            part,
-            str(manifest["parts"][part]["collision_mesh"]),
-            target_colors[part],
-        )
-        for part in dynamic_parts
-    }
+    ghosts = (
+        {
+            part: _create_target_ghost(
+                stage,
+                asset_root,
+                part,
+                str(
+                    manifest["parts"][part].get(
+                        "visual_mesh",
+                        manifest["parts"][part]["collision_mesh"],
+                    )
+                ),
+                target_colors[part],
+            )
+            for part in dynamic_parts
+        }
+        if capture_enabled
+        else {}
+    )
     _set_visibility(roots[reference_part], False)
     dt = configure_physics_scene(stage, simulation)
     if capture_enabled:
@@ -657,6 +814,52 @@ def render_complete_physics_video(
         for part in dynamic_parts
     }
     settled_settings = settled_contact_settings(simulation)
+    trajectory_preload_start = simulation.get(
+        "assembly_trajectory_preload_start_frame"
+    )
+    if tube_constrained_assembly:
+        trajectory_preload_start = None
+    trajectory_preload_ramp_start = float(
+        simulation.get("assembly_trajectory_preload_ramp_start_seconds", 1.5)
+    )
+    trajectory_preload_ramp_end = float(
+        simulation.get("assembly_trajectory_preload_ramp_end_seconds", 3.0)
+    )
+    if (
+        trajectory_preload_ramp_start < 0.0
+        or trajectory_preload_ramp_end < trajectory_preload_ramp_start
+    ):
+        raise ValueError("invalid assembly trajectory preload ramp interval")
+    trajectory_preload_initial = dict(
+        simulation.get("assembly_hold_preload_forces_reference_n", {})
+    )
+    trajectory_preload_final = dict(
+        simulation.get(
+            "assembly_hold_final_preload_forces_reference_n",
+            trajectory_preload_initial,
+        )
+    )
+    trajectory_preload_vectors: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for part in dynamic_parts:
+        initial_value = np.asarray(
+            trajectory_preload_initial.get(part, [0.0, 0.0, 0.0]),
+            dtype=np.float64,
+        )
+        final_value = np.asarray(
+            trajectory_preload_final.get(part, initial_value),
+            dtype=np.float64,
+        )
+        if (
+            initial_value.shape != (3,)
+            or final_value.shape != (3,)
+            or not np.isfinite(initial_value).all()
+            or not np.isfinite(final_value).all()
+        ):
+            raise ValueError(
+                "assembly trajectory preload forces must contain three "
+                "finite values"
+            )
+        trajectory_preload_vectors[part] = (initial_value, final_value)
 
     trajectory_ids = sorted(int(frame_id) for frame_id in trajectory["frames"])
     output_start = int(args.start_frame) if args.start_frame is not None else 0
@@ -667,11 +870,92 @@ def render_complete_physics_video(
     )
     if output_start < 0 or output_end < output_start:
         raise ValueError(f"Invalid output range: {output_start}..{output_end}")
+    tube_start_frame = (
+        int(physics_refinement["apply_frame_range"][0])
+        if physics_refinement is not None
+        else None
+    )
+    passive_hold_start_frame = (
+        int(physics_refinement["apply_frame_range"][1])
+        if physics_refinement is not None
+        else None
+    )
+    body_axis_world = world_from_body[:3, :3] @ np.asarray(
+        [0.0, 1.0, 0.0], dtype=np.float64
+    )
+    body_axis_origin_world = None
+    tube_visual = None
+    tube_visual_report: dict[str, Any] | None = None
+    if physics_refinement is not None:
+        tube = physics_refinement["tube"]
+        body_axis_origin_world = (
+            world_from_body
+            @ np.append(
+                np.asarray(tube["body_axis_origin_body_m"], dtype=np.float64),
+                1.0,
+            )
+        )[:3]
+        initial_frame_id = next(
+            frame_id
+            for frame_id in trajectory_ids
+            if frame_id >= output_start
+        )
+        initial_record = trajectory["frames"][f"{initial_frame_id:06d}"]
+        initial_part_pose = _world_from_part(
+            initial_record,
+            str(simulation["inserted_part"]),
+            reference_part,
+            world_from_body,
+        )
+        if capture_enabled:
+            UsdGeom.Scope.Define(stage, "/World/PhysicsPoseRefinement")
+            UsdGeom.Scope.Define(stage, "/World/DemoVisuals")
+            UsdGeom.Scope.Define(stage, "/World/DemoMaterials")
+            initial_points = runtime.tube_curve_points(
+                position_world=initial_part_pose[:3, 3],
+                rotation_world_from_part=initial_part_pose[:3, :3],
+                body_axis_origin_world=body_axis_origin_world,
+                body_axis_world=body_axis_world,
+                tube=tube,
+            )
+            tube_visual = runtime.author_tube_visual(stage, initial_points, tube)
+            hidden_body_visuals = runtime.hide_imported_visuals(
+                roots[reference_part]
+            )
+            transparent_body = runtime.author_direct_visual(
+                stage,
+                "CompleteAssemblyBodyShell",
+                asset_root
+                / str(
+                    manifest["parts"][reference_part].get(
+                        "visual_mesh",
+                        manifest["parts"][reference_part]["collision_mesh"],
+                    )
+                ),
+                world_from_body,
+                (0.48, 0.10, 0.10),
+                metallic=0.02,
+                roughness=0.45,
+                opacity=0.30,
+            )
+            tube_visual_report = {
+                key: value
+                for key, value in tube_visual.items()
+                if key != "points_attr"
+            }
+            tube_visual_report["hidden_body_visuals"] = hidden_body_visuals
+            tube_visual_report["transparent_body_shell"] = transparent_body
     physics_steps = max(1, int(round(1.0 / (dt * float(args.fps)))))
     active = {part: False for part in dynamic_parts}
     contact_latched = {part: False for part in dynamic_parts}
+    passive_terminal_latched = {part: False for part in dynamic_parts}
+    passive_terminal_ready_steps = {part: 0 for part in dynamic_parts}
+    passive_terminal_release_frame: dict[str, int] = {}
+    passive_terminal_dwell_steps = max(1, int(round(0.25 / dt)))
     last_targets: dict[str, np.ndarray] = {}
+    last_target_corrections: dict[str, dict[str, Any]] = {}
     samples: list[dict[str, Any]] = []
+    assembly_locks: dict[str, dict[str, Any]] = {}
 
     app_utils.play(commit=True)
     app.update()
@@ -682,6 +966,12 @@ def render_complete_physics_video(
     else:
         capture = None
     output_index = 0
+    assembly_hold_report: dict[str, Any] = {
+        "enabled": False,
+        "seconds": 0.0,
+        "samples": 0,
+        "contact_observed": {},
+    }
     try:
         for frame_id in range(0, output_end + 1):
             key = f"{frame_id:06d}"
@@ -699,23 +989,84 @@ def render_complete_physics_video(
                         reference_part,
                         world_from_body,
                     )
+                    correction = assembly_target_translation(
+                        simulation,
+                        part=part,
+                        frame_id=frame_id,
+                        reference_rotation=world_from_body[:3, :3],
+                    )
+                    target[:3, 3] += correction["translation_world_m"]
                     last_targets[part] = target
-                    ghosts[part]["transform_op"].Set(np_to_gf_matrix(target))
+                    last_target_corrections[part] = {
+                        "enabled": bool(correction["enabled"]),
+                        "fraction": float(correction["fraction"]),
+                        "translation_reference_m": np.asarray(
+                            correction["translation_reference_m"], dtype=float
+                        ).tolist(),
+                        "translation_world_m": np.asarray(
+                            correction["translation_world_m"], dtype=float
+                        ).tolist(),
+                        "source": correction["source"],
+                    }
                     observable = states[part] not in UNOBSERVABLE_STATES
-                    _set_visibility(ghosts[part]["root"], observable)
+                    if part in ghosts:
+                        ghosts[part]["transform_op"].Set(
+                            np_to_gf_matrix(target)
+                        )
+                        _set_visibility(ghosts[part]["root"], observable)
                     if observable and not active[part]:
                         set_pose(views[part], target, zero_velocity=False)
-                        set_kinematic(rigid_prims[part], False)
-                        views[part].set_velocities(
-                            linear_velocities=[[0.0, 0.0, 0.0]],
-                            angular_velocities=[[0.0, 0.0, 0.0]],
+                        activate_as_kinematic = bool(
+                            tube_constrained_assembly
+                            and frame_id < int(passive_hold_start_frame)
                         )
+                        set_kinematic(
+                            rigid_prims[part],
+                            activate_as_kinematic,
+                        )
+                        if not activate_as_kinematic:
+                            views[part].set_velocities(
+                                linear_velocities=[[0.0, 0.0, 0.0]],
+                                angular_velocities=[[0.0, 0.0, 0.0]],
+                            )
                         _set_collisions(stage, collider_paths[part], True)
                         PhysxSchema.PhysxRigidBodyAPI.Apply(
                             rigid_prims[part]
-                        ).CreateEnableCCDAttr().Set(True)
+                        ).CreateEnableCCDAttr().Set(not activate_as_kinematic)
                         _set_visibility(roots[part], True)
                         active[part] = True
+
+                if tube_constrained_assembly:
+                    for part in dynamic_parts:
+                        if not active[part]:
+                            continue
+                        if frame_id < int(passive_hold_start_frame):
+                            set_kinematic(rigid_prims[part], True)
+                            set_pose(
+                                views[part],
+                                last_targets[part],
+                                zero_velocity=False,
+                            )
+                        elif not passive_terminal_latched[part]:
+                            # The preceding phases are explicitly hand-constrained.
+                            # Release exactly from the separately validated physical
+                            # projection, rather than carrying controller collision
+                            # error into the passive terminal validation.
+                            set_pose(
+                                views[part],
+                                last_targets[part],
+                                zero_velocity=False,
+                            )
+                            set_kinematic(rigid_prims[part], False)
+                            PhysxSchema.PhysxRigidBodyAPI.Apply(
+                                rigid_prims[part]
+                            ).CreateEnableCCDAttr().Set(True)
+                            views[part].set_velocities(
+                                linear_velocities=[[0.0, 0.0, 0.0]],
+                                angular_velocities=[[0.0, 0.0, 0.0]],
+                            )
+                            passive_terminal_latched[part] = True
+                            passive_terminal_release_frame[part] = frame_id
 
             latest_controls = {
                 part: {
@@ -726,13 +1077,32 @@ def render_complete_physics_video(
                     "controller_mode": "inactive",
                     "controller_frequency_radps": 0.0,
                     "controller_damping_ratio": 0.0,
+                    "external_force_world_n": [0.0, 0.0, 0.0],
+                    "external_torque_world_nm": [0.0, 0.0, 0.0],
                 }
                 for part in dynamic_parts
             }
             if frame_record is not None:
-                for _ in range(physics_steps):
+                for physics_step_index in range(physics_steps):
                     for part in dynamic_parts:
                         if active[part]:
+                            if (
+                                tube_constrained_assembly
+                                and frame_id < int(passive_hold_start_frame)
+                            ):
+                                latest_controls[part] = {
+                                    "force_world_n": [0.0, 0.0, 0.0],
+                                    "torque_world_nm": [0.0, 0.0, 0.0],
+                                    "external_force_world_n": [0.0, 0.0, 0.0],
+                                    "external_torque_world_nm": [0.0, 0.0, 0.0],
+                                    "force_saturated": False,
+                                    "torque_saturated": False,
+                                    "controller_mode": "external_kinematic_hand_constraint",
+                                    "controller_frequency_radps": 0.0,
+                                    "controller_rotation_frequency_radps": 0.0,
+                                    "controller_damping_ratio": 0.0,
+                                }
+                                continue
                             current_pose, _linear, _angular = _read_state(
                                 views[part]
                             )
@@ -767,14 +1137,170 @@ def render_complete_physics_video(
                                 ),
                                 settled_settings=settled_settings,
                             )
-                            latest_controls[part] = _control(
-                                views[part],
-                                last_targets[part],
-                                controller_parameters[part],
-                                float(profile["frequency_radps"]),
-                                float(profile["damping_ratio"]),
-                                str(profile["mode"]),
+                            trajectory_external_force = None
+                            trajectory_external_torque = None
+                            trajectory_angular_frequency = None
+                            if (
+                                trajectory_preload_start is not None
+                                and frame_id >= int(trajectory_preload_start)
+                                and states[part] in settled_settings["states"]
+                            ):
+                                elapsed = (
+                                    frame_id - int(trajectory_preload_start)
+                                    + (physics_step_index + 1) / physics_steps
+                                ) / float(args.fps)
+                                if elapsed <= trajectory_preload_ramp_start:
+                                    preload_fraction = 0.0
+                                elif trajectory_preload_ramp_end <= (
+                                    trajectory_preload_ramp_start
+                                ):
+                                    preload_fraction = 1.0
+                                else:
+                                    preload_fraction = float(np.clip(
+                                        (elapsed - trajectory_preload_ramp_start)
+                                        / (
+                                            trajectory_preload_ramp_end
+                                            - trajectory_preload_ramp_start
+                                        ),
+                                        0.0,
+                                        1.0,
+                                    ))
+                                initial_value, final_value = (
+                                    trajectory_preload_vectors[part]
+                                )
+                                preload_reference_value = (
+                                    (1.0 - preload_fraction) * initial_value
+                                    + preload_fraction * final_value
+                                )
+                                trajectory_external_force = (
+                                    world_from_body[:3, :3]
+                                    @ preload_reference_value
+                                )
+                                trajectory_angular_frequency = float(
+                                    simulation.get(
+                                        "assembly_hold_rotation_frequency_radps",
+                                        settled_settings["frequency_radps"],
+                                    )
+                                )
+                            tube_wrench = None
+                            if (
+                                physics_refinement is not None
+                                and part == str(simulation["inserted_part"])
+                                and frame_id >= int(tube_start_frame)
+                            ):
+                                tube_wrench = elastic_tube_wrench(
+                                    position_world=current_pose[:3, 3],
+                                    rotation_world_from_part=current_pose[:3, :3],
+                                    linear_velocity_world=_linear,
+                                    angular_velocity_world=_angular,
+                                    body_axis_origin_world=body_axis_origin_world,
+                                    body_axis_world=body_axis_world,
+                                    tube=physics_refinement["tube"],
+                                )
+                                trajectory_external_force = np.asarray(
+                                    tube_wrench["force_world_n"], dtype=np.float64
+                                )
+                                trajectory_external_torque = np.asarray(
+                                    tube_wrench["torque_world_nm"], dtype=np.float64
+                                )
+                            passive_tube_hold = bool(
+                                physics_refinement is not None
+                                and part == str(simulation["inserted_part"])
+                                and frame_id >= int(passive_hold_start_frame)
+                                and passive_terminal_latched[part]
                             )
+                            if (
+                                physics_refinement is not None
+                                and part == str(simulation["inserted_part"])
+                                and frame_id >= int(passive_hold_start_frame)
+                                and not passive_terminal_latched[part]
+                            ):
+                                rotation_error_deg = math.degrees(float(np.linalg.norm(
+                                    _rotation_error_vector(
+                                        current_pose[:3, :3],
+                                        last_targets[part][:3, :3],
+                                    )
+                                )))
+                                contact_ready = bool(
+                                    _contact_snapshot(views[part], dt).get("count", 0) > 0
+                                )
+                                terminal_ready = bool(
+                                    current_position_error <= 0.002
+                                    and rotation_error_deg <= 2.0
+                                    and float(np.linalg.norm(_linear)) <= 0.01
+                                    and float(np.linalg.norm(_angular)) <= 0.1
+                                    and contact_ready
+                                )
+                                passive_terminal_ready_steps[part] = (
+                                    passive_terminal_ready_steps[part] + 1
+                                    if terminal_ready
+                                    else 0
+                                )
+                                if (
+                                    passive_terminal_ready_steps[part]
+                                    >= passive_terminal_dwell_steps
+                                ):
+                                    passive_terminal_latched[part] = True
+                                    passive_terminal_release_frame[part] = frame_id
+                                    passive_tube_hold = True
+                            if passive_tube_hold:
+                                views[part].apply_forces_and_torques_at_pos(
+                                    forces=[trajectory_external_force.tolist()],
+                                    torques=[trajectory_external_torque.tolist()],
+                                    local_frame=False,
+                                )
+                                latest_controls[part] = {
+                                    "force_world_n": trajectory_external_force.tolist(),
+                                    "torque_world_nm": trajectory_external_torque.tolist(),
+                                    "external_force_world_n": trajectory_external_force.tolist(),
+                                    "external_torque_world_nm": trajectory_external_torque.tolist(),
+                                    "force_saturated": bool(tube_wrench["force_saturated"]),
+                                    "torque_saturated": bool(tube_wrench["torque_saturated"]),
+                                    "controller_mode": "passive_tube_terminal_hold",
+                                    "controller_frequency_radps": 0.0,
+                                    "controller_rotation_frequency_radps": 0.0,
+                                    "controller_damping_ratio": 0.0,
+                                    "tube_radial_deflection_m": float(tube_wrench["radial_deflection_m"]),
+                                    "tube_bend_angle_deg": float(tube_wrench["bend_angle_deg"]),
+                                    "tube_elastic_energy_j": float(tube_wrench["elastic_energy_j"]),
+                                }
+                            else:
+                                control_frequency = float(profile["frequency_radps"])
+                                control_damping = float(profile["damping_ratio"])
+                                control_rotation_frequency = trajectory_angular_frequency
+                                if (
+                                    physics_refinement is not None
+                                    and part == str(simulation["inserted_part"])
+                                    and frame_id >= int(passive_hold_start_frame)
+                                ):
+                                    control_frequency = max(
+                                        float(args.controller_frequency), 24.0
+                                    )
+                                    control_damping = max(control_damping, 1.25)
+                                    control_rotation_frequency = control_frequency
+                                latest_controls[part] = _control(
+                                    views[part],
+                                    last_targets[part],
+                                    controller_parameters[part],
+                                    control_frequency,
+                                    control_damping,
+                                    (
+                                        "external_constraint_plus_tube"
+                                        if tube_wrench is not None
+                                        else str(profile["mode"])
+                                    ),
+                                    external_force_world=trajectory_external_force,
+                                    external_torque_world=trajectory_external_torque,
+                                    angular_natural_frequency=(
+                                        control_rotation_frequency
+                                    ),
+                                )
+                                if tube_wrench is not None:
+                                    latest_controls[part].update({
+                                        "tube_radial_deflection_m": float(tube_wrench["radial_deflection_m"]),
+                                        "tube_bend_angle_deg": float(tube_wrench["bend_angle_deg"]),
+                                        "tube_elastic_energy_j": float(tube_wrench["elastic_energy_j"]),
+                                    })
                     SimulationManager.step(steps=1)
 
             if frame_id < output_start:
@@ -793,6 +1319,21 @@ def render_complete_physics_video(
                 for part in dynamic_parts
                 if active[part]
             }
+            if tube_visual is not None and str(simulation["inserted_part"]) in snapshots:
+                actual_pose = np.asarray(
+                    snapshots[str(simulation["inserted_part"])]["T_world_from_part"],
+                    dtype=np.float64,
+                )
+                runtime.update_tube_visual(
+                    tube_visual,
+                    runtime.tube_curve_points(
+                        position_world=actual_pose[:3, 3],
+                        rotation_world_from_part=actual_pose[:3, :3],
+                        body_axis_origin_world=body_axis_origin_world,
+                        body_axis_world=body_axis_world,
+                        tube=physics_refinement["tube"],
+                    ),
+                )
             blocked_parts = [
                 part
                 for part in dynamic_parts
@@ -809,10 +1350,20 @@ def render_complete_physics_video(
                     for part in dynamic_parts
                     if active[part]
                 },
+                "passive_terminal_latched": {
+                    part: passive_terminal_latched[part]
+                    for part in dynamic_parts
+                    if active[part]
+                },
                 "blocked_parts": blocked_parts,
                 "blocked": bool(blocked_parts),
                 "actual": snapshots,
                 "contacts": contacts,
+                "target_corrections": {
+                    part: last_target_corrections[part]
+                    for part in dynamic_parts
+                    if part in last_target_corrections
+                },
             }
             samples.append(sample)
             if capture is not None:
@@ -824,6 +1375,8 @@ def render_complete_physics_video(
                     snapshots,
                     contacts,
                     dynamic_parts,
+                    target_is_contact_corrected,
+                    tube_constrained_assembly,
                 ).save(
                     frame_dir / f"{output_index:06d}.jpg",
                     quality=94,
@@ -835,6 +1388,346 @@ def render_complete_physics_video(
                     f"{output_end - output_start + 1} "
                     f"(trajectory frame {frame_id:03d})",
                     flush=True,
+                )
+        hold_seconds = float(simulation.get("assembly_hold_seconds", 0.0))
+        hold_contact_observed = {part: False for part in dynamic_parts}
+        hold_contact_history = {part: [] for part in dynamic_parts}
+        preload_reference_initial = (
+            {}
+            if tube_constrained_assembly
+            else dict(simulation.get("assembly_hold_preload_forces_reference_n", {}))
+        )
+        preload_reference_final = (
+            {}
+            if tube_constrained_assembly
+            else dict(
+                simulation.get(
+                    "assembly_hold_final_preload_forces_reference_n",
+                    preload_reference_initial,
+                )
+            )
+        )
+        preload_initial: dict[str, np.ndarray] = {}
+        preload_final: dict[str, np.ndarray] = {}
+        for part in dynamic_parts:
+            initial_value = np.asarray(
+                preload_reference_initial.get(part, [0.0, 0.0, 0.0]),
+                dtype=np.float64,
+            )
+            final_value = np.asarray(
+                preload_reference_final.get(part, initial_value),
+                dtype=np.float64,
+            )
+            if (
+                initial_value.shape != (3,)
+                or final_value.shape != (3,)
+                or not np.isfinite(initial_value).all()
+                or not np.isfinite(final_value).all()
+            ):
+                raise ValueError(
+                    "assembly hold preload force values must "
+                    "contain three finite values"
+                )
+            preload_initial[part] = initial_value
+            preload_final[part] = final_value
+        preload_ramp_start = float(
+            simulation.get("assembly_hold_preload_ramp_start_seconds", 0.0)
+        )
+        if preload_ramp_start < 0.0 or preload_ramp_start > hold_seconds:
+            raise ValueError(
+                "assembly_hold_preload_ramp_start_seconds must be within hold"
+            )
+        current_preload_world = {
+            part: world_from_body[:3, :3] @ preload_initial[part]
+            for part in dynamic_parts
+        }
+        if hold_seconds > 0.0 and last_targets:
+            hold_steps = max(1, int(math.ceil(hold_seconds / dt)))
+            capture_interval = max(
+                1, int(round(1.0 / (dt * float(args.fps))))
+            )
+            hold_frames = 0
+            for hold_step in range(hold_steps):
+                elapsed = float(hold_step + 1) * dt
+                if hold_seconds <= preload_ramp_start:
+                    preload_fraction = 0.0
+                else:
+                    preload_fraction = float(np.clip(
+                        (elapsed - preload_ramp_start)
+                        / (hold_seconds - preload_ramp_start),
+                        0.0,
+                        1.0,
+                    ))
+                current_preload_world = {
+                    part: world_from_body[:3, :3]
+                    @ (
+                        (1.0 - preload_fraction) * preload_initial[part]
+                        + preload_fraction * preload_final[part]
+                    )
+                    for part in dynamic_parts
+                }
+                latest_controls = {}
+                for part in dynamic_parts:
+                    if not active[part]:
+                        continue
+                    if (
+                        physics_refinement is not None
+                        and part == str(simulation["inserted_part"])
+                    ):
+                        current_pose, linear, angular = _read_state(views[part])
+                        wrench = elastic_tube_wrench(
+                            position_world=current_pose[:3, 3],
+                            rotation_world_from_part=current_pose[:3, :3],
+                            linear_velocity_world=linear,
+                            angular_velocity_world=angular,
+                            body_axis_origin_world=body_axis_origin_world,
+                            body_axis_world=body_axis_world,
+                            tube=physics_refinement["tube"],
+                        )
+                        if not passive_terminal_latched[part]:
+                            position_error = float(np.linalg.norm(
+                                last_targets[part][:3, 3] - current_pose[:3, 3]
+                            ))
+                            rotation_error_deg = math.degrees(float(np.linalg.norm(
+                                _rotation_error_vector(
+                                    current_pose[:3, :3],
+                                    last_targets[part][:3, :3],
+                                )
+                            )))
+                            contact_ready = bool(
+                                _contact_snapshot(views[part], dt).get("count", 0) > 0
+                            )
+                            terminal_ready = bool(
+                                position_error <= 0.002
+                                and rotation_error_deg <= 2.0
+                                and float(np.linalg.norm(linear)) <= 0.01
+                                and float(np.linalg.norm(angular)) <= 0.1
+                                and contact_ready
+                            )
+                            passive_terminal_ready_steps[part] = (
+                                passive_terminal_ready_steps[part] + 1
+                                if terminal_ready
+                                else 0
+                            )
+                            if (
+                                passive_terminal_ready_steps[part]
+                                >= passive_terminal_dwell_steps
+                            ):
+                                passive_terminal_latched[part] = True
+                                passive_terminal_release_frame[part] = (
+                                    output_end
+                                    + max(1, int(round(elapsed * float(args.fps))))
+                                )
+                        if passive_terminal_latched[part]:
+                            views[part].apply_forces_and_torques_at_pos(
+                                forces=[wrench["force_world_n"].tolist()],
+                                torques=[wrench["torque_world_nm"].tolist()],
+                                local_frame=False,
+                            )
+                            latest_controls[part] = {
+                                "force_world_n": wrench["force_world_n"].tolist(),
+                                "torque_world_nm": wrench["torque_world_nm"].tolist(),
+                                "external_force_world_n": wrench["force_world_n"].tolist(),
+                                "external_torque_world_nm": wrench["torque_world_nm"].tolist(),
+                                "force_saturated": bool(wrench["force_saturated"]),
+                                "torque_saturated": bool(wrench["torque_saturated"]),
+                                "controller_mode": "passive_tube_terminal_hold",
+                                "controller_frequency_radps": 0.0,
+                                "controller_rotation_frequency_radps": 0.0,
+                                "controller_damping_ratio": 0.0,
+                                "tube_radial_deflection_m": float(wrench["radial_deflection_m"]),
+                                "tube_bend_angle_deg": float(wrench["bend_angle_deg"]),
+                                "tube_elastic_energy_j": float(wrench["elastic_energy_j"]),
+                            }
+                        else:
+                            latest_controls[part] = _control(
+                                views[part],
+                                last_targets[part],
+                                controller_parameters[part],
+                                max(float(args.controller_frequency), 24.0),
+                                1.25,
+                                "terminal_pose_acquisition_plus_tube",
+                                external_force_world=np.asarray(
+                                    wrench["force_world_n"], dtype=np.float64
+                                ),
+                                external_torque_world=np.asarray(
+                                    wrench["torque_world_nm"], dtype=np.float64
+                                ),
+                                angular_natural_frequency=max(
+                                    float(args.controller_frequency), 24.0
+                                ),
+                            )
+                            latest_controls[part].update({
+                                "tube_radial_deflection_m": float(wrench["radial_deflection_m"]),
+                                "tube_bend_angle_deg": float(wrench["bend_angle_deg"]),
+                                "tube_elastic_energy_j": float(wrench["elastic_energy_j"]),
+                            })
+                    else:
+                        latest_controls[part] = _control(
+                            views[part],
+                            last_targets[part],
+                            controller_parameters[part],
+                            float(settled_settings["frequency_radps"]),
+                            float(settled_settings["damping_ratio"]),
+                            "assembly_hold",
+                            external_force_world=current_preload_world[part],
+                            angular_natural_frequency=float(
+                                simulation.get(
+                                    "assembly_hold_rotation_frequency_radps",
+                                    settled_settings["frequency_radps"],
+                                )
+                            ),
+                        )
+                SimulationManager.step(steps=1)
+                contacts_now = {
+                    part: _contact_snapshot(views[part], dt)
+                    for part in dynamic_parts
+                    if active[part]
+                }
+                for part, contact in contacts_now.items():
+                    has_contact = bool(contact.get("count", 0) > 0)
+                    hold_contact_observed[part] |= has_contact
+                    hold_contact_history[part].append(has_contact)
+                if (
+                    hold_step % capture_interval != capture_interval - 1
+                    and hold_step != hold_steps - 1
+                ):
+                    continue
+                snapshots = {
+                    part: _snapshot(
+                        views[part],
+                        last_targets[part],
+                        latest_controls[part],
+                    )
+                    for part in dynamic_parts
+                    if active[part]
+                }
+                if tube_visual is not None and str(simulation["inserted_part"]) in snapshots:
+                    actual_pose = np.asarray(
+                        snapshots[str(simulation["inserted_part"])]["T_world_from_part"],
+                        dtype=np.float64,
+                    )
+                    runtime.update_tube_visual(
+                        tube_visual,
+                        runtime.tube_curve_points(
+                            position_world=actual_pose[:3, 3],
+                            rotation_world_from_part=actual_pose[:3, :3],
+                            body_axis_origin_world=body_axis_origin_world,
+                            body_axis_world=body_axis_world,
+                            tube=physics_refinement["tube"],
+                        ),
+                    )
+                hold_frame_id = output_end + hold_frames + 1
+                sample = {
+                    "frame_id": hold_frame_id,
+                    "states": {
+                        part: "assembly_hold" for part in dynamic_parts
+                    },
+                    "active_parts": [
+                        part for part in dynamic_parts if active[part]
+                    ],
+                    "settled_contact_latched": {
+                        part: hold_contact_observed[part]
+                        for part in dynamic_parts
+                        if active[part]
+                    },
+                    "blocked_parts": [],
+                    "blocked": False,
+                    "actual": snapshots,
+                    "contacts": contacts_now,
+                    "target_corrections": {
+                        part: last_target_corrections[part]
+                        for part in dynamic_parts
+                        if part in last_target_corrections
+                    },
+                }
+                samples.append(sample)
+                if capture is not None:
+                    rendered_views = capture.capture()
+                    _compose(
+                        rendered_views,
+                        hold_frame_id,
+                        sample["states"],
+                        snapshots,
+                        contacts_now,
+                        dynamic_parts,
+                        target_is_contact_corrected,
+                        tube_constrained_assembly,
+                    ).save(
+                        frame_dir / f"{output_index:06d}.jpg",
+                        quality=94,
+                    )
+                output_index += 1
+                hold_frames += 1
+            contact_gate = {
+                part: sustained_contact_summary(
+                    hold_contact_history[part],
+                    physics_dt=dt,
+                    settings=dict(simulation.get("assembly_lock", {})),
+                )
+                for part in dynamic_parts
+            }
+            assembly_hold_report = {
+                "enabled": True,
+                "seconds": hold_seconds,
+                "physics_steps": hold_steps,
+                "samples": hold_frames,
+                "contact_observed": hold_contact_observed,
+                "contact_gate": contact_gate,
+                "initial_preload_forces_reference_n": {
+                    part: preload_initial[part].tolist()
+                    for part in dynamic_parts
+                },
+                "final_preload_forces_reference_n": {
+                    part: preload_final[part].tolist()
+                    for part in dynamic_parts
+                },
+                "final_preload_forces_world_n": {
+                    part: current_preload_world[part].tolist()
+                    for part in dynamic_parts
+                },
+                "preload_ramp_start_seconds": preload_ramp_start,
+                "rotation_frequency_radps": float(
+                    simulation.get(
+                        "assembly_hold_rotation_frequency_radps",
+                        settled_settings["frequency_radps"],
+                    )
+                ),
+            }
+
+        lock_settings = dict(simulation.get("assembly_lock", {}))
+        if tube_constrained_assembly:
+            lock_settings["enabled"] = False
+        if samples:
+            final_actual = samples[-1]["actual"]
+            for part in dynamic_parts:
+                if part not in final_actual:
+                    continue
+                achieved = np.asarray(
+                    final_actual[part]["T_world_from_part"],
+                    dtype=np.float64,
+                )
+                assembly_locks[part] = _author_fixed_assembly_lock(
+                    stage,
+                    reference_part=reference_part,
+                    moving_part=part,
+                    moving_prim=rigid_prims[part],
+                    achieved_world_pose=achieved,
+                    position_error_m=float(
+                        final_actual[part]["position_error_m"]
+                    ),
+                    rotation_error_deg=float(
+                        final_actual[part]["rotation_error_deg"]
+                    ),
+                    contact_observed=bool(
+                        hold_contact_observed.get(part, False)
+                    ),
+                    contact_sustained=bool(
+                        assembly_hold_report.get("contact_gate", {})
+                        .get(part, {})
+                        .get("sustained", False)
+                    ),
+                    settings=lock_settings,
                 )
     finally:
         if capture is not None:
@@ -884,20 +1777,49 @@ def render_complete_physics_video(
             for path in contact.get("other_actor_paths", [])
         }
     )
+    lock_required = bool(
+        simulation.get("assembly_lock", {}).get("enabled", False)
+        and not tube_constrained_assembly
+    )
+    assembly_lock_passed = bool(
+        not lock_required
+        or (
+            assembly_locks
+            and all(
+                bool(result.get("qualified", False))
+                for result in assembly_locks.values()
+            )
+        )
+    )
+    passive_release_passed = bool(
+        not tube_constrained_assembly
+        or all(passive_terminal_latched.values())
+    )
     physics_validation = {
-        "passed": not blocked_ids,
+        "passed": (
+            not blocked_ids
+            and assembly_lock_passed
+            and passive_release_passed
+        ),
         "blocked_frame_count": len(blocked_ids),
         "blocked_frame_ranges": blocked_ranges,
         "maximum_position_error_m": maximum_position_error,
         "maximum_rotation_error_deg": maximum_rotation_error,
         "contact_actor_paths": contact_actor_paths,
         "blocked_error_threshold_m": float(args.blocked_error_m),
+        "assembly_lock_required": lock_required,
+        "assembly_lock_passed": assembly_lock_passed,
+        "passive_terminal_release_passed": passive_release_passed,
     }
     report = {
         "schema_version": 1,
         "status": "complete",
         "mode": (
-            "complete force-controlled PhysX trajectory"
+            "complete hand-constrained trajectory with passive physical terminal hold"
+            if tube_constrained_assembly and capture_enabled
+            else "physics-only hand-constrained trajectory with passive physical terminal hold"
+            if tube_constrained_assembly
+            else "complete force-controlled PhysX trajectory"
             if capture_enabled
             else "physics-only force-controlled PhysX trajectory"
         ),
@@ -905,6 +1827,7 @@ def render_complete_physics_video(
         "scene_usd": str(scene_path),
         "asset_root": str(asset_root),
         "runtime_root": str(runtime_root),
+        "trajectory": str(Path(args.trajectory).resolve()),
         "fps": float(args.fps),
         "physics_hz": int(round(1.0 / dt)),
         "physics_steps_per_target": physics_steps,
@@ -914,17 +1837,55 @@ def render_complete_physics_video(
         "duration_s": len(samples) / float(args.fps),
         "controller_frequency_radps": float(args.controller_frequency),
         "controller_parameters": controller_parameters,
+        "trajectory_assembly_control": {
+            "enabled": trajectory_preload_start is not None,
+            "start_frame": trajectory_preload_start,
+            "preload_ramp_start_seconds": trajectory_preload_ramp_start,
+            "preload_ramp_end_seconds": trajectory_preload_ramp_end,
+        },
         "settled_contact_control": settled_settings,
         "contact_offsets": contact_offsets,
         "floor_top_z": floor_top_z,
         "first_blocked_frame": first_blocked,
         "physics_validation": physics_validation,
+        "assembly_locks": assembly_locks,
+        "assembly_hold": assembly_hold_report,
+        "target_corrections_enabled": target_is_contact_corrected,
+        "tube_constrained_assembly": {
+            "enabled": tube_constrained_assembly,
+            "tube_force_start_frame": tube_start_frame,
+            "passive_terminal_hold_start_frame": passive_hold_start_frame,
+            "external_kinematic_constraint_before_terminal_hold": tube_constrained_assembly,
+            "pose_controller_enabled_before_terminal_hold": False if tube_constrained_assembly else True,
+            "pose_controller_enabled_during_terminal_hold": False if tube_constrained_assembly else None,
+            "passive_release_requires_state_gate": False if tube_constrained_assembly else None,
+            "release_pose_source": "trajectory_physics_refined" if tube_constrained_assembly else None,
+            "passive_release_dwell_seconds": 0.0 if tube_constrained_assembly else None,
+            "passive_release_frame": passive_terminal_release_frame,
+            "axial_preload_enabled": False if tube_constrained_assembly else trajectory_preload_start is not None,
+            "fixed_joint_enabled": False if tube_constrained_assembly else lock_required,
+            "tube_visual": tube_visual_report,
+        },
         "samples": samples,
         "interpretation": (
             "Textured meshes are actual PhysX rigid-body poses. Transparent "
-            "colored meshes are pose-solver targets. Once a part becomes "
-            "observable, its pose is controlled only by bounded forces and "
-            "torques while collision remains enabled."
+            "cyan meshes use the same visual geometry and show "
+            + (
+                "explicit contact-corrected targets. "
+                if target_is_contact_corrected
+                else "the unmodified trajectory targets. "
+            )
+            + (
+                "Before terminal hold, an external kinematic constraint represents "
+                "the unmodelled hand and follows the observed trajectory exactly. "
+                "At the assembled phase the body is released from the independently "
+                "validated physical projection; terminal hold uses only contact, "
+                "gravity, and tube elasticity, with no pose controller, FixedJoint, "
+                "or axial preload."
+                if tube_constrained_assembly
+                else "Once a part becomes observable, its pose is controlled only by "
+                "bounded forces and torques while collision remains enabled."
+            )
         ),
     }
     write_json(output_root / "complete_physics_video_report.json", report)

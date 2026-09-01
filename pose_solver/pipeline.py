@@ -552,6 +552,20 @@ def inspect_result(config: PipelineConfig) -> dict[str, Any]:
             "simulation_ready": connectors.get("simulation_ready", False),
             "failures": connectors.get("failures", {}),
         }
+    assembly_path = (
+        layout.pose_output / "diagnostics" / "assembly_task_readiness.json"
+    )
+    if assembly_path.is_file():
+        assembly = load_json(assembly_path)
+        result["assembly_task_readiness"] = {
+            "path": str(assembly_path),
+            "pose_product_ready": assembly.get("pose_product_ready", False),
+            "physics_replay_ready": assembly.get(
+                "physics_replay_ready", False
+            ),
+            "pose_failures": assembly.get("pose_failures", []),
+            "physics_blockers": assembly.get("physics_blockers", []),
+        }
     regression = config.raw.get("regression", {})
     baseline_value = regression.get("trajectory")
     if baseline_value:

@@ -1,0 +1,269 @@
+{
+  "asset_name": "object4_0827_tubeless_nozzle",
+  "trajectory": "/data_ft_9_10/wentai/projects/pose_solver/experiments/objects_0827/Object-4/simulation_ready/pose/pose/trajectory_final.json",
+  "meshes": {
+    "sprayer_pump": "/data_ft_9_10/wentai/projects/pose_solver/experiments/objects_0827/Object-4/simulation_ready/simulation_inputs/meshes/sprayer_pump.glb",
+    "bottle_body": "/data_ft_9_10/wentai/projects/pose_solver/experiments/objects_0827/Object-4/simulation_ready/simulation_inputs/meshes/bottle_body.glb"
+  },
+  "output_dir": "/data_ft_9_10/wentai/projects/pose_solver/experiments/objects_0827/Object-4/simulation_ready/simulation_assets",
+  "reference_part": "bottle_body",
+  "display_parts": ["sprayer_pump", "bottle_body"],
+  "mass_kg": {
+    "sprayer_pump": 0.07717580575658799,
+    "bottle_body": 0.39371079792352376
+  },
+  "assembly_interface": {
+    "type": "cylindrical_insertion",
+    "reference_part": "bottle_body",
+    "moving_part": "sprayer_pump",
+    "reference_axis_part": [0.0, 1.0, 0.0],
+    "moving_axis_part": [-0.5500436262, 0.0585236035, -0.8330828273],
+    "reference_outer_radius_m": 0.016,
+    "moving_inner_radius_m": 0.0165,
+    "parameter_source": "engineering_estimate",
+    "confidence": "low",
+    "notes": "Initial reusable sleeve contract derived from the existing bottle-neck and collar proxies; replace with measured or CAD dimensions before claiming metric physical accuracy."
+  },
+  "collision_proxies": {
+    "sprayer_pump": {
+      "type": "cylindrical_sleeve",
+      "axis_vector": [-0.5500436262, 0.0585236035, -0.8330828273],
+      "origin_m": [0.03309, -0.00247, 0.02814],
+      "inner_radius_m": 0.0165,
+      "outer_radius_m": 0.018,
+      "axis_min_m": 0.0,
+      "axis_max_m": 0.012,
+      "sections": 24,
+      "parameter_source": "engineering_estimate",
+      "confidence": "low",
+      "interface_role": "moving_sleeve"
+    },
+    "bottle_body": {
+      "type": "compound",
+      "components": [
+        {
+          "type": "cylindrical_container",
+          "axis": "y",
+          "inner_radius_m": 0.046,
+          "outer_radius_m": 0.055,
+          "floor_top_m": -0.075,
+          "rim_top_m": 0.122,
+          "floor_thickness_m": 0.004,
+          "sections": 64
+        },
+        {
+          "type": "annular_cylinder",
+          "axis": "y",
+          "inner_radius_m": 0.0105,
+          "outer_radius_m": 0.052,
+          "axis_min_m": 0.122,
+          "axis_max_m": 0.126,
+          "sections": 64
+        },
+        {
+          "type": "annular_cylinder",
+          "axis": "y",
+          "inner_radius_m": 0.0105,
+          "outer_radius_m": 0.016,
+          "axis_min_m": 0.126,
+          "axis_max_m": 0.132,
+          "sections": 64
+        }
+      ]
+    }
+  },
+  "assembly_targets": {
+    "sprayer_pump": {
+      "frame_range": [496, 500],
+      "required_state": "static",
+      "min_observing_views": 1,
+      "max_translation_residual_m": 0.005,
+      "max_rotation_residual_deg": 2.0
+    }
+  },
+  "simulation": {
+    "container_part": "bottle_body",
+    "inserted_part": "sprayer_pump",
+    "dynamic_collision_approximation": "convexHull",
+    "observed_overlap_carving": {
+      "enabled": false,
+      "penetration_tolerance_m": 0.001,
+      "minimum_reference_vertices": 5,
+      "maximum_removed_fraction": 0.45
+    },
+    "floor_clearance_m": 0.03,
+    "up_axis_body": [0.0, 1.0, 0.0],
+    "inserted_axis_part": [-0.5500436262, 0.0585236035, -0.8330828273],
+    "align_insert_up_axis": false,
+    "observed_replay_frame_range": [350, 500],
+    "physics_hz": 240,
+    "settle_seconds": 3.0,
+    "drop_height_m": 0.03,
+    "static_friction": 0.4,
+    "dynamic_friction": 0.3,
+    "restitution": 0.0,
+    "contact_offset_m": 0.0001,
+    "rest_offset_m": 0.0,
+    "assembly_hold_preload_forces_reference_n": {
+      "sprayer_pump": [0.0, -0.25, 0.0]
+    },
+    "assembly_hold_final_preload_forces_reference_n": {
+      "sprayer_pump": [0.0, -0.12, 0.0]
+    },
+    "assembly_hold_preload_ramp_start_seconds": 1.5,
+    "assembly_trajectory_preload_start_frame": 427,
+    "assembly_trajectory_preload_ramp_start_seconds": 1.5,
+    "assembly_trajectory_preload_ramp_end_seconds": 3.0,
+    "assembly_hold_rotation_frequency_radps": 10.0,
+    "settled_contact_control": {
+      "enabled": true,
+      "states": ["static"],
+      "frequency_radps": 10.0,
+      "damping_ratio": 1.5,
+      "maximum_position_error_m": 0.006
+    },
+    "assembly_lock": {
+      "enabled": true,
+      "maximum_position_error_m": 0.005,
+      "maximum_rotation_error_deg": 2.0,
+      "require_contact": true,
+      "require_sustained_contact": true,
+      "contact_window_seconds": 0.5,
+      "minimum_contact_fraction": 0.25,
+      "maximum_contact_gap_seconds": 0.11
+    },
+    "assembly_hold_seconds": 3.0,
+    "assembly_validation": {
+      "allow_pose_mutation": false,
+      "release_height_m": 0.0,
+      "settle_seconds": 3.0,
+      "contact_window_seconds": 1.0,
+      "minimum_contact_fraction": 0.1,
+      "maximum_contact_gap_seconds": 0.12,
+      "maximum_lateral_error_m": 0.005,
+      "maximum_axial_error_m": 0.008,
+      "maximum_tilt_error_deg": 5.0,
+      "maximum_final_linear_speed_mps": 0.01,
+      "maximum_final_angular_speed_radps": 0.1,
+      "translation_levels_m": [0.001, 0.002, 0.005],
+      "tilt_levels_deg": [1.0, 3.0, 5.0]
+    },
+    "place_release": {
+      "initial_height_m": 0.003,
+      "settle_seconds": 5.0,
+      "contact_window_seconds": 1.0,
+      "minimum_contact_fraction": 0.1,
+      "maximum_contact_gap_seconds": 0.12,
+      "maximum_lateral_error_m": 0.005,
+      "maximum_axial_error_m": 0.008,
+      "maximum_tilt_error_deg": 5.0,
+      "maximum_final_linear_speed_mps": 0.01,
+      "maximum_final_angular_speed_radps": 0.1,
+      "trials": [
+        {
+          "name": "centered",
+          "xy_offset_m": [0.0, 0.0],
+          "tilt_deg": [0.0, 0.0],
+          "yaw_deg": 0.0
+        },
+        {
+          "name": "offset_x_plus_1mm",
+          "xy_offset_m": [0.001, 0.0],
+          "tilt_deg": [0.0, 0.0],
+          "yaw_deg": 0.0
+        },
+        {
+          "name": "offset_x_minus_1mm",
+          "xy_offset_m": [-0.001, 0.0],
+          "tilt_deg": [0.0, 0.0],
+          "yaw_deg": 0.0
+        },
+        {
+          "name": "tilt_x_plus_1deg",
+          "xy_offset_m": [0.0, 0.0],
+          "tilt_deg": [1.0, 0.0],
+          "yaw_deg": 0.0
+        },
+        {
+          "name": "tilt_x_minus_1deg",
+          "xy_offset_m": [0.0, 0.0],
+          "tilt_deg": [-1.0, 0.0],
+          "yaw_deg": 0.0
+        }
+      ]
+    },
+    "physics_pose_refinement": {
+      "enabled": true,
+      "apply_frame_range": [417, 427],
+      "settle_seconds": 3.0,
+      "initial_height_m": 0.002,
+      "sample_seconds": 0.1,
+      "maximum_visual_translation_m": 0.005,
+      "maximum_visual_tilt_deg": 3.0,
+      "maximum_final_linear_speed_mps": 0.01,
+      "maximum_final_angular_speed_radps": 0.1,
+      "maximum_penetration_m": 0.002,
+      "require_contact": true,
+      "tube": {
+        "enabled": true,
+        "mount_point_part_m": [0.03529, -0.00271, 0.03147],
+        "direction_part": [0.5500436262, -0.0585236035, 0.8330828273],
+        "body_axis_origin_body_m": [-0.003379, 0.12893, 0.005159],
+        "length_m": 0.205,
+        "radius_m": 0.0018,
+        "guide_depth_m": 0.025,
+        "lateral_stiffness_n_per_m": 8.0,
+        "lateral_damping_ns_per_m": 0.12,
+        "angular_stiffness_nm_per_rad": 0.06,
+        "angular_damping_nms_per_rad": 0.008,
+        "maximum_force_n": 0.5,
+        "maximum_torque_nm": 0.08
+      },
+      "score_weights": {
+        "visual_translation": 1.0,
+        "visual_tilt": 1.0,
+        "linear_speed": 1.0,
+        "angular_speed": 1.0,
+        "penetration": 2.0,
+        "missing_contact": 25.0,
+        "tube_energy": 0.25
+      },
+      "candidates": [
+        {"name": "visual_pose", "xy_offset_m": [0.0, 0.0], "tilt_deg": [0.0, 0.0]},
+        {"name": "x_plus_2mm", "xy_offset_m": [0.002, 0.0], "tilt_deg": [0.0, 0.0]},
+        {"name": "x_minus_2mm", "xy_offset_m": [-0.002, 0.0], "tilt_deg": [0.0, 0.0]},
+        {"name": "y_plus_2mm", "xy_offset_m": [0.0, 0.002], "tilt_deg": [0.0, 0.0]},
+        {"name": "y_minus_2mm", "xy_offset_m": [0.0, -0.002], "tilt_deg": [0.0, 0.0]},
+        {"name": "tilt_x_plus_2deg", "xy_offset_m": [0.0, 0.0], "tilt_deg": [2.0, 0.0]},
+        {"name": "tilt_x_minus_2deg", "xy_offset_m": [0.0, 0.0], "tilt_deg": [-2.0, 0.0]},
+        {"name": "tilt_y_plus_2deg", "xy_offset_m": [0.0, 0.0], "tilt_deg": [0.0, 2.0]},
+        {"name": "tilt_y_minus_2deg", "xy_offset_m": [0.0, 0.0], "tilt_deg": [0.0, -2.0]}
+      ]
+    },
+    "success_translation_m": 0.02,
+    "success_rotation_deg": 15.0,
+    "success_linear_speed_mps": 0.03,
+    "success_angular_speed_radps": 0.15,
+    "trials": [
+      {
+        "name": "centered_insert",
+        "xy_offset_m": [0.0, 0.0],
+        "tilt_deg": [0.0, 0.0],
+        "yaw_deg": 0.0
+      },
+      {
+        "name": "offset_2mm_insert",
+        "xy_offset_m": [0.002, 0.0],
+        "tilt_deg": [0.0, 0.0],
+        "yaw_deg": 0.0
+      },
+      {
+        "name": "tilt_2deg_insert",
+        "xy_offset_m": [0.0, 0.0],
+        "tilt_deg": [2.0, 0.0],
+        "yaw_deg": 0.0
+      }
+    ],
+    "mass_note": "Automatically estimated from canonical AABB volume; no measured object mass was supplied."
+  }
+}

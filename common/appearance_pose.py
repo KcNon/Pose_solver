@@ -71,6 +71,73 @@ def carry_pose_orientation(
     return carried
 
 
+def static_temporal_hold_hypotheses(
+    current_pose: np.ndarray,
+    previous_rows: list[dict[str, Any]],
+    *,
+    scale: float,
+    origin: np.ndarray,
+    pose_symmetry: SymmetrySpec | None = None,
+    maximum_candidates: int = 512,
+    duplicate_tolerance_deg: float = 0.25,
+) -> list[dict[str, Any]]:
+    """Carry distinct feasible orientations into the next static anchor.
+
+    A single hold built from the previous *geometry* anchor is insufficient:
+    appearance may have selected a different orientation basin at that anchor.
+    Carrying the scored candidate orientations lets the hard rate constraint
+    preserve a genuinely static pose instead of making the candidate chain
+    infeasible. The candidates are rendered and scored normally at the new
+    anchor; this helper does not copy visual scores across frames.
+    """
+
+    if maximum_candidates < 1:
+        raise ValueError("maximum_candidates must be positive")
+    if duplicate_tolerance_deg < 0.0:
+        raise ValueError("duplicate_tolerance_deg must be non-negative")
+
+    eligible = []
+    for index, row in enumerate(previous_rows):
+        selection_score = float(row.get("selection_score", row["score"]))
+        if (
+            row.get("semantic_candidate_gate_passed") is False
+            or selection_score <= -1.0e11
+        ):
+            continue
+        eligible.append((selection_score, index, row))
+    eligible.sort(key=lambda value: (-value[0], value[1]))
+
+    hypotheses: list[dict[str, Any]] = []
+    rotations: list[np.ndarray] = []
+    for _score, index, row in eligible:
+        previous_pose = np.asarray(
+            row.get("transition_pose", row["pose"]), dtype=np.float64
+        )
+        distance = (
+            rotation_distance_deg
+            if pose_symmetry is None
+            else lambda first, second: symmetry_rotation_distance_deg(
+                first, second, pose_symmetry
+            )
+        )
+        if any(
+            distance(previous_pose, existing) <= duplicate_tolerance_deg
+            for existing in rotations
+        ):
+            continue
+        carried = carry_pose_orientation(current_pose, previous_pose)
+        hypotheses.append({
+            "label": f"static_candidate_hold_{index}",
+            "similarity": similarity_from_rigid(carried, scale, origin),
+            "static_temporal_hold": True,
+            "identity_candidate_only": True,
+        })
+        rotations.append(previous_pose)
+        if len(hypotheses) >= maximum_candidates:
+            break
+    return hypotheses
+
+
 def align_pose_axis(
     pose: np.ndarray,
     axis_raw: np.ndarray,
@@ -891,6 +958,31 @@ def refine_anchor_orientations(
                     ),
                 })
             if (
+                anchor_index > 0
+                and bool(appearance_cfg.get(
+                    "include_static_candidate_holds", True
+                ))
+                and _is_static_transition(
+                    anchor_frames[anchor_index - 1],
+                    anchor_frame,
+                    _range_pairs(state_cfg.get("static_ranges", [])),
+                )
+            ):
+                current_rigid = rigid_from_similarity(
+                    np.asarray(anchors[anchor_frame], dtype=np.float64),
+                    origin,
+                )
+                hypotheses.extend(static_temporal_hold_hypotheses(
+                    current_rigid,
+                    all_candidate_rows[-1],
+                    scale=scale,
+                    origin=origin,
+                    pose_symmetry=symmetry,
+                    maximum_candidates=int(appearance_cfg.get(
+                        "maximum_static_candidate_holds", 512
+                    )),
+                ))
+            if (
                 bool(appearance_cfg.get(
                     "generate_support_aligned_candidates", True
                 ))
@@ -929,7 +1021,16 @@ def refine_anchor_orientations(
                     np.asarray(hypothesis["similarity"], dtype=np.float64),
                     origin,
                 )
-                anchor_candidates = candidates
+                anchor_candidates = (
+                    [{
+                        "label": "identity",
+                        "axis_flipped": False,
+                        "axis_angle_deg": 0.0,
+                        "local_transform": np.eye(4, dtype=np.float64),
+                    }]
+                    if hypothesis.get("identity_candidate_only", False)
+                    else candidates
+                )
                 if (
                     table_yaw_enabled
                     and anchor_frame in table_yaw_frames
@@ -1200,6 +1301,9 @@ def refine_anchor_orientations(
                                 f"{hypothesis['label']}|{candidate['label']}"
                             ),
                             "hypothesis": str(hypothesis["label"]),
+                            "static_temporal_hold": bool(
+                                hypothesis.get("static_temporal_hold", False)
+                            ),
                             "semantic_support_aligned": bool(
                                 hypothesis.get(
                                     "semantic_support_aligned", False
@@ -1365,8 +1469,17 @@ def refine_anchor_orientations(
                     >= minimum_worst_iou
                     and len(row["observations"]) >= minimum_observations
                 )
+                static_hold_fallback = bool(
+                    row.get("static_temporal_hold", False)
+                    and row.get("semantic_candidate_gate_passed", False)
+                )
+                row["static_hold_fallback"] = bool(
+                    static_hold_fallback and not will_apply
+                )
                 row["transition_pose"] = (
-                    row["pose"] if will_apply else fallback_rigid
+                    row["pose"]
+                    if will_apply or static_hold_fallback
+                    else fallback_rigid
                 )
             all_candidate_rows.append(scored_rows)
             per_anchor_report[str(anchor_frame)] = {
@@ -1432,7 +1545,10 @@ def refine_anchor_orientations(
             and float(chosen["worst_silhouette_iou"]) >= minimum_worst_iou
             and len(chosen["observations"]) >= minimum_observations
         )
-        if acceptable:
+        static_hold_fallback = bool(
+            chosen.get("static_hold_fallback", False)
+        )
+        if acceptable or static_hold_fallback:
             updated[anchor_frame] = similarity_from_rigid(
                 chosen["pose"], scale, origin
             )
@@ -1441,7 +1557,12 @@ def refine_anchor_orientations(
                 for key, value in chosen.items()
                 if key not in {"pose", "transition_pose", "observations"}
             }
-            selected_report["appearance_accepted"] = True
+            selected_report["appearance_accepted"] = acceptable
+            if static_hold_fallback:
+                selected_report["fallback"] = "static_temporal_hold"
+                selected_report["reason"] = (
+                    "visual_quality_gate_failed_in_static_interval"
+                )
         else:
             # Sparse first appearances often expose a part in only one or two
             # cameras.  Reject that visual decision locally and retain the

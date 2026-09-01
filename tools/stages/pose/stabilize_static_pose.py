@@ -490,6 +490,20 @@ def main() -> None:
                     str(records[part].get("source", "pose"))
                     + "+rigid_follow_reference"
                 )
+                records[part]["pose_source"] = "assembled_rigid_follow"
+                records[part]["pose_valid"] = True
+                records[part]["state"] = "assembled"
+                observation_state = str(
+                    records[part].get("observation_state", "")
+                )
+                records[part]["observability"] = (
+                    "occluded_attached"
+                    if observation_state in {
+                        "unobserved", "occluded", "visibility_rejected"
+                    }
+                    or not records[part].get("visible_views", [])
+                    else "observed_attached"
+                )
                 applied_frames.append(frame)
             part_reports.append({
                 "frame_range": [start, end],

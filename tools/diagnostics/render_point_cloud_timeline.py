@@ -543,7 +543,7 @@ def _compose_frame(
     canvas = np.full((height, width, 3), BACKGROUND, dtype=np.uint8)
     _draw_text(
         canvas,
-        f"Object-9 point-cloud timeline | {part} | frame {timestamp} | primary {primary_view}",
+        f"Point-cloud timeline | {part} | frame {timestamp} | primary {primary_view}",
         (24, 39),
         scale=0.82,
         thickness=2,

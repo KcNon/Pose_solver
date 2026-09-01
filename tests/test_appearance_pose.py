@@ -17,6 +17,7 @@ from common.appearance_pose import (
     normalize_similarity_to_support_plane,
     rigid_core_mask,
     select_candidate_chain,
+    static_temporal_hold_hypotheses,
     table_yaw_angles,
 )
 from common.silhouette_scale_calibration import (
@@ -26,6 +27,7 @@ from common.silhouette_scale_calibration import (
 from common.calibration_cache import fingerprint_files
 from common.mesh_align import align_mesh_to_cloud
 from common.pose_transforms import decompose_similarity
+from common.symmetry import SymmetrySpec
 import trimesh
 
 
@@ -289,6 +291,98 @@ def test_fingerprint_changes_for_content_and_observation_stat(tmp_path: Path) ->
 
 
 class CalibrationRegressionTests(unittest.TestCase):
+    def test_static_holds_carry_distinct_scored_candidate_orientations(self):
+        current = _pose_x(-40)
+        current[:3, 3] = [1.0, 2.0, 3.0]
+        rows = [
+            {"pose": _pose_x(90), "score": 0.9},
+            {"pose": _pose_x(90.1), "score": 0.8},
+            {
+                "pose": _pose_x(170),
+                "transition_pose": _pose_x(15),
+                "score": 0.7,
+            },
+            {
+                "pose": _pose_x(45),
+                "score": 1.0,
+                "semantic_candidate_gate_passed": False,
+            },
+        ]
+
+        holds = static_temporal_hold_hypotheses(
+            current,
+            rows,
+            scale=2.0,
+            origin=np.zeros(3),
+        )
+
+        self.assertEqual(len(holds), 2)
+        decomposed = [
+            decompose_similarity(row["similarity"])
+            for row in holds
+        ]
+        np.testing.assert_allclose(
+            decomposed[0][1], _pose_x(90)[:3, :3]
+        )
+        np.testing.assert_allclose(
+            decomposed[1][1], _pose_x(15)[:3, :3]
+        )
+        np.testing.assert_allclose(decomposed[0][2], current[:3, 3])
+
+    def test_static_holds_deduplicate_candidate_symmetry_classes(self):
+        current = np.eye(4)
+        axial = SymmetrySpec(
+            axis_raw=(1.0, 0.0, 0.0),
+            equivalence="continuous_axial",
+        )
+        tilted = _pose_x(30)
+        tilted[:3, :3] = Rotation.from_euler(
+            "y", 20, degrees=True
+        ).as_matrix()
+        rows = [
+            {"pose": _pose_x(0), "score": 0.9},
+            {"pose": _pose_x(120), "score": 0.8},
+            {"pose": tilted, "score": 0.7},
+        ]
+
+        holds = static_temporal_hold_hypotheses(
+            current,
+            rows,
+            scale=1.0,
+            origin=np.zeros(3),
+            pose_symmetry=axial,
+        )
+
+        self.assertEqual(len(holds), 2)
+
+    def test_static_hold_fallback_keeps_hard_chain_feasible(self):
+        selected, _report = select_candidate_chain(
+            [100, 200],
+            [
+                [{"pose": _pose_x(0), "score": 0.0}],
+                [
+                    {
+                        "pose": _pose_x(170),
+                        "transition_pose": _pose_x(170),
+                        "score": 1.0,
+                    },
+                    {
+                        "pose": _pose_x(0),
+                        "transition_pose": _pose_x(0),
+                        "score": -1.0,
+                        "selection_score": -1.0,
+                        "static_hold_fallback": True,
+                    },
+                ],
+            ],
+            transition_weight=0.0,
+            max_rotation_deg_per_frame=25.0,
+            static_ranges=[[101, 199]],
+            hard_rotation_rate=True,
+        )
+
+        self.assertEqual(selected, [0, 1])
+
     def test_chain_rate_uses_pose_written_after_candidate_fallback(self):
         selected, _report = select_candidate_chain(
             [10, 20],

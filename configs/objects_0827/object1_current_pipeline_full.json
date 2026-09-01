@@ -1,0 +1,100 @@
+{
+  "schema_version": 1,
+  "dataset": "Object-1-0827-current-pipeline-full",
+  "input": {
+    "frames_dir": "/data_ft_9_10/wentai/projects/DiffSynth-Studio/data/objects-0827/Object-1/frames",
+    "depth_dir": "/data_ft_9_10/wentai/projects/DiffSynth-Studio/data/objects-0827/Object-1/da3-self_cond",
+    "views": [
+      "GX012854",
+      "GX013167",
+      "GX013168",
+      "GX013495",
+      "GX014101",
+      "GX015380",
+      "GX015381",
+      "GX017770"
+    ],
+    "frame_range": [400, 630]
+  },
+  "parts": {
+    "sprayer_pump": {
+      "id": 1,
+      "mesh": "/data_ft_9_10/wentai/projects/DiffSynth-Studio/data/objects-0827/Object-1/meshes/sprayer_pump.glb",
+      "prompts": ["sprayer pump, trigger head, collar, and attached dip tube"],
+      "appearance_hint": 400
+    },
+    "bottle_body": {
+      "id": 2,
+      "mesh": "/data_ft_9_10/wentai/projects/DiffSynth-Studio/data/objects-0827/Object-1/meshes/bottle_body.glb",
+      "prompts": ["spray bottle body and threaded neck"],
+      "appearance_hint": 400,
+      "reference": true
+    }
+  },
+  "output": {
+    "root": "../../experiments/objects_0827/Object-1/current_pipeline_full"
+  },
+  "runtime": {
+    "devices": [1],
+    "egl_device": 1,
+    "memory_guard": {
+      "enabled": true,
+      "minimum_available_gib": 128,
+      "maximum_process_rss_gib": 32,
+      "poll_seconds": 1,
+      "report_seconds": 10,
+      "stop_grace_seconds": 2
+    }
+  },
+  "models": {},
+  "mask": {
+    "mode": "reuse",
+    "artifact": "/data_ft_9_10/wentai/projects/DiffSynth-Studio/data/objects-0827/Object-1/masks",
+    "overrides": {
+      "source_layout": "view_first"
+    }
+  },
+  "depth": {
+    "mode": "run",
+    "overrides": {
+      "quality_cloud": {
+        "enabled": true,
+        "variant": "da3_self_cond_quality_hand_excluded",
+        "mask_resize_mode": "nearest",
+        "mask_erode": 1,
+        "depth_edge_mm": 30.0,
+        "cross_view_support_mm": 15.0,
+        "nearest_neighbor_workers": 4,
+        "min_support": 1,
+        "retain_unsupported_fraction": 0.0,
+        "stride": 2,
+        "fusion_voxel_mm": 1.0,
+        "max_points": 50000,
+        "minimum_mask_pixels": 80,
+        "minimum_fused_points": 300,
+        "minimum_supported_views": 2,
+        "minimum_supported_points_per_view": 30
+      }
+    }
+  },
+  "pose": {
+    "mode": "run",
+    "overrides": {
+      "render": {
+        "views": "all",
+        "primary_view": "GX012854",
+        "width": 1280,
+        "height": 720,
+        "fps": 29.97002997002997,
+        "basic_only": true,
+        "occlusion_aware": true,
+        "mask_occluder_labels": [3],
+        "mask_occlusion_dilation_pixels": 1,
+        "grid": {
+          "enabled": true,
+          "video_names": ["overlay.mp4", "mesh_only.mp4"]
+        }
+      }
+    }
+  }
+}

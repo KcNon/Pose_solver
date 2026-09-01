@@ -147,6 +147,80 @@ class SimulationAssetTests(unittest.TestCase):
         self.assertLess(len(proxy.faces), 1000)
         self.assertEqual(len(info["components"]), 2)
 
+    def test_oriented_cylinder_follows_connector_axis(self) -> None:
+        visual = __import__("trimesh").creation.box()
+        axis = np.asarray([1.0, 2.0, -1.0], dtype=np.float64)
+        axis /= np.linalg.norm(axis)
+        origin = np.asarray([0.03, -0.02, 0.01], dtype=np.float64)
+        proxy, info = create_collision_proxy(
+            visual,
+            {
+                "type": "oriented_cylinder",
+                "axis_vector": axis.tolist(),
+                "origin_m": origin.tolist(),
+                "radius_m": 0.01,
+                "axis_min_m": -0.02,
+                "axis_max_m": 0.04,
+                "sections": 32,
+            },
+        )
+        self.assertTrue(proxy.is_watertight)
+        self.assertEqual(info["type"], "oriented_cylinder")
+        np.testing.assert_allclose(
+            proxy.centroid,
+            origin + 0.01 * axis,
+            atol=1e-9,
+        )
+
+    def test_annular_cylinder_preserves_center_passage(self) -> None:
+        visual = __import__("trimesh").creation.box()
+        proxy, info = create_collision_proxy(
+            visual,
+            {
+                "type": "annular_cylinder",
+                "axis": "y",
+                "inner_radius_m": 0.01,
+                "outer_radius_m": 0.02,
+                "axis_min_m": 0.1,
+                "axis_max_m": 0.104,
+                "sections": 32,
+            },
+        )
+        self.assertTrue(proxy.is_watertight)
+        self.assertEqual(info["type"], "annular_cylinder")
+        np.testing.assert_allclose(proxy.bounds[:, 1], [0.1, 0.104], atol=1e-12)
+
+    def test_oriented_annular_cylinder_is_convex_component_sleeve(self) -> None:
+        visual = __import__("trimesh").creation.box()
+        axis = np.asarray([1.0, -2.0, 0.5], dtype=np.float64)
+        axis /= np.linalg.norm(axis)
+        origin = np.asarray([0.02, 0.03, -0.01], dtype=np.float64)
+        proxy, info = create_collision_proxy(
+            visual,
+            {
+                "type": "cylindrical_sleeve",
+                "axis_vector": axis.tolist(),
+                "origin_m": origin.tolist(),
+                "inner_radius_m": 0.0165,
+                "outer_radius_m": 0.020,
+                "axis_min_m": -0.004,
+                "axis_max_m": 0.012,
+                "sections": 16,
+                "parameter_source": "measured",
+            },
+        )
+        self.assertTrue(proxy.is_watertight)
+        self.assertEqual(proxy.body_count, 16)
+        self.assertEqual(info["type"], "cylindrical_sleeve")
+        self.assertEqual(info["convex_components"], 16)
+        self.assertTrue(info["center_passage_preserved"])
+        self.assertEqual(info["parameter_source"], "measured")
+        np.testing.assert_allclose(
+            proxy.centroid,
+            origin + 0.004 * axis,
+            atol=2e-5,
+        )
+
     def test_uniform_scale_applies_to_configured_proxy(self) -> None:
         trimesh = __import__("trimesh")
         visual = trimesh.creation.box()

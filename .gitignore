@@ -16,5 +16,15 @@ configs/*
 !configs/object9_rigid_nozzle_inputs.json
 !configs/object9_rigid_nozzle_depth.json
 !configs/object9_rigid_nozzle_pose.json
+!configs/objects_0827/
+configs/objects_0827/*
+!configs/objects_0827/object4_simulation_meshes.json
+!configs/objects_0827/object4_simulation_ready.json
+!configs/objects_0827/object4_isaac_physics.json
+!configs/objects_0827/object1_current_pipeline_full.json
+!configs/objects_0827/object1_rigid_nozzle_inputs.json
+!configs/objects_0827/object1_rigid_nozzle_pose.json
 exports
 video-object8/*
+parts3/*
+data/*

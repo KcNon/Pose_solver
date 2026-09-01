@@ -122,6 +122,178 @@ def _proxy_cylinder(spec: dict[str, Any]) -> tuple[trimesh.Trimesh, dict[str, An
     }
 
 
+def _proxy_oriented_cylinder(
+    spec: dict[str, Any],
+) -> tuple[trimesh.Trimesh, dict[str, Any]]:
+    """Create a cylinder around an arbitrary canonical-part axis.
+
+    Connector axes inferred from an assembled pose rarely coincide with the
+    reconstruction mesh's XYZ axes.  Keeping the connector primitive in the
+    canonical part frame lets visual and collision geometry share one rigid
+    transform without baking an assembly pose into the exported URDF.
+    """
+    axis = np.asarray(spec["axis_vector"], dtype=np.float64)
+    origin = np.asarray(spec.get("origin_m", [0.0, 0.0, 0.0]), dtype=np.float64)
+    if axis.shape != (3,) or origin.shape != (3,):
+        raise ValueError("oriented_cylinder axis_vector and origin_m must be 3-vectors")
+    axis_norm = float(np.linalg.norm(axis))
+    if axis_norm <= 1e-12 or not np.isfinite(axis).all() or not np.isfinite(origin).all():
+        raise ValueError("oriented_cylinder axis and origin must be finite and non-zero")
+    axis /= axis_norm
+    radius = float(spec["radius_m"])
+    coordinate_min = float(spec["axis_min_m"])
+    coordinate_max = float(spec["axis_max_m"])
+    sections = int(spec.get("sections", 64))
+    if radius <= 0.0 or coordinate_max <= coordinate_min:
+        raise ValueError(f"Invalid oriented cylinder collision proxy: {spec}")
+    transform = np.eye(4, dtype=np.float64)
+    transform[:3, :3] = rotation_align_vectors([0.0, 0.0, 1.0], axis)
+    mesh = trimesh.creation.cylinder(
+        radius=radius,
+        height=coordinate_max - coordinate_min,
+        sections=sections,
+        transform=transform,
+    )
+    mesh.apply_translation(
+        origin + axis * (0.5 * (coordinate_min + coordinate_max))
+    )
+    return mesh, {
+        "type": "oriented_cylinder",
+        "axis_vector": axis.tolist(),
+        "origin_m": origin.tolist(),
+        "radius_m": radius,
+        "axis_min_m": coordinate_min,
+        "axis_max_m": coordinate_max,
+        "sections": sections,
+    }
+
+
+def _proxy_oriented_annular_cylinder(
+    spec: dict[str, Any],
+) -> tuple[trimesh.Trimesh, dict[str, Any]]:
+    """Create an arbitrary-axis hollow sleeve as convex wedge components.
+
+    A single concave annulus can be cooked as a filled convex hull by a
+    dynamic-body collision backend.  This implementation deliberately emits
+    one watertight convex trapezoidal prism per angular section, preserving the
+    central passage after component materialization and URDF import.
+    """
+    axis = np.asarray(spec["axis_vector"], dtype=np.float64)
+    origin = np.asarray(spec.get("origin_m", [0.0, 0.0, 0.0]), dtype=np.float64)
+    if axis.shape != (3,) or origin.shape != (3,):
+        raise ValueError(
+            "oriented_annular_cylinder axis_vector and origin_m must be 3-vectors"
+        )
+    axis_norm = float(np.linalg.norm(axis))
+    if (
+        axis_norm <= 1e-12
+        or not np.isfinite(axis).all()
+        or not np.isfinite(origin).all()
+    ):
+        raise ValueError(
+            "oriented_annular_cylinder axis and origin must be finite and non-zero"
+        )
+    axis /= axis_norm
+    inner_radius = float(spec["inner_radius_m"])
+    outer_radius = float(spec["outer_radius_m"])
+    coordinate_min = float(spec["axis_min_m"])
+    coordinate_max = float(spec["axis_max_m"])
+    sections = int(spec.get("sections", 24))
+    if not 0.0 < inner_radius < outer_radius:
+        raise ValueError(f"Invalid oriented annular cylinder radii: {spec}")
+    if coordinate_max <= coordinate_min:
+        raise ValueError(f"Invalid oriented annular cylinder axial range: {spec}")
+    if not 8 <= sections <= 256:
+        raise ValueError("oriented_annular_cylinder sections must be in [8, 256]")
+
+    faces = np.asarray(
+        [
+            [0, 2, 1], [0, 3, 2],  # lower cap
+            [4, 5, 6], [4, 6, 7],  # upper cap
+            [1, 2, 6], [1, 6, 5],  # outer wall
+            [0, 4, 7], [0, 7, 3],  # inner wall
+            [0, 1, 5], [0, 5, 4],  # first radial side
+            [3, 7, 6], [3, 6, 2],  # second radial side
+        ],
+        dtype=np.int64,
+    )
+    components: list[trimesh.Trimesh] = []
+    for index in range(sections):
+        theta0 = 2.0 * math.pi * index / sections
+        theta1 = 2.0 * math.pi * (index + 1) / sections
+        radial = (
+            (inner_radius * math.cos(theta0), inner_radius * math.sin(theta0)),
+            (outer_radius * math.cos(theta0), outer_radius * math.sin(theta0)),
+            (outer_radius * math.cos(theta1), outer_radius * math.sin(theta1)),
+            (inner_radius * math.cos(theta1), inner_radius * math.sin(theta1)),
+        )
+        vertices = np.asarray(
+            [
+                [x, y, coordinate]
+                for coordinate in (coordinate_min, coordinate_max)
+                for x, y in radial
+            ],
+            dtype=np.float64,
+        )
+        components.append(
+            trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+        )
+    mesh = trimesh.util.concatenate(components)
+    transform = np.eye(4, dtype=np.float64)
+    transform[:3, :3] = rotation_align_vectors([0.0, 0.0, 1.0], axis)
+    transform[:3, 3] = origin
+    mesh.apply_transform(transform)
+    return mesh, {
+        "type": "oriented_annular_cylinder",
+        "axis_vector": axis.tolist(),
+        "origin_m": origin.tolist(),
+        "inner_radius_m": inner_radius,
+        "outer_radius_m": outer_radius,
+        "axis_min_m": coordinate_min,
+        "axis_max_m": coordinate_max,
+        "sections": sections,
+        "convex_components": sections,
+        "center_passage_preserved": True,
+        "recommended_dynamic_collision_approximation": "convexHull",
+    }
+
+
+def _proxy_annular_cylinder(
+    spec: dict[str, Any],
+) -> tuple[trimesh.Trimesh, dict[str, Any]]:
+    """Create a hollow cylindrical wall/plate without closing its passage."""
+    axis = str(spec.get("axis", "y"))
+    transform, direction = _axis_transform(axis)
+    inner_radius = float(spec["inner_radius_m"])
+    outer_radius = float(spec["outer_radius_m"])
+    coordinate_min = float(spec["axis_min_m"])
+    coordinate_max = float(spec["axis_max_m"])
+    sections = int(spec.get("sections", 64))
+    if not 0.0 < inner_radius < outer_radius:
+        raise ValueError(f"Invalid annular cylinder radii: {spec}")
+    if coordinate_max <= coordinate_min:
+        raise ValueError(f"Invalid annular cylinder axial range: {spec}")
+    mesh = trimesh.creation.annulus(
+        r_min=inner_radius,
+        r_max=outer_radius,
+        height=coordinate_max - coordinate_min,
+        sections=sections,
+        transform=transform,
+    )
+    mesh.apply_translation(
+        direction * (0.5 * (coordinate_min + coordinate_max))
+    )
+    return mesh, {
+        "type": "annular_cylinder",
+        "axis": axis,
+        "inner_radius_m": inner_radius,
+        "outer_radius_m": outer_radius,
+        "axis_min_m": coordinate_min,
+        "axis_max_m": coordinate_max,
+        "sections": sections,
+    }
+
+
 def _proxy_revolved_solid(spec: dict[str, Any]) -> tuple[trimesh.Trimesh, dict[str, Any]]:
     axis = str(spec.get("axis", "y"))
     transform, _ = _axis_transform(axis)
@@ -334,6 +506,14 @@ def create_collision_proxy(
         proxy_type = str(spec["type"])
         if proxy_type == "cylinder":
             mesh, metadata = _proxy_cylinder(spec)
+        elif proxy_type == "oriented_cylinder":
+            mesh, metadata = _proxy_oriented_cylinder(spec)
+        elif proxy_type in {"oriented_annular_cylinder", "cylindrical_sleeve"}:
+            mesh, metadata = _proxy_oriented_annular_cylinder(spec)
+            if proxy_type == "cylindrical_sleeve":
+                metadata["type"] = "cylindrical_sleeve"
+        elif proxy_type == "annular_cylinder":
+            mesh, metadata = _proxy_annular_cylinder(spec)
         elif proxy_type == "revolved_solid":
             mesh, metadata = _proxy_revolved_solid(spec)
         elif proxy_type == "cylindrical_container":
@@ -367,6 +547,9 @@ def create_collision_proxy(
             np.asarray(mesh.vertices, dtype=np.float64) * uniform_scale
         )
         metadata["uniform_scale"] = uniform_scale
+    for key in ("parameter_source", "confidence", "interface_role", "notes"):
+        if spec is not None and key in spec:
+            metadata[key] = spec[key]
     mesh.remove_unreferenced_vertices()
     metadata.update(
         {

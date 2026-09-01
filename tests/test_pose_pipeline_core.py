@@ -233,10 +233,14 @@ class PoseConfigTests(unittest.TestCase):
             "auto": {
                 "minimum_static_frames": 1,
                 "minimum_dynamic_frames": 1,
+                "refine_post_dynamic_static_pose": True,
+                "refine_initial_static_pose": True,
+                "initial_refinement_parts": ["body"],
             },
         }
         config["states"]["body"]["calibration_frames"] = [0]
         config["states"]["part"]["anchor_frames"] = [1]
+        config["states"]["part"]["assembly_parent"] = "body"
         report = {"parts": {}}
         for part in ("body", "part"):
             states = {}
@@ -248,6 +252,8 @@ class PoseConfigTests(unittest.TestCase):
                         if moving
                         else "occluded"
                         if part == "part" and frame >= 3
+                        else "assembled"
+                        if part == "part" and frame == 2
                         else "static"
                     ),
                     "observing_views": 2,
@@ -259,6 +265,8 @@ class PoseConfigTests(unittest.TestCase):
                 "detected_moving_ranges": (
                     [[1, 1]] if part == "part" else []
                 ),
+                "detected_assembled_from": 2 if part == "part" else None,
+                "detected_assembled_confirmed_at": 2 if part == "part" else None,
             }
         resolved, audit = resolve_pose_config(config, report)
         self.assertEqual(
@@ -301,11 +309,73 @@ class PoseConfigTests(unittest.TestCase):
             dynamic_window["maximum_internal_rotation_degradation_deg"], 0.0
         )
         self.assertEqual(modes["auto_static_body_0_2"], "static_window")
+        initial_static = next(
+            window
+            for window in resolved["multiframe_optimization"]["windows"]
+            if window["name"] == "auto_static_body_0_2"
+        )
+        self.assertTrue(initial_static["refine_constant_pose"])
+        self.assertTrue(initial_static["constant_optimize_rotation"])
+        post_dynamic = next(
+            window
+            for window in resolved["multiframe_optimization"]["windows"]
+            if window["name"] == "auto_static_part_2_2"
+        )
+        self.assertTrue(post_dynamic["refine_constant_pose"])
+        self.assertEqual(post_dynamic["reference_part"], "body")
+        follow = resolved["static_pose_consensus"]["rigid_follow"]["part"][0]
+        self.assertEqual(follow["reference_part"], "body")
+        self.assertEqual(follow["frame_range"], [2, 2])
+        self.assertEqual(follow["relative_anchor_frames"], [2])
         self.assertIn(
             "auto_dynamic_part_1_1",
             audit["parts"]["part"]["generated_multiframe_windows"],
         )
         validate_pose_config(resolved)
+
+    def test_detected_motion_is_backdated_by_detector_latency(self):
+        config = base_config()
+        config["frames"] = {"start": 0, "end": 20}
+        config["part_start_frames"] = {"body": 0, "part": 0}
+        config["automation"] = {
+            "enabled": True,
+            "use_detected_states": True,
+            "infer_anchors": False,
+            "infer_calibration_frames": False,
+            "minimum_dynamic_frames": 1,
+        }
+        report = {
+            "thresholds": {"motion_lag": 3, "dwell_on": 2},
+            "parts": {},
+        }
+        for part in ("body", "part"):
+            report["parts"][part] = {
+                "states": {
+                    f"{frame:06d}": {
+                        "state": "moving"
+                        if part == "part" and 10 <= frame <= 15
+                        else "static",
+                        "observing_views": 2,
+                    }
+                    for frame in range(21)
+                },
+                "detected_moving_ranges": (
+                    [[10, 15]] if part == "part" else []
+                ),
+            }
+
+        resolved, audit = resolve_pose_config(config, report)
+
+        self.assertEqual(
+            resolved["automation"]["motion_padding_before"], 7
+        )
+        self.assertEqual(
+            resolved["states"]["part"]["dynamic_ranges"], [[3, 15]]
+        )
+        self.assertEqual(
+            audit["parts"]["part"]["static_pose_lock_ranges"],
+            [[0, 2], [16, 20]],
+        )
 
     def test_reference_selection_penalizes_observed_motion(self):
         config = base_config()
