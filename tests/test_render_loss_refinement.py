@@ -141,6 +141,32 @@ class RenderLossRefinementTests(unittest.TestCase):
             result["views"][0]["ignored_occluded_pixels"], 0
         )
 
+    def test_known_occluder_dilation_protects_annotation_boundary(self) -> None:
+        target = np.zeros_like(self.observations[0].target_mask)
+        known = np.zeros_like(target)
+        known[45, 80] = True
+        observation = RenderObservation(
+            view="opt",
+            intrinsics=self.K,
+            extrinsics=self.E,
+            target_mask=target,
+            known_occluder_mask=known,
+        )
+        without_dilation = MultiViewRenderObjective(
+            self.points,
+            [observation],
+            {"dilation_pixels": 2, "known_occluder_dilation_pixels": 0},
+        ).evaluate(self.target_pose, ["opt"])
+        with_dilation = MultiViewRenderObjective(
+            self.points,
+            [observation],
+            {"dilation_pixels": 2, "known_occluder_dilation_pixels": 2},
+        ).evaluate(self.target_pose, ["opt"])
+        self.assertGreater(
+            with_dilation["views"][0]["ignored_occluded_pixels"],
+            without_dilation["views"][0]["ignored_occluded_pixels"],
+        )
+
     def test_coarse_reacquire_escapes_local_translation_basin(self) -> None:
         objective = MultiViewRenderObjective(
             self.points,
@@ -298,6 +324,38 @@ class RenderLossRefinementTests(unittest.TestCase):
         self.assertFalse(report["accepted"])
         self.assertIn(
             "optimize_iou_below_minimum",
+            report["absolute_gate_failures"],
+        )
+        np.testing.assert_allclose(selected, initial)
+
+    def test_strict_mode_rejects_candidate_without_holdout(self) -> None:
+        objective = MultiViewRenderObjective(
+            self.points,
+            self.observations,
+            {"dilation_pixels": 2, "weights": {"depth": 0.0}},
+        )
+        initial = self.target_pose.copy()
+        initial[0, 3] += 0.06
+        selected, report = refine_pose_coordinate_search(
+            objective,
+            initial,
+            optimize_views=["opt"],
+            holdout_views=[],
+            translation_steps_m=[0.04, 0.02],
+            rotation_steps_deg=[1.0],
+            symmetry_axis_part=None,
+            optimize_rotation=False,
+            maximum_translation_delta_m=0.10,
+            maximum_rotation_delta_deg=5.0,
+            minimum_improvement=0.001,
+            maximum_holdout_degradation=0.0,
+            require_independent_holdout=True,
+            prior_weight=0.0,
+            temporal_weight=0.0,
+        )
+        self.assertFalse(report["accepted"])
+        self.assertIn(
+            "independent_holdout_missing",
             report["absolute_gate_failures"],
         )
         np.testing.assert_allclose(selected, initial)

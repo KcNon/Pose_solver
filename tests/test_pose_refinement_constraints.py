@@ -13,6 +13,7 @@ from tools.stages.pose.stabilize_static_pose import interpolate_pose
 from tools.stages.pose.refine_pose_render_loss import (
     exact_holdout_gate,
     other_part_touch_ratio,
+    resolve_frame_view_split,
 )
 from tools.stages.pose.render_multiview_pose import resolved_render_settings
 
@@ -61,6 +62,58 @@ class PoseConstraintTests(unittest.TestCase):
         )
         self.assertTrue(accepted)
         self.assertLess(report["loss_degradation"], 0.0)
+
+    def test_exact_triangle_strict_gate_requires_holdout(self):
+        accepted, report = exact_holdout_gate(
+            None,
+            None,
+            {"require_independent_holdout": True},
+        )
+        self.assertFalse(accepted)
+        self.assertIn("independent_holdout_missing", report["failures"])
+
+    def test_rotating_holdout_is_removed_from_optimization(self):
+        available = {"a", "b", "c", "d"}
+        first_opt, first_holdout, first_report = resolve_frame_view_split(
+            available,
+            ["a", "b", "c", "d"],
+            [],
+            frame=0,
+            minimum_optimize_views=3,
+            minimum_holdout_views=1,
+            require_independent_holdout=True,
+            auto_holdout_policy="rotating",
+        )
+        next_opt, next_holdout, _ = resolve_frame_view_split(
+            available,
+            ["a", "b", "c", "d"],
+            [],
+            frame=1,
+            minimum_optimize_views=3,
+            minimum_holdout_views=1,
+            require_independent_holdout=True,
+            auto_holdout_policy="rotating",
+        )
+        self.assertEqual(first_holdout, ["a"])
+        self.assertEqual(next_holdout, ["b"])
+        self.assertFalse(set(first_opt).intersection(first_holdout))
+        self.assertFalse(set(next_opt).intersection(next_holdout))
+        self.assertTrue(first_report["independent_holdout_satisfied"])
+
+    def test_strict_view_split_fails_closed_when_too_few_views(self):
+        optimize, holdout, report = resolve_frame_view_split(
+            {"a", "b", "c"},
+            ["a", "b", "c"],
+            [],
+            frame=0,
+            minimum_optimize_views=3,
+            minimum_holdout_views=0,
+            require_independent_holdout=True,
+            auto_holdout_policy="rotating",
+        )
+        self.assertEqual(optimize, ["a", "b", "c"])
+        self.assertEqual(holdout, [])
+        self.assertFalse(report["independent_holdout_satisfied"])
 
     def test_pose_bridge_uses_geodesic_rotation(self):
         start = np.eye(4)

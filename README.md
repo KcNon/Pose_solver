@@ -101,6 +101,11 @@ pose：状态检测、绝对 anchor、相邻帧跟踪、渲染与多帧优化
 
 ICP 在这里是粗 pose 之后的局部跟踪器，不是独立的全局位姿估计器。
 
+没有 pose GT 时，render-loss refinement 可以用未参与优化的同步相机反向修正
+粗 pose。四个及以上相机的自动配置会保留独立 holdout，并按帧轮换缺省留出
+视角；holdout 退化、最差视角失败或手部遮挡证据不足时不会写回候选。原理、
+配置和报告字段见[无 GT 的多视角 Pose 修正](docs/multiview_pose_correction.md)。
+
 ## 输入契约
 
 ### 多视角帧

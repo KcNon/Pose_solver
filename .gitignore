@@ -25,6 +25,7 @@ configs/objects_0827/*
 !configs/objects_0827/object1_rigid_nozzle_inputs.json
 !configs/objects_0827/object1_rigid_nozzle_pose.json
 exports
-video-object8/*
-parts3/*
+/exports.zip
+/video-object8/
+/parts3
 data/*

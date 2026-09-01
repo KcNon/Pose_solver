@@ -320,6 +320,80 @@ def compact_metric(value: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def resolve_frame_view_split(
+    available_views: set[str],
+    optimize_views: list[str],
+    holdout_views: list[str],
+    *,
+    frame: int,
+    minimum_optimize_views: int,
+    minimum_holdout_views: int,
+    require_independent_holdout: bool,
+    auto_holdout_policy: str,
+) -> tuple[list[str], list[str], dict[str, Any]]:
+    """Resolve a leak-free per-frame optimization/validation camera split.
+
+    A configured holdout remains authoritative when it is observable.  In
+    strict mode, ``last_available`` or ``rotating`` can move cameras out of
+    the optimization set to replace an unavailable/omitted holdout.  A moved
+    camera is never used in both sets for the same frame.
+    """
+
+    available = set(available_views)
+    effective_optimize = list(dict.fromkeys(
+        view for view in optimize_views if view in available
+    ))
+    effective_holdout = list(dict.fromkeys(
+        view for view in holdout_views if view in available
+    ))
+    overlap = sorted(set(effective_optimize).intersection(effective_holdout))
+    if overlap:
+        raise ValueError(
+            f"effective optimize and holdout views overlap: {overlap}"
+        )
+
+    required_holdouts = max(
+        int(minimum_holdout_views),
+        1 if require_independent_holdout else 0,
+    )
+    policy = str(auto_holdout_policy or "none")
+    if policy not in {"none", "last_available", "rotating"}:
+        raise ValueError(
+            "auto_holdout_policy must be one of: none, last_available, "
+            "rotating"
+        )
+    needed = max(0, required_holdouts - len(effective_holdout))
+    maximum_movable = max(
+        0, len(effective_optimize) - int(minimum_optimize_views)
+    )
+    move_count = min(needed, maximum_movable)
+    moved: list[str] = []
+    if move_count and policy != "none":
+        candidates = list(effective_optimize)
+        if policy == "last_available":
+            moved = candidates[-move_count:]
+        else:
+            start = int(frame) % len(candidates)
+            moved = [
+                candidates[(start + offset) % len(candidates)]
+                for offset in range(move_count)
+            ]
+        moved_set = set(moved)
+        effective_optimize = [
+            view for view in effective_optimize if view not in moved_set
+        ]
+        effective_holdout.extend(moved)
+
+    return effective_optimize, effective_holdout, {
+        "policy": policy,
+        "required_holdout_views": required_holdouts,
+        "auto_selected_holdout_views": moved,
+        "independent_holdout_satisfied": bool(
+            len(effective_holdout) >= required_holdouts
+        ),
+    }
+
+
 def exact_holdout_gate(
     baseline: dict[str, Any] | None,
     selected: dict[str, Any] | None,
@@ -328,10 +402,13 @@ def exact_holdout_gate(
     """Apply the independent-view gate again after exact triangle polishing."""
 
     if baseline is None or selected is None:
-        return True, {
+        required = bool(settings.get("require_independent_holdout", False))
+        return not required, {
             "evaluated": False,
             "loss_degradation": 0.0,
-            "failures": [],
+            "failures": (
+                ["independent_holdout_missing"] if required else []
+            ),
         }
     degradation = float(selected["loss"] - baseline["loss"])
     maximum = float(
@@ -579,6 +656,26 @@ def main() -> None:
                 refinement.get("minimum_holdout_views", 0),
             )
         )
+        require_independent_holdout = bool(
+            part_config.get(
+                "require_independent_holdout",
+                refinement.get("require_independent_holdout", False),
+            )
+        )
+        auto_holdout_policy = str(
+            part_config.get(
+                "auto_holdout_policy",
+                refinement.get("auto_holdout_policy", "none"),
+            )
+        )
+        part_overlap = sorted(
+            set(part_optimize_views).intersection(part_holdout_views)
+        )
+        if part_overlap:
+            raise ValueError(
+                f"{part} optimize_views and holdout_views overlap: "
+                f"{part_overlap}"
+            )
         temporal_delta = np.zeros(6, dtype=np.float64)
         last_accepted_pose = None
         last_accepted_frame = None
@@ -652,37 +749,44 @@ def main() -> None:
                     ),
                 )
                 available = {item.view for item in observations}
-                effective_optimize = [
-                    view for view in part_optimize_views if view in available
-                ]
-                effective_holdout = [
-                    view for view in part_holdout_views if view in available
-                ]
+                frame_holdout_policy = auto_holdout_policy
                 if (
                     args.static_anchor_search
-                    and not effective_holdout
-                    and len(effective_optimize) > minimum_optimize_views
+                    and frame_holdout_policy == "none"
                 ):
-                    # Preserve an independent camera gate even when the
-                    # configured holdout view is rejected as inter-part
-                    # occluded.  Selection is deterministic and never leaks
-                    # this view back into the optimize set.
-                    replacement_holdout = effective_optimize[-1]
-                    effective_optimize = effective_optimize[:-1]
-                    effective_holdout = [replacement_holdout]
+                    frame_holdout_policy = "last_available"
+                (
+                    effective_optimize,
+                    effective_holdout,
+                    view_split_report,
+                ) = resolve_frame_view_split(
+                    available,
+                    part_optimize_views,
+                    part_holdout_views,
+                    frame=frame,
+                    minimum_optimize_views=minimum_optimize_views,
+                    minimum_holdout_views=minimum_holdout_views,
+                    require_independent_holdout=(
+                        require_independent_holdout
+                        or args.static_anchor_search
+                    ),
+                    auto_holdout_policy=frame_holdout_policy,
+                )
                 if len(effective_optimize) < minimum_optimize_views:
                     part_report["frames"][timestamp] = {
                         "accepted": False,
                         "skip_reason": "insufficient_views",
                         "available_views": sorted(available),
+                        "view_split": view_split_report,
                     }
                     continue
-                if len(effective_holdout) < minimum_holdout_views:
+                if not view_split_report["independent_holdout_satisfied"]:
                     part_report["frames"][timestamp] = {
                         "accepted": False,
                         "skip_reason": "insufficient_holdout_views",
                         "available_views": sorted(available),
                         "effective_holdout_views": effective_holdout,
+                        "view_split": view_split_report,
                     }
                     continue
                 objective = MultiViewRenderObjective(
@@ -880,6 +984,7 @@ def main() -> None:
                             "maximum_worst_view_loss", 1.0e9
                         )
                     ),
+                    require_independent_holdout=require_independent_holdout,
                     previous_pose=previous_pose,
                     next_pose=next_pose,
                     maximum_step_translation_m=float(
@@ -1454,6 +1559,9 @@ def main() -> None:
                     "accepted": accepted,
                     "continuity_fallback": continuity_fallback,
                     "available_views": sorted(available),
+                    "effective_optimize_views": effective_optimize,
+                    "effective_holdout_views": effective_holdout,
+                    "view_split": view_split_report,
                     "evaluations": frame_report["evaluations"],
                     "translation_delta_m": frame_report[
                         "translation_delta_m"

@@ -647,6 +647,13 @@ def resolve_pose_config(
         render_refinement.setdefault("minimum_optimize_views", 3)
         render_refinement.setdefault("minimum_per_view_iou", 0.005)
         render_refinement.setdefault("maximum_worst_view_loss", 2.0)
+        render_refinement.setdefault("known_occluder_dilation_pixels", 1)
+        render_refinement.setdefault(
+            "require_independent_holdout", len(resolved["views"]) >= 4
+        )
+        render_refinement.setdefault(
+            "auto_holdout_policy", "rotating"
+        )
         if len(resolved["views"]) >= 4:
             render_refinement.setdefault(
                 "holdout_views", [resolved["views"][-1]]
@@ -655,6 +662,7 @@ def resolve_pose_config(
                 "optimize_views", resolved["views"][:-1]
             )
             render_refinement.setdefault("minimum_holdout_iou", 0.005)
+            render_refinement.setdefault("minimum_holdout_views", 1)
         refinement_parts = render_refinement.setdefault("parts", {})
         for part in resolved["parts"]:
             refinement_parts.setdefault(part, {"enabled": True})

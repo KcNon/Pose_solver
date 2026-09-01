@@ -399,6 +399,21 @@ class MultiViewRenderObjective:
                     raise ValueError(
                         "known_occluder_mask must match target_mask shape"
                     )
+                known_dilation = max(
+                    0,
+                    int(
+                        self.config.get(
+                            "known_occluder_dilation_pixels", 0
+                        )
+                    ),
+                )
+                if known_dilation and known.any():
+                    size = 2 * known_dilation + 1
+                    known = cv2.dilate(
+                        known.astype(np.uint8),
+                        np.ones((size, size), dtype=np.uint8),
+                        iterations=1,
+                    ).astype(bool)
                 occluded |= known & full_predicted
             if (
                 self.config.get("occlusion_aware", False)
@@ -517,6 +532,7 @@ def refine_pose_coordinate_search(
     minimum_holdout_iou: float = 0.0,
     minimum_per_view_iou: float = 0.0,
     maximum_worst_view_loss: float = 1.0e9,
+    require_independent_holdout: bool = False,
     previous_pose: np.ndarray | None = None,
     next_pose: np.ndarray | None = None,
     maximum_step_translation_m: float | None = None,
@@ -705,6 +721,8 @@ def refine_pose_coordinate_search(
         refined_holdout["loss"] - baseline_holdout["loss"]
     )
     absolute_gate_failures = []
+    if require_independent_holdout and not effective_holdout:
+        absolute_gate_failures.append("independent_holdout_missing")
     if float(best_data.get("mean_iou", 0.0)) < minimum_refined_iou:
         absolute_gate_failures.append("optimize_iou_below_minimum")
     if (
@@ -757,6 +775,9 @@ def refine_pose_coordinate_search(
             "minimum_holdout_iou": float(minimum_holdout_iou),
             "minimum_per_view_iou": float(minimum_per_view_iou),
             "maximum_worst_view_loss": float(maximum_worst_view_loss),
+            "require_independent_holdout": bool(
+                require_independent_holdout
+            ),
         },
         "trajectory_boundary_gate": {
             "previous_pose": previous_pose is not None,

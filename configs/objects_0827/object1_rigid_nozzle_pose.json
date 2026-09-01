@@ -319,6 +319,7 @@
       "render_loss_refinement": {
         "known_part_occlusion_aware": true,
         "known_occluder_labels": [1, 2, 3],
+        "known_occluder_dilation_pixels": 1,
         "quality_cloud_summary": "/data_ft_9_10/wentai/projects/pose_solver/experiments/objects_0827/Object-1/rigid_nozzle_v1/pose_pipeline/depth/parts_ply/da3_self_cond_quality_rigid_nozzle_hand_excluded/quality_cloud_summary.json",
         "minimum_full_mask_pixels": 60,
         "minimum_mask_area_ratio": 0.05,
@@ -334,6 +335,9 @@
           "GX017770"
         ],
         "holdout_views": [],
+        "require_independent_holdout": true,
+        "minimum_holdout_views": 1,
+        "auto_holdout_policy": "rotating",
         "minimum_holdout_iou": 0.0,
         "parts": {
           "sprayer_pump": {
